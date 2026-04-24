@@ -3362,6 +3362,10 @@
     roomCode: "",
     localRoom: null,
     lobbyReady: false,
+    /** Optional wss:// URL for Render/dedicated host; empty = same-browser / local lobby. */
+    multiplayerDedicatedUrl: "",
+    /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
+    _multiplayerMenuReturnPhase: "terminal_login",
     isPaused: false,
     loadingTimer: 0,
     loadingNextMissionId: 1,
@@ -4411,6 +4415,9 @@
         case "terminal_login":
           this.tryTerminalLoginClick(mx, my);
           return;
+        case "multiplayer_menu":
+          this.tryMultiplayerMenuClick(mx, my);
+          return;
         case "title":
           this.tryTitleClick(mx, my);
           return;
@@ -4444,32 +4451,98 @@
     tryTerminalLoginClick(mx, my) {
       if (mx > VIEW_W / 2 - 170 && mx < VIEW_W / 2 + 170) {
         if (my > 260 && my < 312) {
-          this.gameMode = "online_mock";
-          NetworkManager.touchSession();
-          this.unlocked = loadUnlock();
-          this.setPhase("mission_select");
+          this.openMultiplayerMenu("terminal_login");
           return;
         }
         if (my > 332 && my < 384) {
+          SFX.play("ui_click");
           this.gameMode = "campaign";
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
+          if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           this.unlocked = loadUnlock();
           this.setPhase("mission_select");
         }
-        if (my > 404 && my < 456) {
-          const defWs = (typeof window !== "undefined" && window.location && window.location.origin.indexOf("localhost") >= 0)
-            ? "ws://127.0.0.1:8787/ws" : "";
+      }
+    },
+    _applyMultiplayerDedicatedUrlToWindow() {
+      const u = (this.multiplayerDedicatedUrl || "").trim();
+      if (typeof window === "undefined") return;
+      if (u) window.NEURAL_HEIST_WS = u;
+      else window.NEURAL_HEIST_WS = "";
+    },
+    _goToMultiplayerMissionSelect() {
+      this.gameMode = "online_mock";
+      NetworkManager.touchSession();
+      this.unlocked = loadUnlock();
+      this.setPhase("mission_select");
+    },
+    openMultiplayerMenu(fromReturn) {
+      SFX.play("ui_click");
+      if (typeof window !== "undefined" && window.NEURAL_HEIST_WS && !(this.multiplayerDedicatedUrl || "").trim()) {
+        this.multiplayerDedicatedUrl = String(window.NEURAL_HEIST_WS).trim();
+      }
+      this._multiplayerMenuReturnPhase = fromReturn || "terminal_login";
+      this.setPhase("multiplayer_menu");
+    },
+    tryMultiplayerMenuClick(mx, my) {
+      const cx0 = VIEW_W / 2 - 170;
+      const cx1 = VIEW_W / 2 + 170;
+      if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
+        SFX.play("ui_click");
+        this.setPhase(this._multiplayerMenuReturnPhase === "title" ? "title" : "terminal_login");
+        return;
+      }
+      if (mx > cx0 && mx < cx1) {
+        if (my > 220 && my < 272) {
+          SFX.play("ui_click");
+          this._applyMultiplayerDedicatedUrlToWindow();
+          this.localRoom = null;
+          this.roomCode = "";
+          this.lobbyReady = false;
+          this._goToMultiplayerMissionSelect();
+          return;
+        }
+        if (my > 288 && my < 340) {
+          SFX.play("ui_click");
+          const hasDedicated = !!(this.multiplayerDedicatedUrl || "").trim();
+          if (hasDedicated) {
+            this._applyMultiplayerDedicatedUrlToWindow();
+            this.localRoom = null;
+            this.roomCode = "";
+            this.lobbyReady = false;
+            this._goToMultiplayerMissionSelect();
+            return;
+          }
           const entered = (typeof window !== "undefined" && window.prompt)
-            ? window.prompt("Dedicated server WebSocket URL (wss://your-app.onrender.com/ws)", defWs || (window.NEURAL_HEIST_WS || ""))
+            ? window.prompt("Enter the 4-digit room code", this.roomCode || "")
             : "";
-          if (!entered) return;
-          if (typeof window !== "undefined") window.NEURAL_HEIST_WS = String(entered).trim();
-          this.gameMode = "online_mock";
-          NetworkManager.touchSession();
-          this.unlocked = loadUnlock();
-          this.setPhase("mission_select");
+          const joined = LocalRoomService.joinRoom(entered || this.roomCode);
+          if (joined) {
+            this.localRoom = joined.room;
+            this.roomCode = joined.room.roomCode;
+            this.localPlayerId = joined.slot;
+            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
+            if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
+            this._goToMultiplayerMissionSelect();
+          } else if (typeof window !== "undefined" && window.alert) {
+            window.alert("Could not join that room. Check the code and try again.");
+          }
+          return;
+        }
+        if (my > 388 && my < 440) {
+          SFX.play("ui_click");
+          const defHint = (typeof window !== "undefined" && window.location && String(window.location.hostname || "").indexOf("localhost") >= 0)
+            ? "ws://127.0.0.1:8787/ws"
+            : "wss://your-server.example.com/ws";
+          const cur = (this.multiplayerDedicatedUrl || "").trim() || (typeof window !== "undefined" ? (window.NEURAL_HEIST_WS || "") : "");
+          const msg = "Optional online server (leave empty for same-browser play).\n\nPaste wss:// or ws:// URL, or clear to use the default.";
+          const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt(msg, cur || defHint) : null;
+          if (entered === null) return;
+          this.multiplayerDedicatedUrl = String(entered).trim();
+          this._applyMultiplayerDedicatedUrlToWindow();
+          return;
         }
       }
     },
@@ -4482,16 +4555,13 @@
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
+          if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           NetworkManager.touchSession();
           this.setPhase("mission_select");
           return;
         }
         if (my>308 && my<360) {
-          SFX.play("ui_click");
-          this.gameMode = "online_mock";
-          NetworkManager.touchSession();
-          this.unlocked = loadUnlock();
-          this.setPhase("mission_select");
+          this.openMultiplayerMenu("title");
           return;
         }
         if (my>376 && my<428) { SFX.play("ui_click"); this.unlocked = loadUnlock(); this.setPhase("mission_select"); }
@@ -5070,6 +5140,7 @@
       switch (this.currentState) {
         case STATES.MENU:
           if (this.phase==="terminal_login") { this.drawTerminalLogin(); ctx.restore(); return; }
+          if (this.phase==="multiplayer_menu") { this.drawMultiplayerMenu(); ctx.restore(); return; }
           if (this.phase==="title") { this.drawTitle(); ctx.restore(); return; }
           if (this.phase==="mission_select") { this.drawMissionSelect(); ctx.restore(); return; }
           if (this.phase==="briefing") { this.drawBriefing(); ctx.restore(); return; }
@@ -5620,11 +5691,11 @@
       const br = 0.42 + Math.sin(u * 1.8) * 0.12;
       ctx.fillStyle="rgba(0,45,58,0.92)"; ctx.strokeStyle="rgba(0,255,220,"+br+")";
       ctx.fillRect(VIEW_W/2-160,240,320,52); ctx.strokeRect(VIEW_W/2-160,240,320,52);
-      ctx.fillStyle="#0ff"; ctx.font="17px monospace"; ctx.fillText("CAMPAIGN", VIEW_W/2, 274);
+      ctx.fillStyle="#0ff"; ctx.font="17px monospace"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 274);
       ctx.fillStyle="rgba(0,50,62,0.92)"; ctx.strokeStyle="rgba(255,160,120,"+(0.35+Math.sin(u*2.1)*0.1)+")";
       ctx.fillRect(VIEW_W/2-160,308,320,52); ctx.strokeRect(VIEW_W/2-160,308,320,52);
-      ctx.fillStyle="#fa8"; ctx.font="15px monospace"; ctx.fillText("LIVE OPS — authoritative net (2-4 ops)", VIEW_W/2, 338);
-      ctx.fillStyle="#678"; ctx.font="10px monospace"; ctx.fillText("WASD · IJKL · server-authoritative sim", VIEW_W/2, 356);
+      ctx.fillStyle="#fa8"; ctx.font="16px monospace"; ctx.fillText("MULTIPLAYER", VIEW_W/2, 338);
+      ctx.fillStyle="#678"; ctx.font="10px monospace"; ctx.fillText("Co-op with friends · optional online server", VIEW_W/2, 356);
       ctx.fillStyle="rgba(0,38,48,0.92)"; ctx.strokeStyle="rgba(0,170,200,0.38)";
       ctx.fillRect(VIEW_W/2-160,376,320,52); ctx.strokeRect(VIEW_W/2-160,376,320,52);
       ctx.fillStyle="#0aa"; ctx.fillText("CONTINUE (saved unlock)", VIEW_W/2, 410);
@@ -5641,17 +5712,71 @@
       ctx.fillText("TERMINAL LOGIN", VIEW_W/2, 170);
       ctx.shadowBlur = 0;
       ctx.fillStyle="#89a"; ctx.font="12px monospace";
-      ctx.fillText("Establish encrypted session or enter solo campaign.", VIEW_W/2, 205);
+      ctx.fillText("Choose multiplayer or play the campaign on this device.", VIEW_W/2, 205);
       const pA = 0.38 + Math.sin(u * 1.7) * 0.12;
       ctx.fillStyle="rgba(0,50,64,0.92)"; ctx.strokeStyle="rgba(0,255,220,"+pA+")";
       ctx.fillRect(VIEW_W/2-170,260,340,52); ctx.strokeRect(VIEW_W/2-170,260,340,52);
-      ctx.fillStyle="#0ff"; ctx.font="bold 16px monospace"; ctx.fillText("CREATE SESSION / JOIN", VIEW_W/2, 292);
+      ctx.fillStyle="#0ff"; ctx.font="bold 17px monospace"; ctx.fillText("MULTIPLAYER", VIEW_W/2, 292);
       ctx.fillStyle="rgba(0,40,58,0.92)"; ctx.strokeStyle="rgba(140,180,255,0.42)";
       ctx.fillRect(VIEW_W/2-170,332,340,52); ctx.strokeRect(VIEW_W/2-170,332,340,52);
-      ctx.fillStyle="#9cf"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 364);
-      ctx.fillStyle="rgba(28,36,52,0.92)"; ctx.strokeStyle="rgba(200,180,255,0.38)";
-      ctx.fillRect(VIEW_W/2-170,404,340,52); ctx.strokeRect(VIEW_W/2-170,404,340,52);
-      ctx.fillStyle="#dcf"; ctx.font="bold 15px monospace"; ctx.fillText("DEDICATED SERVER (WSS)", VIEW_W/2, 438);
+      ctx.fillStyle="#9cf"; ctx.font="bold 16px monospace"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 364);
+    },
+    drawMultiplayerMenu() {
+      const u = VisualJuice.uiT;
+      const g = ctx.createRadialGradient(VIEW_W / 2, 200, 10, VIEW_W / 2, 360, 460);
+      g.addColorStop(0, "rgba(0,70,95,0.28)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.fillStyle = "#00ffdd";
+      ctx.font = "bold 30px monospace";
+      ctx.textAlign = "center";
+      ctx.shadowColor = "rgba(0,255,220,0.45)";
+      ctx.shadowBlur = 16;
+      ctx.fillText("MULTIPLAYER", VIEW_W / 2, 158);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#7a9aac";
+      ctx.font = "12px monospace";
+      ctx.fillText("Host a session, join a friend, or add an online server below.", VIEW_W / 2, 192);
+      const pulse = 0.36 + Math.sin(u * 1.65) * 0.1;
+      ctx.fillStyle = "rgba(0,52,68,0.94)";
+      ctx.strokeStyle = "rgba(0,255,220," + pulse + ")";
+      ctx.fillRect(VIEW_W / 2 - 170, 220, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 220, 340, 52);
+      ctx.fillStyle = "#0ff";
+      ctx.font = "bold 16px monospace";
+      ctx.fillText("HOST GAME", VIEW_W / 2, 254);
+      ctx.fillStyle = "rgba(36,28,48,0.94)";
+      ctx.strokeStyle = "rgba(255,170,130," + (0.32 + Math.sin(u * 1.9) * 0.08) + ")";
+      ctx.fillRect(VIEW_W / 2 - 170, 288, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 288, 340, 52);
+      ctx.fillStyle = "#fc9";
+      ctx.font = "bold 16px monospace";
+      ctx.fillText("JOIN GAME", VIEW_W / 2, 322);
+      ctx.fillStyle = "#6a7a88";
+      ctx.font = "11px monospace";
+      ctx.fillText("Join with a room code on this device, or set an online server first.", VIEW_W / 2, 352);
+      ctx.fillStyle = "#5a6a78";
+      ctx.font = "10px monospace";
+      ctx.fillText("Server address (optional)", VIEW_W / 2, 378);
+      ctx.fillStyle = "rgba(22,32,44,0.92)";
+      ctx.strokeStyle = "rgba(120,160,200,0.35)";
+      ctx.fillRect(VIEW_W / 2 - 170, 388, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 388, 340, 52);
+      const urlDisp = (this.multiplayerDedicatedUrl || "").trim();
+      ctx.fillStyle = urlDisp ? "#bde" : "#789";
+      ctx.font = "11px monospace";
+      const line = urlDisp ? (urlDisp.length > 48 ? urlDisp.slice(0, 45) + "…" : urlDisp) : "Not set — click to add or change";
+      ctx.fillText(line, VIEW_W / 2, 420);
+      ctx.fillStyle = "#345";
+      ctx.fillRect(80, VIEW_H - 80, 160, 40);
+      ctx.strokeStyle = "#567";
+      ctx.strokeRect(80, VIEW_H - 80, 160, 40);
+      ctx.fillStyle = "#9ab";
+      ctx.font = "12px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("← Back", 160, VIEW_H - 55);
+      ctx.textAlign = "left";
     },
     drawMissionSelect() {
       const u = VisualJuice.uiT;
@@ -5659,7 +5784,7 @@
       ctx.shadowColor="rgba(0,255,220,0.35)"; ctx.shadowBlur=12;
       ctx.fillText("SELECT OPERATION", VIEW_W/2, 90);
       ctx.shadowBlur=0;
-      const modeLab = this.gameMode === "online_mock" ? "Live ops session — authoritative net (2-4 slots)" : "Campaign — solo Ghost Layer";
+      const modeLab = this.gameMode === "online_mock" ? "Multiplayer — 2 to 4 operatives" : "Campaign — solo Ghost Layer";
       ctx.fillStyle="#789"; ctx.font="11px monospace"; ctx.fillText(modeLab, VIEW_W/2, 118);
       for (let i = 1; i < MISSIONS.length; i++) {
         const m = MISSIONS[i];
