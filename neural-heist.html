@@ -15,6 +15,17 @@
   </style>
 </head>
 <body>
+  <script>
+    (function () {
+      try {
+        var q = new URLSearchParams(window.location.search);
+        var w = q.get("ws");
+        if (w) window.NEURAL_HEIST_WS = decodeURIComponent(w);
+        var s = q.get("slots");
+        if (s != null && s !== "") window.NEURAL_HEIST_SLOTS = Math.max(2, Math.min(4, parseInt(s, 10) || 2));
+      } catch (e) {}
+    })();
+  </script>
   <div id="wrap">
     <canvas id="c" width="1280" height="720" tabindex="0"></canvas>
     <button type="button" id="breachBtn">Interact [E]</button>
@@ -313,6 +324,8 @@
   };
   const NetworkCoordinator = {
     mode: "embedded",
+    /** Dedicated Node host: per-slot inputs from sockets (see server). */
+    _authoritativeRemoteInputs: null,
     ws: null,
     bc: null,
     peerId: PeerManager.ensureLocalPeer(),
@@ -334,11 +347,18 @@
         this.ws = new WebSocket(url);
         this.mode = "ws_client";
         this.ws.onopen = () => {
-          this.ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" }));
+          const hello = { v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" };
+          if (typeof window !== "undefined" && window.NEURAL_HEIST_SLOTS != null) {
+            hello.slotCount = clamp(window.NEURAL_HEIST_SLOTS | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
+          }
+          this.ws.send(JSON.stringify(hello));
         };
         this.ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (msg.type === Net.Msg.ERROR && msg.message && GameStateManager._setHint) {
+            GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
+          }
           if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world && AuthoritativeSession.players.length) {
             const byId = {};
             AuthoritativeSession.players.forEach(p => { byId[p.id] = p; });
@@ -479,6 +499,17 @@
       }
     },
     inputForSlot(slot, keys) {
+      const ri = this._authoritativeRemoteInputs;
+      if (ri && ri[slot] != null) {
+        const x = ri[slot];
+        return {
+          left: !!x.left,
+          right: !!x.right,
+          up: !!x.up,
+          down: !!x.down,
+          sprint: !!x.sprint
+        };
+      }
       if (this.mode === "local_host" && slot !== (GameStateManager.localPlayerId | 0)) {
         return this.remoteInputs[slot] || { left: false, right: false, up: false, down: false, sprint: false };
       }
@@ -3288,15 +3319,19 @@
       });
     },
     enterHackingMode() {
-      if (this._hackingListenersActive || !this._bound) return;
-      if (this._gamePointerDown) canvas.removeEventListener("pointerdown", this._gamePointerDown);
-      if (this._hackPointerDown) canvas.addEventListener("pointerdown", this._hackPointerDown);
+      if (this._hackingListenersActive) return;
+      if (this._bound) {
+        if (this._gamePointerDown) canvas.removeEventListener("pointerdown", this._gamePointerDown);
+        if (this._hackPointerDown) canvas.addEventListener("pointerdown", this._hackPointerDown);
+      }
       this._hackingListenersActive = true;
     },
     exitHackingMode() {
-      if (!this._bound || !this._hackingListenersActive) return;
-      if (this._hackPointerDown) canvas.removeEventListener("pointerdown", this._hackPointerDown);
-      if (this._gamePointerDown) canvas.addEventListener("pointerdown", this._gamePointerDown);
+      if (!this._hackingListenersActive) return;
+      if (this._bound) {
+        if (this._hackPointerDown) canvas.removeEventListener("pointerdown", this._hackPointerDown);
+        if (this._gamePointerDown) canvas.addEventListener("pointerdown", this._gamePointerDown);
+      }
       this._hackingListenersActive = false;
     }
   };
@@ -3477,6 +3512,11 @@
     },
     _buildStaticWorldLayer() {
       const w = this.world;
+      if (typeof globalThis !== "undefined" && globalThis.__NEURAL_HEIST_HEADLESS_SERVER__) {
+        this._worldStaticCanvas = null;
+        this._worldStaticMissionKey = "";
+        return;
+      }
       if (!w || typeof document === "undefined") return;
       const key = [
         (w.def && w.def.id) || this.missionId,
@@ -4418,6 +4458,19 @@
           this.unlocked = loadUnlock();
           this.setPhase("mission_select");
         }
+        if (my > 404 && my < 456) {
+          const defWs = (typeof window !== "undefined" && window.location && window.location.origin.indexOf("localhost") >= 0)
+            ? "ws://127.0.0.1:8787/ws" : "";
+          const entered = (typeof window !== "undefined" && window.prompt)
+            ? window.prompt("Dedicated server WebSocket URL (wss://your-app.onrender.com/ws)", defWs || (window.NEURAL_HEIST_WS || ""))
+            : "";
+          if (!entered) return;
+          if (typeof window !== "undefined") window.NEURAL_HEIST_WS = String(entered).trim();
+          this.gameMode = "online_mock";
+          NetworkManager.touchSession();
+          this.unlocked = loadUnlock();
+          this.setPhase("mission_select");
+        }
       }
     },
 
@@ -4452,8 +4505,15 @@
         if (mx>VIEW_W/2-200 && mx<VIEW_W/2+200 && my>row && my<row+52 && i<=this.unlocked) {
           SFX.play("ui_click");
           this.missionId = i;
-          if (this.gameMode === "online_mock") this.enterLobby(i);
-          else this.setPhase("briefing");
+          if (this.gameMode === "online_mock") {
+            if (typeof window !== "undefined" && window.NEURAL_HEIST_WS) {
+              this.roomCode = "";
+              this.localRoom = null;
+              this.setPhase("briefing");
+            } else {
+              this.enterLobby(i);
+            }
+          } else this.setPhase("briefing");
           return;
         }
       }
@@ -5589,6 +5649,9 @@
       ctx.fillStyle="rgba(0,40,58,0.92)"; ctx.strokeStyle="rgba(140,180,255,0.42)";
       ctx.fillRect(VIEW_W/2-170,332,340,52); ctx.strokeRect(VIEW_W/2-170,332,340,52);
       ctx.fillStyle="#9cf"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 364);
+      ctx.fillStyle="rgba(28,36,52,0.92)"; ctx.strokeStyle="rgba(200,180,255,0.38)";
+      ctx.fillRect(VIEW_W/2-170,404,340,52); ctx.strokeRect(VIEW_W/2-170,404,340,52);
+      ctx.fillStyle="#dcf"; ctx.font="bold 15px monospace"; ctx.fillText("DEDICATED SERVER (WSS)", VIEW_W/2, 438);
     },
     drawMissionSelect() {
       const u = VisualJuice.uiT;
@@ -5831,8 +5894,63 @@
     LocalRoomService
   };
 
-  GameStateManager.initInput();
-  GameStateManager._setHint("WASD · Q talk (1/2/3 choose) · hack relays then extract", "#8fefff", 4.0);
+  const _nhHeadless = typeof globalThis !== "undefined" && globalThis.__NEURAL_HEIST_HEADLESS_SERVER__;
+
+  function __nhApplyRemoteMissionAction(slot, payload) {
+    if (!AuthoritativeSession.players || !AuthoritativeSession.players.length) return;
+    const w = GameStateManager.world;
+    if (!w) return;
+    const pl = AuthoritativeSession.players[slot | 0];
+    if (!pl) return;
+    const prevSlot = GameStateManager.localPlayerId | 0;
+    GameStateManager.localPlayerId = slot | 0;
+    GameStateManager.player = pl;
+    try {
+      const k = payload && payload.kind;
+      if (k === "fake_task") GameStateManager.tryFakeTask();
+      else if (k === "sabotage") GameStateManager.trySabotage();
+      else if (k === "investigate") GameStateManager.tryInvestigate();
+      else if (k === "report") GameStateManager.tryReportSuspicion();
+      else if (k === "interact") GameStateManager.tryInteract();
+      else if (k === "hack_click" && payload.mx != null && payload.my != null) {
+        GameStateManager.handleHackPointer(payload.mx, payload.my, 1);
+      }
+    } finally {
+      GameStateManager.localPlayerId = prevSlot;
+      GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
+    }
+  }
+
+  function __nhBootstrapDedicatedRoom(opts) {
+    opts = opts || {};
+    const mid = opts.missionId | 0;
+    const sc = clamp(opts.slotCount | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
+    const onSnapshot = opts.onSnapshot;
+    if (typeof globalThis !== "undefined") globalThis.NEURAL_HEIST_SLOTS = sc;
+    GameStateManager.gameMode = "online_mock";
+    GameStateManager.localRoom = null;
+    GameStateManager.roomCode = "";
+    GameStateManager.phase = "playing";
+    GameStateManager.mode = "play";
+    GameStateManager.currentState = STATES.CAMPAIGN;
+    GameStateManager.paused = false;
+    GameStateManager.startMission(mid > 0 ? mid : 1);
+    AuthoritativeSession.transport = {
+      emit(ev, payload) {
+        if (ev === Net.Msg.SNAPSHOT && typeof onSnapshot === "function") onSnapshot(payload);
+      }
+    };
+    return true;
+  }
+
+  function __nhServerTick(dt) {
+    const d = Math.max(1 / 240, Math.min(0.08, dt));
+    GameStateManager._lastDt = d;
+    if (GameStateManager.flushPendingState) GameStateManager.flushPendingState();
+    if (GameStateManager.processEventQueue) GameStateManager.processEventQueue();
+    GameStateManager.syncStateFromPhase();
+    GameStateManager.update(d);
+  }
 
   let lastTime = performance.now();
   let dbgLastFrameAt = performance.now();
@@ -5853,73 +5971,90 @@
     canvas.style.cursor = "crosshair";
     canvas.style.pointerEvents = "auto";
   }
-  function frame(now) {
-    const dt = Math.min(0.05, (now-lastTime)/1000);
-    lastTime = now;
-    dbgLastFrameAt = now;
-    dbgFrameCount++;
-    GameStateManager._lastDt = dt;
-    GameStateManager.flushPendingState();
-    if (GameStateManager.processEventQueue) GameStateManager.processEventQueue();
-    if (GameStateManager.ensurePostHackStateHealth && now >= (GameStateManager._nextPostHackHealthAt || 0)) {
-      GameStateManager._nextPostHackHealthAt = now + 120;
-      GameStateManager.ensurePostHackStateHealth(now);
+
+  if (_nhHeadless) {
+    globalThis.__NeuralHeistServerRuntime__ = {
+      bootstrapDedicatedRoom: __nhBootstrapDedicatedRoom,
+      serverTick: __nhServerTick,
+      applyRemoteMissionAction: __nhApplyRemoteMissionAction,
+      Net,
+      GameStateManager,
+      AuthoritativeSession,
+      NetworkCoordinator,
+      STATES
+    };
+  } else {
+    GameStateManager.initInput();
+    GameStateManager._setHint("WASD · Q talk (1/2/3 choose) · hack relays then extract", "#8fefff", 4.0);
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now-lastTime)/1000);
+      lastTime = now;
+      dbgLastFrameAt = now;
+      dbgFrameCount++;
+      GameStateManager._lastDt = dt;
+      GameStateManager.flushPendingState();
+      if (GameStateManager.processEventQueue) GameStateManager.processEventQueue();
+      if (GameStateManager.ensurePostHackStateHealth && now >= (GameStateManager._nextPostHackHealthAt || 0)) {
+        GameStateManager._nextPostHackHealthAt = now + 120;
+        GameStateManager.ensurePostHackStateHealth(now);
+      }
+      if (GameStateManager.validateRuntimeState && now >= (GameStateManager._nextRuntimeValidateAt || 0)) {
+        GameStateManager._nextRuntimeValidateAt = now + 90;
+        GameStateManager.validateRuntimeState(now);
+      }
+      GameStateManager.syncStateFromPhase();
+      const stateSnap = GameStateManager.phase + "|" + GameStateManager.mode + "|" + GameStateManager.currentState;
+      if (stateSnap !== dbgLastStateSnapshot) {
+        dbgLastStateSnapshot = stateSnap;
+        if (GameStateManager._dbgLog) GameStateManager._dbgLog("frame state transition", { frame: dbgFrameCount, dt: +dt.toFixed(4), phase: GameStateManager.phase, mode: GameStateManager.mode, currentState: GameStateManager.currentState });
+        if (GameStateManager.mode === "play" && GameStateManager._dbgWatchEnd) GameStateManager._dbgWatchEnd("endHacking->campaign-loop");
+      }
+      if ((dbgFrameCount % 180) === 0 && GameStateManager._dbgLog) {
+        GameStateManager._dbgLog("frame heartbeat", {
+          frame: dbgFrameCount,
+          dt: +dt.toFixed(4),
+          phase: GameStateManager.phase,
+          mode: GameStateManager.mode,
+          currentState: GameStateManager.currentState
+        });
+      }
+      switch (GameStateManager.currentState) {
+        case STATES.CAMPAIGN:
+        case STATES.HACKING:
+          GameStateManager.update(dt);
+          break;
+        case STATES.GAMEOVER:
+        case STATES.MENU:
+        case STATES.MULTIPLAYER_LOBBY:
+          GameStateManager.updateMeta(dt);
+          break;
+        default:
+          break;
+      }
+      GameStateManager.render(dt);
+      requestAnimationFrame(frame);
     }
-    if (GameStateManager.validateRuntimeState && now >= (GameStateManager._nextRuntimeValidateAt || 0)) {
-      GameStateManager._nextRuntimeValidateAt = now + 90;
-      GameStateManager.validateRuntimeState(now);
-    }
-    GameStateManager.syncStateFromPhase();
-    const stateSnap = GameStateManager.phase + "|" + GameStateManager.mode + "|" + GameStateManager.currentState;
-    if (stateSnap !== dbgLastStateSnapshot) {
-      dbgLastStateSnapshot = stateSnap;
-      if (GameStateManager._dbgLog) GameStateManager._dbgLog("frame state transition", { frame: dbgFrameCount, dt: +dt.toFixed(4), phase: GameStateManager.phase, mode: GameStateManager.mode, currentState: GameStateManager.currentState });
-      if (GameStateManager.mode === "play" && GameStateManager._dbgWatchEnd) GameStateManager._dbgWatchEnd("endHacking->campaign-loop");
-    }
-    if ((dbgFrameCount % 180) === 0 && GameStateManager._dbgLog) {
-      GameStateManager._dbgLog("frame heartbeat", {
-        frame: dbgFrameCount,
-        dt: +dt.toFixed(4),
-        phase: GameStateManager.phase,
-        mode: GameStateManager.mode,
-        currentState: GameStateManager.currentState
-      });
-    }
-    switch (GameStateManager.currentState) {
-      case STATES.CAMPAIGN:
-      case STATES.HACKING:
-        GameStateManager.update(dt);
-        break;
-      case STATES.GAMEOVER:
-      case STATES.MENU:
-      case STATES.MULTIPLAYER_LOBBY:
-        GameStateManager.updateMeta(dt);
-        break;
-      default:
-        break;
-    }
-    GameStateManager.render(dt);
+    setInterval(() => {
+      const elapsed = performance.now() - dbgLastFrameAt;
+      if (elapsed > 1200) {
+        if (!dbgLoopStallWarned) {
+          dbgLoopStallWarned = true;
+          if (GameStateManager && GameStateManager._dbgLog) {
+            GameStateManager._dbgLog("FRAME LOOP STALL DETECTED", {
+              elapsedMs: +elapsed.toFixed(1),
+              phase: GameStateManager.phase,
+              mode: GameStateManager.mode,
+              currentState: GameStateManager.currentState
+            });
+          }
+        }
+      } else {
+        dbgLoopStallWarned = false;
+      }
+    }, 500);
     requestAnimationFrame(frame);
   }
-  setInterval(() => {
-    const elapsed = performance.now() - dbgLastFrameAt;
-    if (elapsed > 1200) {
-      if (!dbgLoopStallWarned) {
-        dbgLoopStallWarned = true;
-        if (GameStateManager && GameStateManager._dbgLog) {
-          GameStateManager._dbgLog("FRAME LOOP STALL DETECTED", {
-            elapsedMs: +elapsed.toFixed(1),
-            phase: GameStateManager.phase,
-            mode: GameStateManager.mode,
-            currentState: GameStateManager.currentState
-          });
-        }
-      }
-    } else {
-      dbgLoopStallWarned = false;
-    }
-  }, 500);
-  requestAnimationFrame(frame);
 })();
 </script>
 </body>
