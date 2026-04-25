@@ -5869,10 +5869,24 @@
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
+          this.multiplayerDedicatedUrl = "";
           if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           this.unlocked = loadUnlock();
           this.setPhase("mission_select");
         }
+      }
+    },
+    /** True when a dedicated WS/WSS server is configured (stored or from ?ws=). */
+    _hasDedicatedMultiplayerUrl() {
+      if ((this.multiplayerDedicatedUrl || "").trim()) return true;
+      if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) return true;
+      return false;
+    },
+    /** Ensure GameStateManager has the URL before _apply (HOST used to clear ?ws= when this was empty). */
+    _ensureMultiplayerDedicatedUrlFromWindow() {
+      if ((this.multiplayerDedicatedUrl || "").trim()) return;
+      if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) {
+        this.multiplayerDedicatedUrl = String(window.NEURAL_HEIST_WS).trim();
       }
     },
     _applyMultiplayerDedicatedUrlToWindow() {
@@ -5889,9 +5903,7 @@
     },
     openMultiplayerMenu(fromReturn) {
       SFX.play("ui_click");
-      if (typeof window !== "undefined" && window.NEURAL_HEIST_WS && !(this.multiplayerDedicatedUrl || "").trim()) {
-        this.multiplayerDedicatedUrl = String(window.NEURAL_HEIST_WS).trim();
-      }
+      this._ensureMultiplayerDedicatedUrlFromWindow();
       this._multiplayerMenuReturnPhase = fromReturn || "terminal_login";
       this.setPhase("multiplayer_menu");
     },
@@ -5906,6 +5918,7 @@
       if (mx > cx0 && mx < cx1) {
         if (my > 220 && my < 272) {
           SFX.play("ui_click");
+          this._ensureMultiplayerDedicatedUrlFromWindow();
           this._applyMultiplayerDedicatedUrlToWindow();
           this.localRoom = null;
           this.roomCode = "";
@@ -5915,8 +5928,9 @@
         }
         if (my > 288 && my < 340) {
           SFX.play("ui_click");
-          const hasDedicated = !!(this.multiplayerDedicatedUrl || "").trim();
+          const hasDedicated = this._hasDedicatedMultiplayerUrl();
           if (hasDedicated) {
+            this._ensureMultiplayerDedicatedUrlFromWindow();
             this._applyMultiplayerDedicatedUrlToWindow();
             this.localRoom = null;
             this.roomCode = "";
@@ -5964,6 +5978,7 @@
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
+          this.multiplayerDedicatedUrl = "";
           if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           NetworkManager.touchSession();
           this.setPhase("mission_select");
@@ -5985,7 +6000,10 @@
           SFX.play("ui_click");
           this.missionId = i;
           if (this.gameMode === "online_mock") {
-            if (typeof window !== "undefined" && window.NEURAL_HEIST_WS) {
+            const dedicatedSoloNet = this._hasDedicatedMultiplayerUrl() && !this.localRoom;
+            if (dedicatedSoloNet) {
+              this._ensureMultiplayerDedicatedUrlFromWindow();
+              this._applyMultiplayerDedicatedUrlToWindow();
               this.roomCode = "";
               this.localRoom = null;
               this.setPhase("briefing");
@@ -7627,6 +7645,9 @@
     };
   } else {
     GameStateManager.initInput();
+    if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) {
+      GameStateManager.multiplayerDedicatedUrl = String(window.NEURAL_HEIST_WS).trim();
+    }
     GameStateManager._setHint("WASD · Q talk (1/2/3 choose) · hack relays then extract", "#8fefff", 4.0);
 
     function frame(now) {
