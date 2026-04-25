@@ -1,9 +1,9 @@
 # Node version: https://render.com/docs/node-version
 # (NODE_VERSION env below overrides; .node-version also pins the repo.)
 # Deploy: New → Blueprint → paste this repo. Creates one WebSocket-capable Node service.
-# After deploy, open index.html locally or host it anywhere, then use terminal
-# "DEDICATED SERVER (WSS)" with wss://neural-heist.onrender.com/ws (path must be /ws)
-# Or append: ?ws=wss%3A%2F%2F<host>%2Fws&slots=2
+# After deploy, the static game (e.g. on Vercel) uses this host automatically for
+# multiplayer (see NH_DEDICATED_WS_URL in index.html). Path must be /ws.
+# Optional: ?slots=2 still sets lobby size when opening the page.
 services:
   - type: web
     name: neural-heist-server

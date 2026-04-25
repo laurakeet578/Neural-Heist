@@ -19,13 +19,6 @@
     (function () {
       try {
         var q = new URLSearchParams(window.location.search);
-        var w = q.get("ws");
-        if (w) {
-          w = decodeURIComponent(w).trim();
-          // Shorthand: /?ws=ws → dedicated Render host (full URL required otherwise)
-          if (/^ws$/i.test(w)) w = "wss://neural-heist.onrender.com/ws";
-          window.NEURAL_HEIST_WS = w;
-        }
         var s = q.get("slots");
         if (s != null && s !== "") window.NEURAL_HEIST_SLOTS = Math.max(2, Math.min(4, parseInt(s, 10) || 2));
       } catch (e) {}
@@ -39,13 +32,19 @@
 <script>
 /**
  * NEURAL HEIST: UNDERCOVER — Client–host separation with wire protocol.
- * - Embedded host (campaign / mock): SimulationRunner ticks in-process; snapshots optional.
- * - Remote client: set window.NEURAL_HEIST_WS to a wss:// URL; client sends INPUT, applies SNAPSHOT only.
- * Server binary should run the same protocol (Node + ws) using shared message shapes.
+ * - Embedded host (campaign): SimulationRunner ticks in-process.
+ * - Multiplayer: always uses NH_DEDICATED_WS_URL (Node + ws); client sends INPUT, applies SNAPSHOT only.
  */
 (function () {
   "use strict";
   const VIEW_W = 1280, VIEW_H = 720;
+  /** Authoritative Node host for online co-op. Edit if your game server moves. */
+  const NH_DEDICATED_WS_URL = (() => {
+    if (typeof window === "undefined" || !window.location) return "wss://neural-heist.onrender.com/ws";
+    const h = String(window.location.hostname || "").toLowerCase();
+    if (h === "localhost" || h === "127.0.0.1") return "ws://127.0.0.1:8787/ws";
+    return "wss://neural-heist.onrender.com/ws";
+  })();
   const canvas = document.getElementById("c");
   const ctx = canvas.getContext("2d");
   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
@@ -428,7 +427,7 @@
       }
       if (this.mode === "ws_client") this.mode = "embedded";
     },
-    /** Optional: window.NEURAL_HEIST_WS = "wss://host/game" — client mode, no local sim */
+    /** Dedicated host URL (set via GameStateManager._assignDedicatedCloudUrl). */
     tryConnectWebSocket(url) {
       if (!url || typeof WebSocket === "undefined") return;
       let connectUrl = String(url).trim();
@@ -5894,13 +5893,13 @@
         }
       }
     },
-    /** True when a dedicated WS/WSS server is configured (stored or from ?ws=). */
+    /** True when dedicated cloud multiplayer is active (NH_DEDICATED_WS_URL applied). */
     _hasDedicatedMultiplayerUrl() {
       if ((this.multiplayerDedicatedUrl || "").trim()) return true;
       if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) return true;
       return false;
     },
-    /** Ensure GameStateManager has the URL before _apply (HOST used to clear ?ws= when this was empty). */
+    /** Copy window.NEURAL_HEIST_WS into state if set (e.g. devtools override). */
     _ensureMultiplayerDedicatedUrlFromWindow() {
       if ((this.multiplayerDedicatedUrl || "").trim()) return;
       if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) {
@@ -5913,22 +5912,19 @@
       if (u) window.NEURAL_HEIST_WS = u;
       else window.NEURAL_HEIST_WS = "";
     },
+    _assignDedicatedCloudUrl() {
+      this.multiplayerDedicatedUrl = NH_DEDICATED_WS_URL;
+      this._applyMultiplayerDedicatedUrlToWindow();
+    },
     _goToMultiplayerMissionSelect() {
       this.gameMode = "online_mock";
-      NetworkManager.touchSession();
-      this.unlocked = loadUnlock();
-      this.setPhase("mission_select");
-    },
-    /** Same-browser / BroadcastChannel room codes — disconnects cloud WS for this session. */
-    switchToLocalBrowserMultiplayer() {
-      NetworkCoordinator.closeCloudWebSocket();
-      this.multiplayerDedicatedUrl = "";
-      if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
+      this._assignDedicatedCloudUrl();
       this.localRoom = null;
       this.roomCode = "";
       this.lobbyReady = false;
-      this._goToMultiplayerMissionSelect();
-      this._setHint("Local room: choose a mission, then host or join with the 4-digit code (same browser / tabs). Reload to use ?ws= cloud again.", "#9defff", 5.5);
+      NetworkManager.touchSession();
+      this.unlocked = loadUnlock();
+      this.setPhase("mission_select");
     },
     openMultiplayerMenu(fromReturn) {
       SFX.play("ui_click");
@@ -5945,60 +5941,14 @@
         return;
       }
       if (mx > cx0 && mx < cx1) {
-        if (my > 206 && my < 258) {
+        if (my > 224 && my < 276) {
           SFX.play("ui_click");
-          this._ensureMultiplayerDedicatedUrlFromWindow();
-          this._applyMultiplayerDedicatedUrlToWindow();
+          NetworkCoordinator.closeCloudWebSocket();
+          this._assignDedicatedCloudUrl();
           this.localRoom = null;
           this.roomCode = "";
           this.lobbyReady = false;
           this._goToMultiplayerMissionSelect();
-          return;
-        }
-        if (my > 266 && my < 318) {
-          SFX.play("ui_click");
-          const hasDedicated = this._hasDedicatedMultiplayerUrl();
-          if (hasDedicated) {
-            this._ensureMultiplayerDedicatedUrlFromWindow();
-            this._applyMultiplayerDedicatedUrlToWindow();
-            this.localRoom = null;
-            this.roomCode = "";
-            this.lobbyReady = false;
-            this._goToMultiplayerMissionSelect();
-            return;
-          }
-          const entered = (typeof window !== "undefined" && window.prompt)
-            ? window.prompt("Enter the 4-digit room code", this.roomCode || "")
-            : "";
-          const joined = LocalRoomService.joinRoom(entered || this.roomCode);
-          if (joined) {
-            this.localRoom = joined.room;
-            this.roomCode = joined.room.roomCode;
-            this.localPlayerId = joined.slot;
-            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
-            if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
-            this._goToMultiplayerMissionSelect();
-          } else if (typeof window !== "undefined" && window.alert) {
-            window.alert("Could not join that room. Check the code and try again.");
-          }
-          return;
-        }
-        if (my > 326 && my < 378) {
-          SFX.play("ui_click");
-          this.switchToLocalBrowserMultiplayer();
-          return;
-        }
-        if (my > 396 && my < 448) {
-          SFX.play("ui_click");
-          const defHint = (typeof window !== "undefined" && window.location && String(window.location.hostname || "").indexOf("localhost") >= 0)
-            ? "ws://127.0.0.1:8787/ws"
-            : "wss://neural-heist.onrender.com/ws";
-          const cur = (this.multiplayerDedicatedUrl || "").trim() || (typeof window !== "undefined" ? (window.NEURAL_HEIST_WS || "") : "");
-          const msg = "Optional online server (leave empty for same-browser play).\n\nPaste wss:// or ws:// URL, or clear to use the default.";
-          const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt(msg, cur || defHint) : null;
-          if (entered === null) return;
-          this.multiplayerDedicatedUrl = String(entered).trim();
-          this._applyMultiplayerDedicatedUrlToWindow();
           return;
         }
       }
@@ -6035,16 +5985,12 @@
           SFX.play("ui_click");
           this.missionId = i;
           if (this.gameMode === "online_mock") {
-            const dedicatedSoloNet = this._hasDedicatedMultiplayerUrl() && !this.localRoom;
-            if (dedicatedSoloNet) {
-              this._ensureMultiplayerDedicatedUrlFromWindow();
-              this._applyMultiplayerDedicatedUrlToWindow();
-              this.roomCode = "";
-              this.localRoom = null;
-              this.setPhase("briefing");
-            } else {
-              this.enterLobby(i);
-            }
+            // Dedicated-server multiplayer is the only supported online flow.
+            this._assignDedicatedCloudUrl();
+            this.roomCode = "";
+            this.localRoom = null;
+            this.lobbyReady = false;
+            this.setPhase("briefing");
           } else this.setPhase("briefing");
           return;
         }
@@ -7255,7 +7201,7 @@
       ctx.fillStyle="rgba(0,50,62,0.92)"; ctx.strokeStyle="rgba(255,160,120,"+(0.35+Math.sin(u*2.1)*0.1)+")";
       ctx.fillRect(VIEW_W/2-160,308,320,52); ctx.strokeRect(VIEW_W/2-160,308,320,52);
       ctx.fillStyle="#fa8"; ctx.font="16px monospace"; ctx.fillText("MULTIPLAYER", VIEW_W/2, 338);
-      ctx.fillStyle="#678"; ctx.font="10px monospace"; ctx.fillText("Co-op with friends · optional online server", VIEW_W/2, 356);
+      ctx.fillStyle="#678"; ctx.font="10px monospace"; ctx.fillText("Online co-op via the Neural Heist game server", VIEW_W/2, 356);
       ctx.fillStyle="rgba(0,38,48,0.92)"; ctx.strokeStyle="rgba(0,170,200,0.38)";
       ctx.fillRect(VIEW_W/2-160,376,320,52); ctx.strokeRect(VIEW_W/2-160,376,320,52);
       ctx.fillStyle="#0aa"; ctx.fillText("CONTINUE (saved unlock)", VIEW_W/2, 410);
@@ -7297,44 +7243,19 @@
       ctx.shadowBlur = 0;
       ctx.fillStyle = "#7a9aac";
       ctx.font = "12px monospace";
-      ctx.fillText("Cloud host / join, local room codes, or edit the server URL.", VIEW_W / 2, 192);
+      ctx.fillText("Everyone connects to the same dedicated server — no link or URL to paste.", VIEW_W / 2, 188);
+      ctx.fillStyle = "#5a6a78";
+      ctx.font = "10px monospace";
+      const hostLine = NH_DEDICATED_WS_URL.length > 52 ? NH_DEDICATED_WS_URL.slice(0, 49) + "…" : NH_DEDICATED_WS_URL;
+      ctx.fillText(hostLine, VIEW_W / 2, 208);
       const pulse = 0.36 + Math.sin(u * 1.65) * 0.1;
       ctx.fillStyle = "rgba(0,52,68,0.94)";
       ctx.strokeStyle = "rgba(0,255,220," + pulse + ")";
-      ctx.fillRect(VIEW_W / 2 - 170, 206, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 206, 340, 52);
+      ctx.fillRect(VIEW_W / 2 - 170, 224, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 224, 340, 52);
       ctx.fillStyle = "#0ff";
       ctx.font = "bold 16px monospace";
-      ctx.fillText("CLOUD HOST / PICK MISSION", VIEW_W / 2, 240);
-      ctx.fillStyle = "rgba(36,28,48,0.94)";
-      ctx.strokeStyle = "rgba(255,170,130," + (0.32 + Math.sin(u * 1.9) * 0.08) + ")";
-      ctx.fillRect(VIEW_W / 2 - 170, 266, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 266, 340, 52);
-      ctx.fillStyle = "#fc9";
-      ctx.font = "bold 16px monospace";
-      ctx.fillText("CLOUD JOIN (same URL)", VIEW_W / 2, 300);
-      ctx.fillStyle = "rgba(40,52,40,0.94)";
-      ctx.strokeStyle = "rgba(120,255,180," + (0.28 + Math.sin(u * 1.5) * 0.08) + ")";
-      ctx.fillRect(VIEW_W / 2 - 170, 326, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 326, 340, 52);
-      ctx.fillStyle = "#9f8";
-      ctx.font = "bold 15px monospace";
-      ctx.fillText("LOCAL ROOM (4-DIGIT CODE)", VIEW_W / 2, 358);
-      ctx.fillStyle = "#6a7a88";
-      ctx.font = "10px monospace";
-      ctx.fillText("Friends in tabs: use this — skips cloud. One shared world on Render has no private codes.", VIEW_W / 2, 384);
-      ctx.fillStyle = "#5a6a78";
-      ctx.font = "10px monospace";
-      ctx.fillText("Cloud server URL (?ws=)", VIEW_W / 2, 402);
-      ctx.fillStyle = "rgba(22,32,44,0.92)";
-      ctx.strokeStyle = "rgba(120,160,200,0.35)";
-      ctx.fillRect(VIEW_W / 2 - 170, 396, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 396, 340, 52);
-      const urlDisp = (this.multiplayerDedicatedUrl || "").trim();
-      ctx.fillStyle = urlDisp ? "#bde" : "#789";
-      ctx.font = "11px monospace";
-      const line = urlDisp ? (urlDisp.length > 48 ? urlDisp.slice(0, 45) + "…" : urlDisp) : "Not set — click to add or change";
-      ctx.fillText(line, VIEW_W / 2, 428);
+      ctx.fillText("PLAY ONLINE (SHARED SERVER)", VIEW_W / 2, 258);
       ctx.fillStyle = "#345";
       ctx.fillRect(80, VIEW_H - 80, 160, 40);
       ctx.strokeStyle = "#567";
@@ -7691,9 +7612,6 @@
     };
   } else {
     GameStateManager.initInput();
-    if (typeof window !== "undefined" && String(window.NEURAL_HEIST_WS || "").trim()) {
-      GameStateManager.multiplayerDedicatedUrl = String(window.NEURAL_HEIST_WS).trim();
-    }
     GameStateManager._setHint("WASD · Q talk (1/2/3 choose) · hack relays then extract", "#8fefff", 4.0);
 
     function frame(now) {
