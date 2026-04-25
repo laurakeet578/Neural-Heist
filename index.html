@@ -20,7 +20,12 @@
       try {
         var q = new URLSearchParams(window.location.search);
         var w = q.get("ws");
-        if (w) window.NEURAL_HEIST_WS = decodeURIComponent(w);
+        if (w) {
+          w = decodeURIComponent(w).trim();
+          // Shorthand: /?ws=ws → dedicated Render host (full URL required otherwise)
+          if (/^ws$/i.test(w)) w = "wss://neural-heist.onrender.com/ws";
+          window.NEURAL_HEIST_WS = w;
+        }
         var s = q.get("slots");
         if (s != null && s !== "") window.NEURAL_HEIST_SLOTS = Math.max(2, Math.min(4, parseInt(s, 10) || 2));
       } catch (e) {}
@@ -411,8 +416,16 @@
     /** Optional: window.NEURAL_HEIST_WS = "wss://host/game" — client mode, no local sim */
     tryConnectWebSocket(url) {
       if (!url || typeof WebSocket === "undefined") return;
+      let connectUrl = String(url).trim();
       try {
-        this.ws = new WebSocket(url);
+        const pu = new URL(connectUrl);
+        if (pu.pathname === "/" || pu.pathname === "") {
+          pu.pathname = "/ws";
+          connectUrl = pu.toString();
+        }
+      } catch (e) { /* use raw url */ }
+      try {
+        this.ws = new WebSocket(connectUrl);
         this.mode = "ws_client";
         this.ws.onopen = () => {
           const hello = { v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" };
@@ -5931,7 +5944,7 @@
           SFX.play("ui_click");
           const defHint = (typeof window !== "undefined" && window.location && String(window.location.hostname || "").indexOf("localhost") >= 0)
             ? "ws://127.0.0.1:8787/ws"
-            : "wss://your-server.example.com/ws";
+            : "wss://neural-heist.onrender.com/ws";
           const cur = (this.multiplayerDedicatedUrl || "").trim() || (typeof window !== "undefined" ? (window.NEURAL_HEIST_WS || "") : "");
           const msg = "Optional online server (leave empty for same-browser play).\n\nPaste wss:// or ws:// URL, or clear to use the default.";
           const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt(msg, cur || defHint) : null;

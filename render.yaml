@@ -2,7 +2,7 @@
 # (NODE_VERSION env below overrides; .node-version also pins the repo.)
 # Deploy: New → Blueprint → paste this repo. Creates one WebSocket-capable Node service.
 # After deploy, open index.html locally or host it anywhere, then use terminal
-# "DEDICATED SERVER (WSS)" with wss://<this-service>.onrender.com/ws
+# "DEDICATED SERVER (WSS)" with wss://neural-heist.onrender.com/ws (path must be /ws)
 # Or append: ?ws=wss%3A%2F%2F<host>%2Fws&slots=2
 services:
   - type: web
