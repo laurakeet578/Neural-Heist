@@ -15,6 +15,7 @@ const HTML_PATH = path.join(ROOT, "index.html");
 
 const PORT = Number(process.env.PORT || 8787);
 const NH_MISSION_ID = Number(process.env.NH_MISSION_ID || 1);
+const NH_MAX_MISSION = Math.max(1, Number(process.env.NH_MAX_MISSION || 6));
 const NH_SLOT_COUNT = Math.max(2, Math.min(4, Number(process.env.NH_SLOT_COUNT || 2)));
 const NH_TICK_HZ = Math.max(8, Math.min(60, Number(process.env.NH_TICK_HZ || 20)));
 
@@ -112,8 +113,23 @@ function main() {
   /** @type {null | ((payload: object) => void)} */
   let broadcastSnapshot = null;
 
-  function ensureRoom() {
+  function clampMissionId(m) {
+    const v = Number(m) | 0;
+    if (!Number.isFinite(v) || v < 1) return NH_MISSION_ID;
+    return Math.min(v, NH_MAX_MISSION);
+  }
+
+  function clampSlotCount(n) {
+    const v = Number(n) | 0;
+    if (!Number.isFinite(v)) return NH_SLOT_COUNT;
+    return Math.max(2, Math.min(4, v));
+  }
+
+  /** First HELLO picks mission + slot count so browser clients stay in sync with the host world. */
+  function ensureRoom(hello) {
     if (roomBootstrapped) return;
+    const mid = hello && hello.missionId != null ? clampMissionId(hello.missionId) : NH_MISSION_ID;
+    const sc = hello && hello.slotCount != null ? clampSlotCount(hello.slotCount) : NH_SLOT_COUNT;
     broadcastSnapshot = (payload) => {
       const json = JSON.stringify(payload);
       for (const ws of clients.keys()) {
@@ -121,8 +137,8 @@ function main() {
       }
     };
     RT.bootstrapDedicatedRoom({
-      missionId: NH_MISSION_ID,
-      slotCount: NH_SLOT_COUNT,
+      missionId: mid,
+      slotCount: sc,
       onSnapshot: broadcastSnapshot
     });
     roomBootstrapped = true;
@@ -172,7 +188,7 @@ function main() {
       }
 
       if (msg.type === Net.Msg.HELLO) {
-        ensureRoom();
+        ensureRoom(msg);
         const meta = clients.get(ws);
         if (meta && meta.slot != null) return;
 

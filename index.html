@@ -306,6 +306,14 @@
       if (snap.doorsOpen && world.doorsOpen) {
         for (const k of Object.keys(snap.doorsOpen)) world.doorsOpen[k] = snap.doorsOpen[k];
       }
+      if (Array.isArray(snap.connectedSlots) && snap.connectedSlots.length) {
+        const cs = snap.connectedSlots.map(x => !!x);
+        if (!NetworkCoordinator.connectedSlots || NetworkCoordinator.connectedSlots.length !== cs.length) {
+          NetworkCoordinator.connectedSlots = cs.slice();
+        } else {
+          for (let ci = 0; ci < cs.length; ci++) NetworkCoordinator.connectedSlots[ci] = cs[ci];
+        }
+      }
       if (world.flags) {
         const f = snap.flags || {};
         world.flags.package = f.package;
@@ -413,6 +421,13 @@
     isAuthoritativeHost() {
       return this.mode !== "ws_client" && this.mode !== "local_client";
     },
+    closeCloudWebSocket() {
+      if (this.ws) {
+        try { this.ws.close(); } catch (e) {}
+        this.ws = null;
+      }
+      if (this.mode === "ws_client") this.mode = "embedded";
+    },
     /** Optional: window.NEURAL_HEIST_WS = "wss://host/game" — client mode, no local sim */
     tryConnectWebSocket(url) {
       if (!url || typeof WebSocket === "undefined") return;
@@ -429,6 +444,8 @@
         this.mode = "ws_client";
         this.ws.onopen = () => {
           const hello = { v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" };
+          const maxM = Math.max(1, MISSIONS.length - 1);
+          hello.missionId = clamp((GameStateManager.missionId | 0) || 1, 1, maxM);
           if (typeof window !== "undefined" && window.NEURAL_HEIST_SLOTS != null) {
             hello.slotCount = clamp(window.NEURAL_HEIST_SLOTS | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
           }
@@ -5866,6 +5883,7 @@
         if (my > 332 && my < 384) {
           SFX.play("ui_click");
           this.gameMode = "campaign";
+          NetworkCoordinator.closeCloudWebSocket();
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
@@ -5901,6 +5919,17 @@
       this.unlocked = loadUnlock();
       this.setPhase("mission_select");
     },
+    /** Same-browser / BroadcastChannel room codes — disconnects cloud WS for this session. */
+    switchToLocalBrowserMultiplayer() {
+      NetworkCoordinator.closeCloudWebSocket();
+      this.multiplayerDedicatedUrl = "";
+      if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
+      this.localRoom = null;
+      this.roomCode = "";
+      this.lobbyReady = false;
+      this._goToMultiplayerMissionSelect();
+      this._setHint("Local room: choose a mission, then host or join with the 4-digit code (same browser / tabs). Reload to use ?ws= cloud again.", "#9defff", 5.5);
+    },
     openMultiplayerMenu(fromReturn) {
       SFX.play("ui_click");
       this._ensureMultiplayerDedicatedUrlFromWindow();
@@ -5916,7 +5945,7 @@
         return;
       }
       if (mx > cx0 && mx < cx1) {
-        if (my > 220 && my < 272) {
+        if (my > 206 && my < 258) {
           SFX.play("ui_click");
           this._ensureMultiplayerDedicatedUrlFromWindow();
           this._applyMultiplayerDedicatedUrlToWindow();
@@ -5926,7 +5955,7 @@
           this._goToMultiplayerMissionSelect();
           return;
         }
-        if (my > 288 && my < 340) {
+        if (my > 266 && my < 318) {
           SFX.play("ui_click");
           const hasDedicated = this._hasDedicatedMultiplayerUrl();
           if (hasDedicated) {
@@ -5954,7 +5983,12 @@
           }
           return;
         }
-        if (my > 388 && my < 440) {
+        if (my > 326 && my < 378) {
+          SFX.play("ui_click");
+          this.switchToLocalBrowserMultiplayer();
+          return;
+        }
+        if (my > 396 && my < 448) {
           SFX.play("ui_click");
           const defHint = (typeof window !== "undefined" && window.location && String(window.location.hostname || "").indexOf("localhost") >= 0)
             ? "ws://127.0.0.1:8787/ws"
@@ -5975,6 +6009,7 @@
         if (my>240 && my<292) {
           SFX.play("ui_click");
           this.gameMode = "campaign";
+          NetworkCoordinator.closeCloudWebSocket();
           NetworkCoordinator.closeLocalChannel();
           this.localRoom = null;
           this.roomCode = "";
@@ -6784,7 +6819,11 @@
           ctx.fillText("DONE ✓", o.rect.x + 6, o.rect.y + 18);
         }
       });
-      AuthoritativeSession.players.forEach(pl => pl.render(ctx));
+      const slotOn = NetworkCoordinator.connectedSlots;
+      AuthoritativeSession.players.forEach(pl => {
+        if (slotOn && slotOn.length > pl.id && slotOn[pl.id] === false) return;
+        pl.render(ctx);
+      });
       ctx.restore();
 
       this.drawHUD();
@@ -7258,37 +7297,44 @@
       ctx.shadowBlur = 0;
       ctx.fillStyle = "#7a9aac";
       ctx.font = "12px monospace";
-      ctx.fillText("Host a session, join a friend, or add an online server below.", VIEW_W / 2, 192);
+      ctx.fillText("Cloud host / join, local room codes, or edit the server URL.", VIEW_W / 2, 192);
       const pulse = 0.36 + Math.sin(u * 1.65) * 0.1;
       ctx.fillStyle = "rgba(0,52,68,0.94)";
       ctx.strokeStyle = "rgba(0,255,220," + pulse + ")";
-      ctx.fillRect(VIEW_W / 2 - 170, 220, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 220, 340, 52);
+      ctx.fillRect(VIEW_W / 2 - 170, 206, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 206, 340, 52);
       ctx.fillStyle = "#0ff";
       ctx.font = "bold 16px monospace";
-      ctx.fillText("HOST GAME", VIEW_W / 2, 254);
+      ctx.fillText("CLOUD HOST / PICK MISSION", VIEW_W / 2, 240);
       ctx.fillStyle = "rgba(36,28,48,0.94)";
       ctx.strokeStyle = "rgba(255,170,130," + (0.32 + Math.sin(u * 1.9) * 0.08) + ")";
-      ctx.fillRect(VIEW_W / 2 - 170, 288, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 288, 340, 52);
+      ctx.fillRect(VIEW_W / 2 - 170, 266, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 266, 340, 52);
       ctx.fillStyle = "#fc9";
       ctx.font = "bold 16px monospace";
-      ctx.fillText("JOIN GAME", VIEW_W / 2, 322);
+      ctx.fillText("CLOUD JOIN (same URL)", VIEW_W / 2, 300);
+      ctx.fillStyle = "rgba(40,52,40,0.94)";
+      ctx.strokeStyle = "rgba(120,255,180," + (0.28 + Math.sin(u * 1.5) * 0.08) + ")";
+      ctx.fillRect(VIEW_W / 2 - 170, 326, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 326, 340, 52);
+      ctx.fillStyle = "#9f8";
+      ctx.font = "bold 15px monospace";
+      ctx.fillText("LOCAL ROOM (4-DIGIT CODE)", VIEW_W / 2, 358);
       ctx.fillStyle = "#6a7a88";
-      ctx.font = "11px monospace";
-      ctx.fillText("Join with a room code on this device, or set an online server first.", VIEW_W / 2, 352);
+      ctx.font = "10px monospace";
+      ctx.fillText("Friends in tabs: use this — skips cloud. One shared world on Render has no private codes.", VIEW_W / 2, 384);
       ctx.fillStyle = "#5a6a78";
       ctx.font = "10px monospace";
-      ctx.fillText("Server address (optional)", VIEW_W / 2, 378);
+      ctx.fillText("Cloud server URL (?ws=)", VIEW_W / 2, 402);
       ctx.fillStyle = "rgba(22,32,44,0.92)";
       ctx.strokeStyle = "rgba(120,160,200,0.35)";
-      ctx.fillRect(VIEW_W / 2 - 170, 388, 340, 52);
-      ctx.strokeRect(VIEW_W / 2 - 170, 388, 340, 52);
+      ctx.fillRect(VIEW_W / 2 - 170, 396, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 396, 340, 52);
       const urlDisp = (this.multiplayerDedicatedUrl || "").trim();
       ctx.fillStyle = urlDisp ? "#bde" : "#789";
       ctx.font = "11px monospace";
       const line = urlDisp ? (urlDisp.length > 48 ? urlDisp.slice(0, 45) + "…" : urlDisp) : "Not set — click to add or change";
-      ctx.fillText(line, VIEW_W / 2, 420);
+      ctx.fillText(line, VIEW_W / 2, 428);
       ctx.fillStyle = "#345";
       ctx.fillRect(80, VIEW_H - 80, 160, 40);
       ctx.strokeStyle = "#567";

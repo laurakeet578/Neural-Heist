@@ -16,6 +16,9 @@ services:
         value: "20"
       - key: NH_MISSION_ID
         value: "1"
+      # Max mission index allowed if clients send missionId in HELLO (default 6).
+      - key: NH_MAX_MISSION
+        value: "6"
       - key: NH_SLOT_COUNT
         value: "2"
       - key: NH_TICK_HZ
