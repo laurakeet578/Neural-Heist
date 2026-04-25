@@ -341,7 +341,33 @@
         const s = plist[i];
         const p = playersById[s.id];
         if (!p) continue;
-        p.x = s.x; p.y = s.y; p.vx = s.vx; p.vy = s.vy;
+        const isLocal = (GameStateManager && (GameStateManager.localPlayerId | 0) === (p.id | 0));
+        if (isLocal) {
+          // Keep local player server-authoritative, but damp tiny corrections to reduce visible jitter.
+          const dx = (s.x - p.x), dy = (s.y - p.y);
+          const d2 = dx * dx + dy * dy;
+          if (d2 > 64 * 64) {
+            p.x = s.x;
+            p.y = s.y;
+          } else {
+            p.x = lerp(p.x, s.x, 0.42);
+            p.y = lerp(p.y, s.y, 0.42);
+          }
+          p.vx = s.vx;
+          p.vy = s.vy;
+        } else {
+          // Remote entities: store server target and let render frame interpolate smoothly.
+          p._netTargetX = s.x;
+          p._netTargetY = s.y;
+          p._netTargetVx = s.vx || 0;
+          p._netTargetVy = s.vy || 0;
+          p._netSnapAt = performance.now();
+          if (p._netSeen !== true) {
+            p.x = s.x;
+            p.y = s.y;
+            p._netSeen = true;
+          }
+        }
         p.suspicion = s.suspicion;
         p.fakeTaskTimer = s.fakeTaskTimer;
         if (s.role != null) p.role = s.role;
@@ -412,15 +438,78 @@
     roomCode: "",
     hostSlots: {},
     remoteInputs: {},
+    remoteActionSeqByPeer: {},
     localSlot: 0,
     inputSeq: 0,
+    actionSeq: 0,
     lastAppliedTick: -1,
     connectedSlots: null,
+    wsUrl: "",
+    wsReconnectTimer: null,
+    wsReconnectAttempt: 0,
+    wsHeartbeatTimer: null,
+    wsLastPongAt: 0,
+    wsLastSnapshotAt: 0,
+    _wsManualClose: false,
+    wsConnected: false,
+    wsConnectionState: "idle",
+    wsDisconnectUiTimer: null,
+    pendingWelcomeSlot: null,
+    pendingWelcomeSlotCount: null,
     /** false only when live WS client connected and receiving snapshots */
     isAuthoritativeHost() {
       return this.mode !== "ws_client" && this.mode !== "local_client";
     },
+    _logWs(tag, payload) {
+      if (GameStateManager && GameStateManager._dbgLog) GameStateManager._dbgLog("ws " + tag, payload);
+      else if (payload !== undefined) console.log("[WS]", tag, payload);
+      else console.log("[WS]", tag);
+    },
+    _clearWsTimers() {
+      if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+      if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
+      if (this.wsDisconnectUiTimer) clearTimeout(this.wsDisconnectUiTimer);
+      this.wsReconnectTimer = null;
+      this.wsHeartbeatTimer = null;
+      this.wsDisconnectUiTimer = null;
+    },
+    _scheduleWsReconnect(reason) {
+      if (this._wsManualClose || !this.wsUrl || typeof window === "undefined") return;
+      if (this.wsReconnectTimer) return;
+      const attempt = this.wsReconnectAttempt | 0;
+      const delayMs = Math.min(12000, 2200 + Math.pow(2, Math.min(4, attempt)) * 300);
+      this.wsReconnectAttempt = attempt + 1;
+      this.wsReconnectTimer = setTimeout(() => {
+        this.wsReconnectTimer = null;
+        if (!this.ws && this.wsUrl) this.tryConnectWebSocket(this.wsUrl);
+      }, delayMs);
+      if (GameStateManager && GameStateManager._setHint && reason) {
+        GameStateManager._setHint("Reconnecting: " + reason, "#ffd9a8", 1.8);
+      }
+    },
+    _ensureSessionPlayersForCount(n) {
+      const world = GameStateManager.world;
+      if (!world) return;
+      const wanted = clamp(n | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
+      if (AuthoritativeSession.players.length === wanted) return;
+      AuthoritativeSession.reset(world, wanted, c => NetworkManager.assignRoles(c));
+      if (!NetworkCoordinator.connectedSlots || NetworkCoordinator.connectedSlots.length !== wanted) {
+        NetworkCoordinator.connectedSlots = new Array(wanted).fill(false);
+      }
+      GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
+    },
+    _applyPendingWelcome() {
+      if (this.pendingWelcomeSlot != null) GameStateManager.localPlayerId = this.pendingWelcomeSlot | 0;
+      if (this.pendingWelcomeSlotCount != null) this._ensureSessionPlayersForCount(this.pendingWelcomeSlotCount | 0);
+    },
     closeCloudWebSocket() {
+      this._wsManualClose = true;
+      this._clearWsTimers();
+      this.wsUrl = "";
+      this.wsConnected = false;
+      this.wsConnectionState = "disconnected";
+      this.pendingWelcomeSlot = null;
+      this.pendingWelcomeSlotCount = null;
       if (this.ws) {
         try { this.ws.close(); } catch (e) {}
         this.ws = null;
@@ -438,10 +527,51 @@
           connectUrl = pu.toString();
         }
       } catch (e) { /* use raw url */ }
+      if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) {
+        if (this.wsUrl !== connectUrl) this._logWs("connect skipped (socket already active)", { requestedUrl: connectUrl, activeUrl: this.wsUrl || connectUrl });
+        else this._logWs("connect skipped (already connected/connecting)", { url: connectUrl, readyState: this.ws.readyState });
+        return;
+      }
+      if (this.wsDisconnectUiTimer) {
+        clearTimeout(this.wsDisconnectUiTimer);
+        this.wsDisconnectUiTimer = null;
+      }
+      this.wsUrl = connectUrl;
+      this._wsManualClose = false;
+      this.wsConnectionState = "connecting";
+      this._logWs("connect attempt", { url: connectUrl });
       try {
+        this._clearWsTimers();
         this.ws = new WebSocket(connectUrl);
         this.mode = "ws_client";
         this.ws.onopen = () => {
+          if (this.wsDisconnectUiTimer) {
+            clearTimeout(this.wsDisconnectUiTimer);
+            this.wsDisconnectUiTimer = null;
+          }
+          this.wsConnected = true;
+          this.wsConnectionState = "connected";
+          this._logWs("connect success", { url: connectUrl });
+          this.wsReconnectAttempt = 0;
+          this.wsLastPongAt = Date.now();
+          this.wsLastSnapshotAt = Date.now();
+          if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
+          this.wsHeartbeatTimer = setInterval(() => {
+            const sock = this.ws;
+            if (!sock || sock.readyState !== 1) return;
+            if (Date.now() - this.wsLastPongAt > 35000) {
+              try { sock.close(); } catch (e) {}
+              return;
+            }
+            // Only enforce snapshot stall once a mission is actively running.
+            const phase = GameStateManager ? GameStateManager.phase : "";
+            const needsSnapshotFeed = phase === "playing" || phase === "briefing";
+            if (needsSnapshotFeed && Date.now() - this.wsLastSnapshotAt > 14000) {
+              try { sock.close(); } catch (e) {}
+              return;
+            }
+            try { sock.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PING, t: Date.now() })); } catch (e) {}
+          }, 10000);
           const hello = { v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" };
           const maxM = Math.max(1, MISSIONS.length - 1);
           hello.missionId = clamp((GameStateManager.missionId | 0) || 1, 1, maxM);
@@ -453,10 +583,18 @@
         this.ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (msg.type === Net.Msg.PONG) {
+            this.wsLastPongAt = Date.now();
+            return;
+          }
           if (msg.type === Net.Msg.ERROR && msg.message && GameStateManager._setHint) {
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
           }
           if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world && AuthoritativeSession.players.length) {
+            this.wsLastSnapshotAt = Date.now();
+            if (Array.isArray(msg.players) && msg.players.length) {
+              this._ensureSessionPlayersForCount(msg.players.length);
+            }
             const byId = {};
             AuthoritativeSession.players.forEach(p => { byId[p.id] = p; });
             NetProtocol.applySnapshotV1(GameStateManager.world, byId, msg);
@@ -465,18 +603,38 @@
             GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
           }
           if (msg.type === Net.Msg.WELCOME && msg.slot != null) {
-            GameStateManager.localPlayerId = msg.slot | 0;
-            if (msg.slotCount != null && GameStateManager.world) {
-              const n = clamp(msg.slotCount | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
-              if (AuthoritativeSession.players.length !== n) {
-                AuthoritativeSession.reset(GameStateManager.world, n, c => NetworkManager.assignRoles(c));
-              }
-            }
+            this.pendingWelcomeSlot = msg.slot | 0;
+            if (msg.slotCount != null) this.pendingWelcomeSlotCount = msg.slotCount | 0;
+            this._applyPendingWelcome();
           }
         };
-        this.ws.onerror = () => { this.mode = "embedded"; };
-        this.ws.onclose = () => { this.mode = "embedded"; this.ws = null; };
-      } catch (e) { this.mode = "embedded"; }
+        this.ws.onerror = () => {
+          this._logWs("error", { url: connectUrl });
+        };
+        this.ws.onclose = () => {
+          const wasManual = !!this._wsManualClose;
+          this.wsConnected = false;
+          if (this.wsDisconnectUiTimer) clearTimeout(this.wsDisconnectUiTimer);
+          this.wsDisconnectUiTimer = setTimeout(() => {
+            this.wsConnectionState = "disconnected";
+            this.wsDisconnectUiTimer = null;
+          }, 1200);
+          this._logWs("closed", { manual: wasManual, url: connectUrl });
+          this.mode = "embedded";
+          this.ws = null;
+          if (this.wsHeartbeatTimer) {
+            clearInterval(this.wsHeartbeatTimer);
+            this.wsHeartbeatTimer = null;
+          }
+          if (!wasManual) this._scheduleWsReconnect("socket closed");
+        };
+      } catch (e) {
+        this.mode = "embedded";
+        this.wsConnected = false;
+        this.wsConnectionState = "disconnected";
+        this._logWs("connect failed", { url: connectUrl, error: String(e && e.message ? e.message : e) });
+        this._scheduleWsReconnect("connect failed");
+      }
     },
     sendInputFrame(inputPayload) {
       if (this.mode === "local_client" && this.bc) {
@@ -504,20 +662,24 @@
     /** Discrete gameplay intents — server must validate and apply (same code path as host try*). */
     sendMissionAction(payload, slot) {
       if (this.mode === "local_client" && this.bc) {
+        this.actionSeq++;
         this.bc.postMessage({
           v: Net.PROTOCOL_VERSION,
           type: Net.Msg.ACTION,
           room: this.roomCode,
           from: this.peerId,
+          seq: this.actionSeq,
           slot: slot | 0,
           payload
         });
         return;
       }
       if (!this.ws || this.ws.readyState !== 1) return;
+      this.actionSeq++;
       this.ws.send(JSON.stringify({
         v: Net.PROTOCOL_VERSION,
         type: Net.Msg.ACTION,
+        seq: this.actionSeq,
         slot: slot | 0,
         payload
       }));
@@ -535,6 +697,7 @@
       this.roomCode = "";
       this.hostSlots = {};
       this.remoteInputs = {};
+      this.remoteActionSeqByPeer = {};
     },
     initLocalChannel(roomCode, asHost, localSlot) {
       this.closeLocalChannel();
@@ -547,6 +710,7 @@
         this.hostSlots = {};
         this.hostSlots[this.peerId] = 0;
         this.remoteInputs = {};
+        this.remoteActionSeqByPeer = {};
       }
       this.bc.onmessage = (ev) => {
         const msg = ev.data || {};
@@ -579,6 +743,10 @@
           if (msg.type === Net.Msg.ACTION) {
             const slot = this.hostSlots[msg.from];
             if (slot == null || slot < 1 || slot > 3) return;
+            const seq = msg.seq | 0;
+            const prev = this.remoteActionSeqByPeer[msg.from] | 0;
+            if (seq > 0 && prev > 0 && seq <= prev) return;
+            if (seq > 0) this.remoteActionSeqByPeer[msg.from] = seq;
             const actSlot = msg.slot != null ? msg.slot | 0 : slot;
             if (actSlot !== slot) return;
             __nhApplyRemoteMissionAction(actSlot, msg.payload || {});
@@ -588,10 +756,15 @@
         }
         if (msg.to && msg.to !== this.peerId) return;
         if (msg.type === Net.Msg.WELCOME && msg.slot != null) {
-          GameStateManager.localPlayerId = msg.slot | 0;
+          this.pendingWelcomeSlot = msg.slot | 0;
+          if (msg.slotCount != null) this.pendingWelcomeSlotCount = msg.slotCount | 0;
+          this._applyPendingWelcome();
           return;
         }
         if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world && AuthoritativeSession.players.length) {
+          if (Array.isArray(msg.players) && msg.players.length) {
+            this._ensureSessionPlayersForCount(msg.players.length);
+          }
           const byId = {};
           AuthoritativeSession.players.forEach(p => { byId[p.id] = p; });
           NetProtocol.applySnapshotV1(GameStateManager.world, byId, msg);
@@ -759,20 +932,56 @@
       const room = ServerAuthorityFactory.createRoom(missionId, 4);
       room.roomCode = code;
       room.connectedSlots = [true, false, false, false];
+      room.peerBySlot = [NetworkCoordinator.peerId, null, null, null];
       GlobalGameState.rooms[code] = room;
       GlobalGameState.hostByRoom[code] = NetworkCoordinator.peerId;
       return room;
     },
-    joinRoom(code) {
+    joinRoom(code, peerId) {
       const room = GlobalGameState.rooms[String(code || "").toUpperCase()];
       if (!room) return null;
+      const pid = String(peerId || "");
+      if (pid && Array.isArray(room.peerBySlot)) {
+        for (let i = 0; i < room.peerBySlot.length; i++) {
+          if (room.peerBySlot[i] === pid) return { room, slot: i };
+        }
+      }
       for (let i = 0; i < room.slotCount; i++) {
         if (!room.connectedSlots[i]) {
           room.connectedSlots[i] = true;
+          if (!Array.isArray(room.peerBySlot)) room.peerBySlot = new Array(room.slotCount).fill(null);
+          room.peerBySlot[i] = pid || ("peer_slot_" + i);
           return { room, slot: i };
         }
       }
       return null;
+    },
+    leaveRoom(code, peerId) {
+      const room = GlobalGameState.rooms[String(code || "").toUpperCase()];
+      if (!room) return;
+      const pid = String(peerId || "");
+      if (Array.isArray(room.peerBySlot) && pid) {
+        for (let i = 0; i < room.peerBySlot.length; i++) {
+          if (room.peerBySlot[i] === pid) {
+            room.peerBySlot[i] = null;
+            room.connectedSlots[i] = false;
+            break;
+          }
+        }
+      }
+      if (room.connectedSlots.filter(Boolean).length === 0) {
+        delete GlobalGameState.rooms[room.roomCode];
+        delete GlobalGameState.hostByRoom[room.roomCode];
+      }
+    },
+    playerList(room) {
+      if (!room) return [];
+      const out = [];
+      const peers = Array.isArray(room.peerBySlot) ? room.peerBySlot : [];
+      for (let i = 0; i < room.slotCount; i++) {
+        out.push({ slot: i, connected: !!room.connectedSlots[i], peerId: peers[i] || null });
+      }
+      return out;
     },
     connectedCount(room) {
       return room ? room.connectedSlots.filter(Boolean).length : 0;
@@ -1987,7 +2196,9 @@
       footstep_soft: 0.11,
       guard_alert: 0.55,
       ui_click: 0.08,
-      npc_talk: 0.1
+      npc_talk: 0.1,
+      cutscene_static: 0.35,
+      cutscene_glitch: 0.12
     },
     ensure() {
       if (!this.enabled) return false;
@@ -2062,6 +2273,13 @@
         this._tone(220, 0.12, "sawtooth", 0.06, t + 0.09);
       } else if (kind === "npc_talk") {
         this._tone(540, 0.05, "sine", 0.03, t);
+      } else if (kind === "cutscene_static") {
+        for (let i = 0; i < 10; i++) {
+          this._tone(90 + Math.random() * 520, 0.035, "sawtooth", 0.028, t + i * 0.028);
+        }
+      } else if (kind === "cutscene_glitch") {
+        this._tone(180 + Math.random() * 120, 0.055, "square", 0.045, t);
+        this._tone(720 + Math.random() * 180, 0.04, "sawtooth", 0.03, t + 0.06);
       }
     }
   };
@@ -3668,7 +3886,7 @@
       if ((gsm.missionId | 0) >= maxMission) {
         gsm.nextMissionQueued = 0;
         gsm.breachTimer = 0;
-        gsm.setPhase("final_cutscene");
+        gsm.startFinalCutscene();
         forceExitHacking();
         return;
       }
@@ -3676,8 +3894,20 @@
       if (next > maxMission) next = 1;
       this.currentMissionIndex = next;
       gsm.nextMissionQueued = next;
-      gsm.breachTimer = 1.0;
-      gsm.setPhase("loading_next");
+      if ((gsm.missionId | 0) === 1) {
+        gsm.startPostLevel1Cutscene();
+      } else if ((gsm.missionId | 0) === 2) {
+        gsm.startPostLevel2Cutscene();
+      } else if ((gsm.missionId | 0) === 3) {
+        gsm.startPostLevel3Cutscene();
+      } else if ((gsm.missionId | 0) === 4) {
+        gsm.startPostLevel4Cutscene();
+      } else if ((gsm.missionId | 0) === 5) {
+        gsm.startPostLevel5Cutscene();
+      } else {
+        gsm.breachTimer = 1.0;
+        gsm.setPhase("loading_next");
+      }
       forceExitHacking();
     }
   };
@@ -4487,6 +4717,41 @@
           e.preventDefault();
           GameStateManager.advanceFromOverlay();
         }
+        if (GameStateManager.phase==="final_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape")) {
+          e.preventDefault();
+          GameStateManager.advanceFromOverlay();
+          return;
+        }
+        if (GameStateManager.phase==="intro_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape")) {
+          e.preventDefault();
+          GameStateManager.skipIntroCutscene();
+          return;
+        }
+        if (GameStateManager.phase==="post_level1_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape" || e.code==="KeyR")) {
+          e.preventDefault();
+          GameStateManager.skipPostLevel1Cutscene();
+          return;
+        }
+        if (GameStateManager.phase==="post_level2_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape" || e.code==="KeyR")) {
+          e.preventDefault();
+          GameStateManager.skipPostLevel2Cutscene();
+          return;
+        }
+        if (GameStateManager.phase==="post_level3_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape" || e.code==="KeyR")) {
+          e.preventDefault();
+          GameStateManager.skipPostLevel3Cutscene();
+          return;
+        }
+        if (GameStateManager.phase==="post_level4_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape" || e.code==="KeyR")) {
+          e.preventDefault();
+          GameStateManager.skipPostLevel4Cutscene();
+          return;
+        }
+        if (GameStateManager.phase==="post_level5_cutscene" && (e.code==="Space" || e.code==="Enter" || e.code==="Escape" || e.code==="KeyR")) {
+          e.preventDefault();
+          GameStateManager.skipPostLevel5Cutscene();
+          return;
+        }
         if (e.code==="Escape") { e.preventDefault(); if (GameStateManager.phase==="playing") GameStateManager.paused = !GameStateManager.paused; }
         if (e.code==="Space" && GameStateManager.phase==="briefing") { e.preventDefault(); GameStateManager.startPlaying(); }
       }, true);
@@ -4597,6 +4862,7 @@
     multiplayerDedicatedUrl: "",
     /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
     _multiplayerMenuReturnPhase: "terminal_login",
+    _multiplayerPendingAction: "",
     isPaused: false,
     loadingTimer: 0,
     loadingNextMissionId: 1,
@@ -4618,6 +4884,47 @@
     npcDialogueSpeaker: "",
     npcDialogueChoices: [],
     npcDialogueAwaitingChoice: false,
+    introCutsceneTimer: 0,
+    introCutsceneLineIndex: 0,
+    introCutsceneLineReveal: 0,
+    introCutsceneSkipHintPulse: 0,
+    introCutsceneFlash: 0,
+    /** 0–1: Agent Nyx walk progress toward extraction during intro deploy beats. */
+    introCutsceneDeployU: 0,
+    postLevel1CutsceneTimer: 0,
+    postLevel1CutsceneLineIndex: 0,
+    postLevel1CutsceneLineReveal: 0,
+    postLevel1CutsceneSkipHintPulse: 0,
+    postLevel1CutsceneFlash: 0,
+    postLevel2CutsceneTimer: 0,
+    postLevel2CutsceneLineIndex: 0,
+    postLevel2CutsceneLineReveal: 0,
+    postLevel2CutsceneSkipHintPulse: 0,
+    postLevel2CutsceneFlash: 0,
+    postLevel3CutsceneTimer: 0,
+    postLevel3CutsceneLineIndex: 0,
+    postLevel3CutsceneLineReveal: 0,
+    postLevel3CutsceneSkipHintPulse: 0,
+    postLevel3CutsceneFlash: 0,
+    postLevel4CutsceneTimer: 0,
+    postLevel4CutsceneLineIndex: 0,
+    postLevel4CutsceneLineReveal: 0,
+    postLevel4CutsceneSkipHintPulse: 0,
+    postLevel4CutsceneFlash: 0,
+    postLevel5CutsceneTimer: 0,
+    postLevel5CutsceneLineIndex: 0,
+    postLevel5CutsceneLineReveal: 0,
+    postLevel5CutsceneSkipHintPulse: 0,
+    postLevel5CutsceneFlash: 0,
+    finalCutsceneTimer: 0,
+    finalCutsceneLineIndex: 0,
+    finalCutsceneLineReveal: 0,
+    finalCutsceneSkipHintPulse: 0,
+    finalCutsceneFlash: 0,
+    /** Synced from updateMeta for cue visuals (duration + raw line). */
+    _cutsceneHudLineDur: 1,
+    _cutsceneHudRawLine: "",
+    _cutsceneCueSfxKey: "",
     npcDialogueNPC: null,
     npcTask: null,
     npcFavor: null,
@@ -4738,8 +5045,14 @@
     },
     _smoothCameraToward(player, world, dt) {
       if (!player || !world) return;
-      const tx = clamp(player.x - VIEW_W / 2, 0, world.worldW - VIEW_W);
-      const ty = clamp(player.y - VIEW_H / 2, 0, world.worldH - VIEW_H);
+      const maxTx = world.worldW - VIEW_W;
+      const maxTy = world.worldH - VIEW_H;
+      const tx = maxTx >= 0
+        ? clamp(player.x - VIEW_W / 2, 0, maxTx)
+        : (world.worldW - VIEW_W) / 2;
+      const ty = maxTy >= 0
+        ? clamp(player.y - VIEW_H / 2, 0, maxTy)
+        : (world.worldH - VIEW_H) / 2;
       // Tight follow with tiny smoothing for visual stability, no lead/overshoot.
       const k = 1 - Math.exp(-28 * dt);
       this.cam.x = lerp(this.cam.x, tx, k);
@@ -5621,11 +5934,647 @@
       if (!this.hackingSession) this.hackingSession = new HackingSession(this.hack);
       InputManager.install(this);
     },
+    /** ACTION line: trimmed script token starts with "[" and ends with "]" — never dialogue HUD text. */
+    _cutsceneIsActionLine(line) {
+      const s = String(line || "").trim();
+      return s.length >= 2 && s[0] === "[" && s[s.length - 1] === "]";
+    },
+    /** DIALOGUE only: empty for action lines (typewriter / HUD must never receive bracket directions). */
+    _cutsceneDialogueText(line) {
+      return this._cutsceneIsActionLine(line) ? "" : String(line || "");
+    },
+    /** Run non-draw side effects for the current action line (SFX; extend for camera, etc.). */
+    _cutsceneExecuteActionLine(phaseId, lineIndex, rawLine) {
+      if (!this._cutsceneIsActionLine(rawLine)) return;
+      this._cutsceneDispatchActionSfx(phaseId, lineIndex, rawLine);
+    },
+    /**
+     * Storyboard beats: each shot spans dialogue line indices [line0, line1] inclusive.
+     * Every cutscene is intentionally sequenced as subject + action per shot.
+     */
+    _cutsceneStoryboardShots(phase) {
+      const T = {
+        intro_cutscene: [
+          { subject: "Arcology & relay grid", action: "Night lights pulse across the sector", line0: 0, line1: 0 },
+          { subject: "Security cameras", action: "Guards move on live patrol routes", line0: 1, line1: 1 },
+          { subject: "Agent Nyx", action: "Holds in shadow at the infiltration point", line0: 2, line1: 3 },
+          { subject: "Agent Nyx", action: "Walks the route toward extraction", line0: 4, line1: 5 }
+        ],
+        post_level1_cutscene: [
+          { subject: "Handler uplink", action: "Confirms you crossed the outer seal", line0: 0, line1: 1 },
+          { subject: "The facility grid", action: "Glitches — breach felt too clean", line0: 2, line1: 2 },
+          { subject: "Agent Nyx", action: "Acknowledges — stay sharp", line0: 3, line1: 3 }
+        ],
+        post_level2_cutscene: [
+          { subject: "Mission tempo", action: "Ops warns you are ahead of projections", line0: 0, line1: 1 },
+          { subject: "Neural Grid", action: "Corruption spike on the line", line0: 2, line1: 2 },
+          { subject: "The system", action: "Reacts — tracking your rhythm", line0: 3, line1: 3 }
+        ],
+        post_level3_cutscene: [
+          { subject: "Operator instinct", action: "Something in the pattern is wrong", line0: 0, line1: 1 },
+          { subject: "Heuristic model", action: "Anticipates movement before you commit", line0: 2, line1: 2 },
+          { subject: "Surveillance uplink", action: "Static hit — then push forward", line0: 3, line1: 4 }
+        ],
+        post_level4_cutscene: [
+          { subject: "Security stack", action: "Layers shift after your trigger", line0: 0, line1: 1 },
+          { subject: "Alarm core", action: "Glitch burst — manual override implied", line0: 2, line1: 2 },
+          { subject: "Unknown observer", action: "Locks eyes on your corridor", line0: 3, line1: 4 }
+        ],
+        post_level5_cutscene: [
+          { subject: "Handler", action: "Delivers a final warning", line0: 0, line1: 2 },
+          { subject: "The Grid", action: "Adapts — glitches under pressure", line0: 3, line1: 5 },
+          { subject: "Agent Nyx", action: "Faces cost — it will remember you", line0: 6, line1: 6 }
+        ],
+        final_cutscene: [
+          { subject: "Facility & alarms", action: "Core destabilizes — your ID burns in", line0: 0, line1: 4 },
+          { subject: "Antagonist voice", action: "Finds you on the wire", line0: 5, line1: 7 },
+          { subject: "The truth", action: "Blackout — you were always inside", line0: 8, line1: 11 },
+          { subject: "Neural Grid", action: "Feed dies — connection held open", line0: 12, line1: 14 }
+        ]
+      };
+      return T[phase] || [];
+    },
+    _cutsceneStoryboardForLine(phase, lineIndex) {
+      const shots = this._cutsceneStoryboardShots(phase);
+      const li = lineIndex | 0;
+      for (let i = 0; i < shots.length; i++) {
+        const s = shots[i];
+        if (li >= s.line0 && li <= s.line1) {
+          return { shot: i + 1, total: shots.length, subject: s.subject, action: s.action };
+        }
+      }
+      return { shot: 1, total: Math.max(1, shots.length), subject: "", action: "" };
+    },
+    _drawCutsceneStoryboardHud(ctx, phase, lineIndex, topY) {
+      const sb = this._cutsceneStoryboardForLine(phase, lineIndex);
+      if (!sb.subject && !sb.action) return;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const pad = 16;
+      const w = VIEW_W - pad * 2;
+      const y = topY;
+      ctx.fillStyle = "rgba(2, 10, 18, 0.82)";
+      ctx.fillRect(pad, y, w, 50);
+      ctx.strokeStyle = "rgba(0, 255, 220, 0.42)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(pad, y, w, 50);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "rgba(160, 255, 245, 0.95)";
+      ctx.font = "bold 11px monospace";
+      ctx.fillText("SHOT " + sb.shot + " / " + sb.total, pad + 10, y + 18);
+      ctx.fillStyle = "rgba(210, 240, 255, 0.9)";
+      ctx.font = "11px monospace";
+      const sub = String(sb.subject || "").toUpperCase();
+      const act = String(sb.action || "");
+      const one = (sub + " — " + act).slice(0, 102);
+      ctx.fillText(one, pad + 10, y + 38);
+      ctx.restore();
+    },
+    _introSceneFromLineIndex(idx) {
+      const sb = this._cutsceneStoryboardForLine("intro_cutscene", idx);
+      const map = ["city", "cctv", "nyx", "deploy"];
+      return map[Math.min(sb.shot, map.length) - 1] || "city";
+    },
+    _easeOutCubic(p) {
+      const x = clamp(p, 0, 1);
+      return 1 - Math.pow(1 - x, 3);
+    },
+    /** Deterministic “snow” inside a surveillance monitor bezel (no random particle field). */
+    _cutsceneDrawMonitorFeedNoise(ctx, mx, my, mw, mh, t, steps) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(mx, my, mw, mh);
+      ctx.clip();
+      const ft = (t * 36) | 0;
+      for (let k = 0; k < steps; k++) {
+        const px = mx + 2 + ((k * 83 + ft * 11) % (mw - 4));
+        const py = my + 2 + ((k * 59 + ft * 7) % (mh - 4));
+        ctx.fillStyle = (k % 2) ? "rgba(255,255,255,0.11)" : "rgba(0,255,230,0.07)";
+        ctx.fillRect(px, py, 2, 2);
+      }
+      ctx.restore();
+      ctx.strokeStyle = "rgba(115,250,255,0.5)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(mx, my, mw, mh);
+    },
+    /** Guard NPC: pose idle | walk | run | alert — each reads as a deliberate body action. */
+    _cutsceneDrawGuardSilhouette(ctx, gx, gy, t, gid, pose) {
+      const p = pose || "idle";
+      const spd = p === "run" ? 2.8 : p === "walk" ? 1.15 : 1;
+      const bob = Math.sin(t * 1.65 * spd + gid * 1.7) * (p === "run" ? 3.2 : 2);
+      const stride = p === "walk" ? Math.sin(t * 5.5 + gid * 1.2) * 3.5 : (p === "run" ? Math.sin(t * 11 + gid) * 5.5 : 0);
+      const lean = p === "run" ? 0.11 : 0;
+      ctx.save();
+      ctx.translate(gx, gy + bob);
+      ctx.rotate(lean);
+      ctx.translate(stride * 0.15, 0);
+      ctx.fillStyle = p === "alert" ? "rgba(28,18,22,0.98)" : "rgba(18,34,48,0.98)";
+      ctx.fillRect(-7, -20, 14, 24);
+      const legA = p === "idle" ? 0 : Math.sin(t * (p === "run" ? 12.5 : 6.2) + gid) * (p === "run" ? 2.8 : 1.6);
+      const legB = -legA;
+      ctx.fillRect(-6 + legA, 4, 5, 13);
+      ctx.fillRect(1 + legB, 4, 5, 13);
+      ctx.fillStyle = "rgba(120,250,255,0.55)";
+      ctx.fillRect(-3, -28, 6, 2);
+      if (p === "alert") {
+        ctx.fillStyle = "rgba(255,90,110,0.75)";
+        ctx.beginPath();
+        ctx.moveTo(10, -24);
+        ctx.lineTo(22, -20);
+        ctx.lineTo(10, -16);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    },
+    /** Access terminal: chassis, scan line, optional operator typing cursor (subject + action). */
+    _cutsceneDrawTerminalBezel(ctx, x, y, w, h, t, tid, opts) {
+      const o = opts || {};
+      const typing = !!o.typing;
+      ctx.fillStyle = "rgba(16,30,42,0.96)";
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = "rgba(90,240,255,0.48)";
+      ctx.strokeRect(x, y, w, h);
+      const scanY = y + 14 + ((t * 72 + tid * 40) % (h - 36));
+      ctx.fillStyle = "rgba(0,255,235,0.2)";
+      ctx.fillRect(x + 10, scanY, w - 20, 9);
+      ctx.fillStyle = "rgba(0,255,235,0.08)";
+      ctx.fillRect(x + 10, y + 14, w - 20, h - 28);
+      if (typing) {
+        const rowY = y + h - 22;
+        ctx.fillStyle = "rgba(180,255,245,0.9)";
+        const cx = x + 16 + ((t * 38 + tid * 17) % Math.max(12, w - 52));
+        ctx.fillRect(cx, rowY, 5 + (tid % 3) * 2, 2);
+        if ((((t * 6) | 0) + tid) % 2 === 0) {
+          ctx.fillStyle = "rgba(0,255,220,0.85)";
+          ctx.fillRect(cx + 8, rowY - 10, 2, 10);
+        }
+      }
+    },
+    /** Ceiling-mounted CCTV: housing + lens + sweeping pan (subject: camera — action: scanning). */
+    _cutsceneDrawCeilingCamera(ctx, cx, cy, t, sweepWide) {
+      ctx.fillStyle = "rgba(30,42,58,0.95)";
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, 18, 11, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(130,245,255,0.45)";
+      ctx.stroke();
+      ctx.fillStyle = "rgba(8,14,22,0.92)";
+      ctx.beginPath();
+      ctx.arc(cx, cy + 2, 7, 0, Math.PI * 2);
+      ctx.fill();
+      const ang = Math.sin(t * 1.4) * (sweepWide ? 0.55 : 0.35);
+      ctx.save();
+      ctx.translate(cx, cy + 2);
+      ctx.rotate(ang);
+      ctx.fillStyle = "rgba(0,255,220,0.12)";
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(140, 28);
+      ctx.lineTo(140, -28);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(120,250,255,0.22)";
+      ctx.stroke();
+      ctx.restore();
+    },
+    /** Surveillance monitor: clipped feed showing a guard walking a hallway (subject + action). */
+    _cutsceneDrawMonitorGuardWalkFeed(ctx, mx, my, mw, mh, t, seed) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(mx, my, mw, mh);
+      ctx.clip();
+      ctx.fillStyle = "rgba(6,12,20,0.98)";
+      ctx.fillRect(mx, my, mw, mh);
+      ctx.fillStyle = "rgba(14,28,44,0.9)";
+      ctx.fillRect(mx, my + mh * 0.55, mw, mh * 0.45);
+      ctx.strokeStyle = "rgba(60,110,140,0.35)";
+      ctx.beginPath();
+      ctx.moveTo(mx + 8, my + mh * 0.55);
+      ctx.lineTo(mx + mw - 8, my + mh * 0.55);
+      ctx.stroke();
+      const gx = mx + 12 + ((t * 42 + seed * 61) % (mw - 36));
+      const gy = my + mh * 0.62;
+      this._cutsceneDrawGuardSilhouette(ctx, gx, gy, t, seed % 5, "walk");
+      const scanY = my + 10 + ((t * 55 + seed) % (mh * 0.4));
+      ctx.fillStyle = "rgba(255,255,255,0.06)";
+      ctx.fillRect(mx + 4, scanY, mw - 8, 2);
+      ctx.restore();
+      ctx.strokeStyle = "rgba(115,250,255,0.5)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(mx, my, mw, mh);
+    },
+    /** Mini overhead map: dashed patrol path + guard dot moving along it. */
+    _cutsceneDrawMiniPatrolMap(ctx, mx, my, mw, mh, t, seed) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(mx, my, mw, mh);
+      ctx.clip();
+      ctx.fillStyle = "rgba(8,16,26,0.96)";
+      ctx.fillRect(mx, my, mw, mh);
+      const p0x = mx + 18, p0y = my + mh - 22;
+      const p1x = mx + mw * 0.55, p1y = my + 28;
+      const p2x = mx + mw - 22, p2y = my + mh * 0.45;
+      ctx.strokeStyle = "rgba(255,140,200,0.4)";
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(p0x, p0y);
+      ctx.lineTo(p1x, p1y);
+      ctx.lineTo(p2x, p2y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const u = (t * 0.22 + seed * 0.37) % 1;
+      let qx, qy;
+      if (u < 0.45) {
+        const k = u / 0.45;
+        qx = p0x + (p1x - p0x) * k;
+        qy = p0y + (p1y - p0y) * k;
+      } else if (u < 0.85) {
+        const k = (u - 0.45) / 0.4;
+        qx = p1x + (p2x - p1x) * k;
+        qy = p1y + (p2y - p1y) * k;
+      } else {
+        const k = (u - 0.85) / 0.15;
+        qx = p2x + (p0x - p2x) * k;
+        qy = p2y + (p0y - p2y) * k;
+      }
+      ctx.fillStyle = "rgba(255,200,120,0.95)";
+      ctx.beginPath();
+      ctx.arc(qx, qy, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      ctx.strokeStyle = "rgba(100,240,255,0.38)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(mx, my, mw, mh);
+    },
+    _cutsceneDrawCorridorInterior(ctx, t, e) {
+      ctx.fillStyle = "rgba(5,11,20,0.94)";
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.fillStyle = "rgba(12,22,36,0.92)";
+      ctx.beginPath();
+      ctx.moveTo(0, VIEW_H * 0.74);
+      ctx.lineTo(VIEW_W * 0.5, VIEW_H * 0.4);
+      ctx.lineTo(VIEW_W, VIEW_H * 0.74);
+      ctx.lineTo(VIEW_W, VIEW_H);
+      ctx.lineTo(0, VIEW_H);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "rgba(8,16,28,0.95)";
+      ctx.fillRect(0, 0, VIEW_W * 0.2, VIEW_H);
+      ctx.fillRect(VIEW_W * 0.8, 0, VIEW_W * 0.2, VIEW_H);
+      for (let L = 0; L < 8; L++) {
+        const cx = VIEW_W * 0.24 + L * (VIEW_W * 0.52 / 7);
+        const lit = 0.45 + 0.55 * Math.sin(t * 7.5 + L * 0.85);
+        ctx.fillStyle = "rgba(120,248,255," + (0.12 * lit * (0.5 + 0.5 * e)).toFixed(3) + ")";
+        ctx.fillRect(cx - 18, VIEW_H * 0.18, 36, 7);
+      }
+    },
+    _cutsceneDrawCitySkylineGrounded(ctx, t, e, drift) {
+      ctx.fillStyle = "rgba(2,6,14,0.96)";
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H * 0.42);
+      ctx.fillStyle = "rgba(8,18,32,0.9)";
+      ctx.beginPath();
+      ctx.moveTo(0, VIEW_H * 0.62);
+      ctx.lineTo(VIEW_W, VIEW_H * 0.62);
+      ctx.lineTo(VIEW_W, VIEW_H);
+      ctx.lineTo(0, VIEW_H);
+      ctx.closePath();
+      ctx.fill();
+      for (let i = 0; i < 24; i++) {
+        const w = 16 + (i % 3) * 7;
+        const h = 58 + ((i * 31) % 150);
+        const x = 20 + i * 50 + drift + Math.sin(t * 0.9 + i * 0.28) * 3;
+        const y = VIEW_H - 56 - h;
+        const lit = (Math.floor(t * 7 + i + e * 6) % 4) !== 0;
+        ctx.fillStyle = lit ? "rgba(70,150,195,0.28)" : "rgba(18,28,44,0.4)";
+        ctx.fillRect(x, y, w, h);
+      }
+    },
+    /** Map bracketed stage direction to a visual cue id (never shown as text). */
+    _parseCutsceneCue(text) {
+      const raw = String(text || "").trim();
+      if (!this._cutsceneIsActionLine(raw)) return "";
+      const s = raw.toUpperCase();
+      if (s.includes("BLACK SCREEN")) return "black_screen";
+      if (s.includes("FADE OUT")) return "fade_out";
+      if (s.includes("FADE IN")) return "fade_in";
+      if (s.includes("FINAL GLITCH")) return "final_glitch";
+      if (s.includes("STATIC")) return "static";
+      if (s.includes("GLITCH") && (s.includes("ID") || s.includes("PLAYER"))) return "glitch_id";
+      if (s.includes("GLITCH")) return "glitch";
+      if (s.includes("FLASH") && (s.includes("CITY") || s.includes("LIGHT"))) return "flash_city";
+      if (s.includes("CITY") && (s.includes("LIGHT") || s.includes("FLICKER"))) return "city_lights";
+      if (s.includes("FLASH") && (s.includes("GUARD") || s.includes("TERMINAL") || s.includes("SURVEILLANCE"))) return "flash_montage";
+      if (s.includes("ALARM")) return "alarms";
+      if (s.includes("CAMERA") && s.includes("PAN")) return "camera_pan";
+      if ((s.includes("LIGHT") || s.includes("LIGHTS")) && s.includes("FLICKER")) return "lights_flicker_cue";
+      if (s === "[PAUSE]") return "pause";
+      return "generic_pulse";
+    },
+    _cutsceneDispatchActionSfx(phaseId, idx, rawText) {
+      if (!this._cutsceneIsActionLine(rawText)) return;
+      const cue = this._parseCutsceneCue(rawText);
+      if (!cue || cue === "pause" || cue === "black_screen" || cue === "fade_out" || cue === "fade_in" || cue === "generic_pulse") return;
+      const key = phaseId + ":" + idx + ":" + cue;
+      if (this._cutsceneCueSfxKey === key) return;
+      SFX.ensure();
+      if (cue === "static") SFX.play("cutscene_static");
+      else if (cue === "glitch" || cue === "glitch_id" || cue === "final_glitch") SFX.play("cutscene_glitch");
+      this._cutsceneCueSfxKey = key;
+    },
+    /** Full-frame visuals for an ACTION line (overlays, distortion). Not used for dialogue. */
+    _cutsceneRenderActionEffects(progress, flash, t, rawActionLine) {
+      const cue = this._parseCutsceneCue(rawActionLine);
+      if (!cue) return;
+      const p = clamp(progress, 0, 1);
+      const e = this._easeOutCubic(p);
+      const intenseGlitch = String(rawActionLine || "").toUpperCase().indexOf("INTENSIF") >= 0 || cue === "final_glitch";
+      const gAmt = (flash || 0) * (intenseGlitch ? 1.25 : 0.85) + (intenseGlitch ? 0.2 : 0);
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      if (cue === "alarms") {
+        this._cutsceneDrawCorridorInterior(ctx, t, e * 0.55);
+        const pulse = 0.35 + Math.sin(t * 18) * 0.35;
+        ctx.fillStyle = "rgba(200,25,45," + (0.22 + pulse * 0.38 * e).toFixed(3) + ")";
+        ctx.fillRect(40, 88, 16, VIEW_H - 176);
+        ctx.fillRect(VIEW_W - 56, 88, 16, VIEW_H - 176);
+        ctx.fillStyle = "rgba(255,80,90," + (0.12 + pulse * 0.2 * e).toFixed(3) + ")";
+        ctx.fillRect(0, 64, VIEW_W, 10);
+        ctx.fillRect(0, VIEW_H - 54, VIEW_W, 10);
+        this._cutsceneDrawCeilingCamera(ctx, VIEW_W * 0.28, 86, t + 0.2, true);
+        this._cutsceneDrawCeilingCamera(ctx, VIEW_W * 0.72, 86, t, true);
+        for (let rg = 0; rg < 3; rg++) {
+          const gx = 160 + rg * 210 + Math.sin(t * 9 + rg * 1.4) * 28;
+          this._cutsceneDrawGuardSilhouette(ctx, gx, VIEW_H * 0.72, t, rg + 2, "run");
+        }
+      }
+      if (cue === "city_lights") {
+        ctx.fillStyle = "rgba(0,0,0," + (0.62 * (1 - e)).toFixed(3) + ")";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        const drift = Math.sin(t * 0.55) * 14;
+        this._cutsceneDrawCitySkylineGrounded(ctx, t, e, drift);
+        ctx.save();
+        ctx.translate(VIEW_W * 0.7, VIEW_H - 96);
+        ctx.scale(0.78, 0.78);
+        this._drawCutsceneNyx(0, 0, "look", t);
+        ctx.restore();
+        ctx.fillStyle = "rgba(180,255,250,0.35)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("AGENT NYX // ROOFTOP — OBSERVING GRID", 108, VIEW_H - 38);
+        ctx.textAlign = "center";
+      }
+      if (cue === "flash_montage") {
+        const cut = Math.floor(t * 5.2 + p * 4) % 3;
+        const jx = Math.sin(t * 19) * 3;
+        const jy = Math.cos(t * 17) * 2;
+        ctx.fillStyle = "rgba(4,10,18,0.9)";
+        ctx.fillRect(100 + jx, 96 + jy, VIEW_W - 200, VIEW_H - 192);
+        ctx.strokeStyle = "rgba(0,255,220," + (0.38 + 0.2 * Math.sin(t * 24)).toFixed(3) + ")";
+        ctx.strokeRect(100 + jx, 96 + jy, VIEW_W - 200, VIEW_H - 192);
+        ctx.fillStyle = "rgba(130,245,255,0.35)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        if (cut === 0) {
+          ctx.fillText("SHOT: PATROL — GUARDS MOVING", 108 + jx, 112 + jy);
+          ctx.textAlign = "center";
+          for (let g = 0; g < 4; g++) {
+            const gx = 168 + g * 198 + ((t * 38 + g * 70) % 140) - 70 + jx;
+            const gy = VIEW_H * 0.55 + jy;
+            this._cutsceneDrawGuardSilhouette(ctx, gx, gy, t, g, "walk");
+          }
+        } else if (cut === 1) {
+          ctx.fillText("SHOT: OPS FLOOR — OPERATORS AT TERMINALS", 108 + jx, 112 + jy);
+          ctx.textAlign = "center";
+          for (let i = 0; i < 5; i++) {
+            this._cutsceneDrawTerminalBezel(ctx, 148 + i * 188 + jx, 212 + jy, 124, 76, t, i, { typing: true });
+          }
+        } else {
+          ctx.fillText("SHOT: CCTV WALL — CAMERAS TRACKING HALLWAYS", 108 + jx, 112 + jy);
+          ctx.textAlign = "center";
+          this._cutsceneDrawCeilingCamera(ctx, VIEW_W * 0.35 + jx, 168 + jy, t, true);
+          this._cutsceneDrawCeilingCamera(ctx, VIEW_W * 0.65 + jx, 168 + jy, t + 0.5, true);
+          const mw = 280, mh = 168;
+          const mx0 = VIEW_W * 0.5 - mw - 24 + jx;
+          const mx1 = VIEW_W * 0.5 + 24 + jx;
+          const myf = 198 + jy;
+          this._cutsceneDrawMonitorGuardWalkFeed(ctx, mx0, myf, mw, mh, t, 1);
+          this._cutsceneDrawMonitorGuardWalkFeed(ctx, mx1, myf, mw, mh, t, 4);
+        }
+      }
+      if (cue === "flash_city") {
+        this._cutsceneDrawCitySkylineGrounded(ctx, t, e, Math.sin(t * 1.1) * 6);
+        ctx.save();
+        ctx.translate(VIEW_W * 0.62, VIEW_H - 102);
+        ctx.scale(0.68, 0.68);
+        this._drawCutsceneNyx(0, 0, "look", t);
+        ctx.restore();
+        ctx.fillStyle = "rgba(200,255,255,0.32)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("REVEAL: GRID FROM ABOVE — SUBJECT HOLDING", 104, VIEW_H - 36);
+        ctx.textAlign = "center";
+      }
+      if (cue === "camera_pan") {
+        const shift = Math.sin(t * 0.85 + e * 1.4) * 48 + Math.sin(t * 0.33) * 12;
+        this._cutsceneDrawCorridorInterior(ctx, t, e * 0.7);
+        ctx.strokeStyle = "rgba(0,255,220,0.42)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(106, 94, VIEW_W - 212, VIEW_H - 188);
+        ctx.fillStyle = "rgba(160,245,255,0.4)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("SEC CAM 04 — PAN: DOOR LINE + FIGURE IN FRAME", 112, 112);
+        ctx.textAlign = "center";
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(108, 96, VIEW_W - 216, VIEW_H - 196);
+        ctx.clip();
+        ctx.translate(shift, Math.sin(t * 0.62) * 5);
+        for (let i = -2; i < 16; i++) {
+          const bx = 84 + i * 122;
+          ctx.fillStyle = "rgba(14,26,40,0.92)";
+          ctx.fillRect(bx, 128, 96, VIEW_H - 264);
+          ctx.strokeStyle = "rgba(90,235,255,0.42)";
+          ctx.strokeRect(bx, 128, 96, VIEW_H - 264);
+          ctx.fillStyle = "rgba(0,255,230,0.15)";
+          ctx.fillRect(bx + 38, 128 + (VIEW_H - 264) * 0.42, 20, 52);
+        }
+        this._cutsceneDrawGuardSilhouette(ctx, VIEW_W * 0.5 - shift, VIEW_H * 0.52, t, 7, "walk");
+        ctx.restore();
+      }
+      if (cue === "lights_flicker_cue") {
+        this._cutsceneDrawCorridorInterior(ctx, t, Math.min(1, e * 1.15));
+        const wv = 0.12 + 0.08 * Math.sin(t * 19);
+        ctx.fillStyle = "rgba(255,255,255," + wv.toFixed(3) + ")";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        this._drawCutsceneNyx(VIEW_W * 0.24, VIEW_H * 0.74, "hide", t);
+        ctx.fillStyle = "rgba(200,255,255,0.38)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("SUBJECT: NYX — ACTION: FREEZING AS LIGHTS STROBE", 108, VIEW_H - 42);
+        ctx.textAlign = "center";
+      }
+      if (cue === "glitch" || cue === "glitch_id" || cue === "final_glitch") {
+        const skew = Math.sin(t * 11.5) * 0.012 * (1 + gAmt);
+        const shx = Math.sin(t * 13.2) * (5 + gAmt * 10);
+        const shy = Math.cos(t * 12.1) * (4 + gAmt * 9);
+        this._cutsceneDrawCorridorInterior(ctx, t, Math.min(1, 0.45 + e * 0.5));
+        const tw = 420, th = 208, tx = (VIEW_W - tw) * 0.5, ty = (VIEW_H - th) * 0.5 - 16;
+        ctx.save();
+        ctx.translate(VIEW_W * 0.5, VIEW_H * 0.5);
+        ctx.rotate(skew);
+        ctx.translate(-VIEW_W * 0.5 + shx, -VIEW_H * 0.5 + shy);
+        ctx.fillStyle = "rgba(12,22,34,0.97)";
+        ctx.fillRect(tx, ty, tw, th);
+        ctx.strokeStyle = "rgba(0,255,220,0.55)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(tx, ty, tw, th);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(tx + 12, ty + 36, tw - 24, th - 52);
+        ctx.clip();
+        for (let row = 0; row < 12; row++) {
+          const ry = ty + 36 + row * ((th - 52) / 12);
+          const off = Math.sin(t * 23 + row * 1.1) * (4 + gAmt * 14);
+          ctx.fillStyle = (row % 2) ? "rgba(0,55,52,0.55)" : "rgba(25,85,95,0.42)";
+          ctx.fillRect(tx + 12 + off, ry, tw - 24, (th - 52) / 12 + 1);
+        }
+        const scanY = ty + 40 + ((t * 95) % (th - 70));
+        ctx.fillStyle = "rgba(255,120,200,0.12)";
+        ctx.fillRect(tx + 12, scanY, tw - 24, 6);
+        ctx.restore();
+        if (cue === "glitch_id") {
+          const bx = tx + tw * 0.58, by = ty + 18, bw = 118, bh = 22;
+          ctx.fillStyle = "rgba(8,20,28,0.95)";
+          ctx.fillRect(bx, by, bw, bh);
+          ctx.strokeStyle = "rgba(140,255,190,0.75)";
+          ctx.strokeRect(bx, by, bw, bh);
+          ctx.fillStyle = "rgba(140,255,190," + (0.85 + 0.1 * Math.sin(t * 14)).toFixed(3) + ")";
+          ctx.font = "bold 14px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("AGENT: NYX", bx + bw * 0.5 + Math.sin(t * 10) * 2, by + 16);
+        }
+        if (cue === "final_glitch") {
+          this._cutsceneDrawTerminalBezel(ctx, tx + 24, ty + th - 56, tw - 48, 40, t, 9, { typing: true });
+        }
+        ctx.fillStyle = "rgba(8,14,22,0.92)";
+        ctx.fillRect(tx + tw * 0.5 - 28, ty + th - 28, 56, 22);
+        ctx.fillStyle = "rgba(120,250,255,0.55)";
+        ctx.fillRect(tx + tw * 0.5 - 20, ty + th - 22, 8, 3);
+        ctx.fillRect(tx + tw * 0.5 - 6, ty + th - 18, 10, 2);
+        ctx.restore();
+        ctx.fillStyle = "rgba(200,255,255,0.38)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SUBJECT: CORE TERMINAL  ·  ACTION: DISPLAY TEARING / OPERATOR HANDS", VIEW_W * 0.5, ty + th + 22);
+        ctx.textAlign = "left";
+      }
+      if (cue === "static") {
+        this._cutsceneDrawCorridorInterior(ctx, t, 0.32);
+        const mw = 300, mh = 168, mx = (VIEW_W - mw) * 0.5, my = (VIEW_H - mh) * 0.5;
+        this._cutsceneDrawMonitorFeedNoise(ctx, mx, my, mw, mh, t, 240);
+        ctx.fillStyle = "rgba(255,200,220,0.9)";
+        ctx.font = "bold 12px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("UPLINK LOST — MONITOR SEARCHING FOR SIGNAL", VIEW_W * 0.5, my - 14);
+        ctx.textAlign = "left";
+      }
+      if (cue === "black_screen") {
+        this._cutsceneDrawCorridorInterior(ctx, t, 0.22);
+        const a = this._easeOutCubic(p * 1.12);
+        ctx.fillStyle = "rgba(0,0,0," + a.toFixed(3) + ")";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        const door = VIEW_W * 0.52 * this._easeOutCubic(p * 1.05);
+        ctx.fillStyle = "rgba(2,4,8,0.98)";
+        ctx.fillRect(0, 0, door, VIEW_H);
+        ctx.fillRect(VIEW_W - door, 0, door, VIEW_H);
+        ctx.strokeStyle = "rgba(80,250,255,0.22)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(door, 0);
+        ctx.lineTo(door, VIEW_H);
+        ctx.moveTo(VIEW_W - door, 0);
+        ctx.lineTo(VIEW_W - door, VIEW_H);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(255,120,140,0.85)";
+        ctx.font = "bold 14px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("LOCKDOWN — BLAST DOORS SEALING CORRIDOR", VIEW_W * 0.5, VIEW_H * 0.48);
+        ctx.textAlign = "left";
+      }
+      if (cue === "fade_out" || cue === "fade_in") {
+        this._cutsceneDrawCorridorInterior(ctx, t, 0.5);
+        const doorW = VIEW_W * 0.42 * (cue === "fade_out" ? e : (1 - e));
+        ctx.fillStyle = "rgba(6,12,22,0.94)";
+        ctx.fillRect(VIEW_W * 0.5 - doorW * 0.5, 120, doorW, VIEW_H - 200);
+        ctx.strokeStyle = "rgba(120,250,255,0.45)";
+        ctx.strokeRect(VIEW_W * 0.5 - doorW * 0.5, 120, doorW, VIEW_H - 200);
+        const walkNudge = cue === "fade_out" ? (1 - e) * 40 : e * 40;
+        const a = cue === "fade_in" ? (1 - e) * 0.75 : e * 0.88;
+        ctx.fillStyle = "rgba(0,0,0," + (a * 0.55).toFixed(3) + ")";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        this._drawCutsceneNyx(VIEW_W * 0.5 - 110 + walkNudge, VIEW_H * 0.72, "walk", t);
+        ctx.fillStyle = "rgba(0,0,0," + (a * 0.45).toFixed(3) + ")";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        ctx.fillStyle = "rgba(200,255,255,0.36)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(cue === "fade_out" ? "NYX — WALKING THROUGH ACCESS TUNNEL AS DOORS NARROW" : "NYX — STEPPING BACK INTO LIGHT", VIEW_W * 0.5, VIEW_H - 36);
+        ctx.textAlign = "left";
+      }
+      if (cue === "pause") {
+        ctx.fillStyle = "rgba(6,12,22,0.94)";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        ctx.fillStyle = "rgba(200,255,255,0.4)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SOC WALL — SUBJECT: PATROL ROUTES  ·  ACTION: GUARDS ADVANCING ON MAPS", VIEW_W * 0.5, VIEW_H * 0.2);
+        ctx.textAlign = "left";
+        const ox = VIEW_W * 0.5 - 208, oy = VIEW_H * 0.28;
+        for (let m = 0; m < 4; m++) {
+          const mx = ox + (m % 2) * 218, my = oy + ((m / 2) | 0) * 118;
+          ctx.fillStyle = "rgba(12,22,36,0.98)";
+          ctx.fillRect(mx, my, 198, 100);
+          ctx.strokeStyle = "rgba(100,240,255,0.4)";
+          ctx.strokeRect(mx, my, 198, 100);
+          this._cutsceneDrawMiniPatrolMap(ctx, mx + 8, my + 14, 182, 78, t, m + 1);
+        }
+        const breath = 0.38 + 0.12 * Math.sin(t * 4.2);
+        const rIn = 80 + Math.sin(t * 2.6) * 22;
+        const rOut = VIEW_H * (0.52 + breath * 0.16);
+        const cx = VIEW_W * 0.5 + Math.sin(t * 1.1) * 8;
+        const cy = VIEW_H * 0.5 + Math.cos(t * 1.05) * 8;
+        const vg = ctx.createRadialGradient(cx, cy, rIn, cx, cy, rOut);
+        vg.addColorStop(0, "rgba(0,0,0,0)");
+        vg.addColorStop(0.72, "rgba(0,0,0," + (0.18 + 0.08 * Math.sin(t * 5.2)).toFixed(3) + ")");
+        vg.addColorStop(1, "rgba(0,0,0," + (0.34 + 0.12 * Math.sin(t * 3.6 + 1)).toFixed(3) + ")");
+        ctx.fillStyle = vg;
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      }
+      if (cue === "generic_pulse") {
+        this._cutsceneDrawCorridorInterior(ctx, t, e);
+        this._cutsceneDrawGuardSilhouette(ctx, VIEW_W * 0.5 + Math.sin(t * 1.1) * 120, VIEW_H * 0.68, t, 0, "walk");
+        ctx.fillStyle = "rgba(200,255,255,0.32)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("HALLWAY — LONE PATROL CROSSING FRAME", VIEW_W * 0.5, VIEW_H - 40);
+        ctx.textAlign = "left";
+      }
+      ctx.restore();
+    },
     syncStateFromPhase() {
       if (this.phase === "lobby") this.currentState = STATES.MULTIPLAYER_LOBBY;
       else if (this.phase === "playing") this.currentState = this.mode === "hack" ? STATES.HACKING : STATES.CAMPAIGN;
       else if (this.phase === "mission_win" || this.phase === "mission_fail" || this.phase === "final_cutscene") this.currentState = STATES.GAMEOVER;
       else if (this.phase === "loading_next") this.currentState = STATES.GAMEOVER;
+      else if (this.phase === "intro_cutscene") this.currentState = STATES.MENU;
+      else if (this.phase === "post_level1_cutscene") this.currentState = STATES.GAMEOVER;
+      else if (this.phase === "post_level2_cutscene") this.currentState = STATES.GAMEOVER;
+      else if (this.phase === "post_level3_cutscene") this.currentState = STATES.GAMEOVER;
+      else if (this.phase === "post_level4_cutscene") this.currentState = STATES.GAMEOVER;
+      else if (this.phase === "post_level5_cutscene") this.currentState = STATES.GAMEOVER;
       else this.currentState = STATES.MENU;
       gameState = this.currentState === STATES.HACKING ? "HACKING" : (this.currentState === STATES.CAMPAIGN ? "PLAYING" : "MENU");
     },
@@ -5653,6 +6602,265 @@
       resetClock();
     },
     updateMeta(dt) {
+      if (this.phase === "multiplayer_menu" && this._multiplayerPendingAction) {
+        if (this._isMultiplayerTransportReady()) {
+          const act = this._multiplayerPendingAction;
+          this._multiplayerPendingAction = "";
+          this.enterLobby(this.missionId || 1);
+          if (act === "host" && !this.localRoom) {
+            this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
+            this.roomCode = this.localRoom.roomCode;
+            this.localPlayerId = 0;
+            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
+          }
+        }
+      }
+      if (this.phase === "intro_cutscene") {
+        const sequence = this._introCutsceneSequence();
+        this.introCutsceneTimer += dt;
+        this.introCutsceneSkipHintPulse += dt * 2.6;
+        const idx = this.introCutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishIntroCutscene();
+          return;
+        }
+        const current = sequence[idx];
+        if (this.world && this.world.guards) {
+          for (let gi = 0; gi < this.world.guards.length; gi++) {
+            this.world.guards[gi].update(dt, [], this.world, this.world.flags || {});
+          }
+        }
+        if (this._introSceneFromLineIndex(idx) === "deploy") {
+          this.introCutsceneDeployU = Math.min(1, this.introCutsceneDeployU + dt / 4.15);
+        } else {
+          this.introCutsceneDeployU = 0;
+        }
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("intro", idx, current.text);
+        const revealRate = current.revealRate || 64;
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.introCutsceneLineReveal = Math.min(displayText.length, this.introCutsceneLineReveal + revealRate * dt);
+        this.introCutsceneFlash = Math.max(0, this.introCutsceneFlash - dt * 2.4);
+        if (this.introCutsceneTimer >= current.duration) {
+          this.introCutsceneLineIndex++;
+          this.introCutsceneTimer = 0;
+          this.introCutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "post_level1_cutscene") {
+        const sequence = [
+          { text: "\"Entry confirmed.\"", duration: 1.25, revealRate: 64, fx: "voice" },
+          { text: "\"You're inside the outer layer.\"", duration: 1.55, revealRate: 62, fx: "voice" },
+          { text: "\"...that was too easy.\"", duration: 1.35, revealRate: 66, fx: "glitch" },
+          { text: "\"Stay sharp.\"", duration: 1.2, revealRate: 70, fx: "voice" }
+        ];
+        this.postLevel1CutsceneTimer += dt;
+        this.postLevel1CutsceneSkipHintPulse += dt * 4.2;
+        const idx = this.postLevel1CutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishPostLevel1Cutscene();
+          return;
+        }
+        const current = sequence[idx];
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("p1", idx, current.text);
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.postLevel1CutsceneLineReveal = Math.min(
+          displayText.length,
+          this.postLevel1CutsceneLineReveal + (current.revealRate || 64) * dt
+        );
+        if (current.fx === "glitch") this.postLevel1CutsceneFlash = Math.min(1, this.postLevel1CutsceneFlash + dt * 5.2);
+        else this.postLevel1CutsceneFlash = Math.max(0, this.postLevel1CutsceneFlash - dt * 4.2);
+        if (this.postLevel1CutsceneTimer >= current.duration) {
+          this.postLevel1CutsceneLineIndex++;
+          this.postLevel1CutsceneTimer = 0;
+          this.postLevel1CutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "post_level2_cutscene") {
+        const sequence = [
+          { text: "\"You're moving faster than expected.\"", duration: 1.65, revealRate: 62, fx: "voice" },
+          { text: "\"Grid activity is increasing.\"", duration: 1.45, revealRate: 64, fx: "voice" },
+          { text: "[GLITCH]", duration: 0.62, revealRate: 96, fx: "glitch" },
+          { text: "\"...it's reacting to you.\"", duration: 1.5, revealRate: 66, fx: "glitch" }
+        ];
+        this.postLevel2CutsceneTimer += dt;
+        this.postLevel2CutsceneSkipHintPulse += dt * 4.4;
+        const idx = this.postLevel2CutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishPostLevel2Cutscene();
+          return;
+        }
+        const current = sequence[idx];
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("p2", idx, current.text);
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.postLevel2CutsceneLineReveal = Math.min(
+          displayText.length,
+          this.postLevel2CutsceneLineReveal + (current.revealRate || 64) * dt
+        );
+        if (current.fx === "glitch") this.postLevel2CutsceneFlash = Math.min(1, this.postLevel2CutsceneFlash + dt * 5.6);
+        else this.postLevel2CutsceneFlash = Math.max(0, this.postLevel2CutsceneFlash - dt * 4.0);
+        if (this.postLevel2CutsceneTimer >= current.duration) {
+          this.postLevel2CutsceneLineIndex++;
+          this.postLevel2CutsceneTimer = 0;
+          this.postLevel2CutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "post_level3_cutscene") {
+        const sequence = [
+          { text: "\"Something's off.\"", duration: 1.25, revealRate: 70, fx: "voice" },
+          { text: "\"We're seeing patterns in the system...\"", duration: 1.9, revealRate: 58, fx: "voice" },
+          { text: "\"...like it's predicting your movement.\"", duration: 2.0, revealRate: 56, fx: "glitch" },
+          { text: "[STATIC]", duration: 0.75, revealRate: 110, fx: "static" },
+          { text: "\"Keep going.\"", duration: 1.2, revealRate: 72, fx: "voice" }
+        ];
+        this.postLevel3CutsceneTimer += dt;
+        this.postLevel3CutsceneSkipHintPulse += dt * 4.8;
+        const idx = this.postLevel3CutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishPostLevel3Cutscene();
+          return;
+        }
+        const current = sequence[idx];
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("p3", idx, current.text);
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.postLevel3CutsceneLineReveal = Math.min(
+          displayText.length,
+          this.postLevel3CutsceneLineReveal + (current.revealRate || 64) * dt
+        );
+        if (current.fx === "glitch" || current.fx === "static") this.postLevel3CutsceneFlash = Math.min(1, this.postLevel3CutsceneFlash + dt * 6.0);
+        else this.postLevel3CutsceneFlash = Math.max(0, this.postLevel3CutsceneFlash - dt * 3.8);
+        if (this.postLevel3CutsceneTimer >= current.duration) {
+          this.postLevel3CutsceneLineIndex++;
+          this.postLevel3CutsceneTimer = 0;
+          this.postLevel3CutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "post_level4_cutscene") {
+        const sequence = [
+          { text: "\"You triggered something.\"", duration: 1.45, revealRate: 64, fx: "voice" },
+          { text: "\"Security layers are shifting.\"", duration: 1.55, revealRate: 62, fx: "voice" },
+          { text: "[GLITCH INTENSIFIES]", duration: 0.85, revealRate: 104, fx: "intense" },
+          { text: "\"...this isn't automated anymore.\"", duration: 1.95, revealRate: 58, fx: "intense" },
+          { text: "\"Something is watching.\"", duration: 1.45, revealRate: 64, fx: "intense" }
+        ];
+        this.postLevel4CutsceneTimer += dt;
+        this.postLevel4CutsceneSkipHintPulse += dt * 5.1;
+        const idx = this.postLevel4CutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishPostLevel4Cutscene();
+          return;
+        }
+        const current = sequence[idx];
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("p4", idx, current.text);
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.postLevel4CutsceneLineReveal = Math.min(
+          displayText.length,
+          this.postLevel4CutsceneLineReveal + (current.revealRate || 64) * dt
+        );
+        if (current.fx === "intense") this.postLevel4CutsceneFlash = Math.min(1, this.postLevel4CutsceneFlash + dt * 7.0);
+        else this.postLevel4CutsceneFlash = Math.max(0, this.postLevel4CutsceneFlash - dt * 3.5);
+        if (this.postLevel4CutsceneTimer >= current.duration) {
+          this.postLevel4CutsceneLineIndex++;
+          this.postLevel4CutsceneTimer = 0;
+          this.postLevel4CutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "post_level5_cutscene") {
+        const sequence = [
+          { text: "\"Nyx... listen carefully.\"", duration: 1.5, revealRate: 62, fx: "voice" },
+          { text: "\"This isn't just a system.\"", duration: 1.45, revealRate: 62, fx: "voice" },
+          { text: "[PAUSE]", duration: 0.75, revealRate: 96, fx: "pause" },
+          { text: "\"It's adapting.\"", duration: 1.35, revealRate: 68, fx: "tense" },
+          { text: "[GLITCH]", duration: 0.65, revealRate: 110, fx: "glitch" },
+          { text: "\"If you finish this...\"", duration: 1.45, revealRate: 62, fx: "tense" },
+          { text: "\"...it will know you.\"", duration: 1.5, revealRate: 60, fx: "glitch" }
+        ];
+        this.postLevel5CutsceneTimer += dt;
+        this.postLevel5CutsceneSkipHintPulse += dt * 5.3;
+        const idx = this.postLevel5CutsceneLineIndex;
+        if (idx >= sequence.length) {
+          this.finishPostLevel5Cutscene();
+          return;
+        }
+        const current = sequence[idx];
+        this._cutsceneHudLineDur = current.duration || 1;
+        this._cutsceneHudRawLine = current.text;
+        this._cutsceneExecuteActionLine("p5", idx, current.text);
+        const displayText = this._cutsceneDialogueText(current.text);
+        this.postLevel5CutsceneLineReveal = Math.min(
+          displayText.length,
+          this.postLevel5CutsceneLineReveal + (current.revealRate || 64) * dt
+        );
+        if (current.fx === "glitch" || current.fx === "tense") this.postLevel5CutsceneFlash = Math.min(1, this.postLevel5CutsceneFlash + dt * 7.2);
+        else this.postLevel5CutsceneFlash = Math.max(0, this.postLevel5CutsceneFlash - dt * 3.4);
+        if (this.postLevel5CutsceneTimer >= current.duration) {
+          this.postLevel5CutsceneLineIndex++;
+          this.postLevel5CutsceneTimer = 0;
+          this.postLevel5CutsceneLineReveal = 0;
+        }
+        return;
+      }
+      if (this.phase === "final_cutscene") {
+        const sequence = [
+          { text: "[ALARMS DISTORT]", duration: 0.62, revealRate: 120, fx: "alarm" },
+          { text: "SYSTEM:", duration: 0.5, revealRate: 140, fx: "system" },
+          { text: "\"CORE INSTABILITY DETECTED\"", duration: 0.95, revealRate: 86, fx: "alarm" },
+          { text: "[GLITCH]", duration: 0.48, revealRate: 130, fx: "glitch" },
+          { text: "\"UNAUTHORIZED ACCESS - AGENT: NYX\"", duration: 1.15, revealRate: 78, fx: "alarm" },
+          { text: "[PAUSE]", duration: 0.45, revealRate: 130, fx: "pause" },
+          { text: "VOICE (calm, different):", duration: 0.7, revealRate: 92, fx: "voice" },
+          { text: "\"...found you.\"", duration: 0.9, revealRate: 84, fx: "voice" },
+          { text: "[BLACK SCREEN]", duration: 0.62, revealRate: 140, fx: "black" },
+          { text: "\"You were never outside the system.\"", duration: 1.25, revealRate: 74, fx: "twist" },
+          { text: "[FLASH - CITY LIGHTS]", duration: 0.6, revealRate: 120, fx: "flash" },
+          { text: "\"You were inside it the whole time.\"", duration: 1.18, revealRate: 74, fx: "twist" },
+          { text: "[STATIC]", duration: 0.56, revealRate: 140, fx: "static" },
+          { text: "\"Connection... maintained.\"", duration: 1.0, revealRate: 76, fx: "twist" },
+          { text: "[FINAL GLITCH]", duration: 0.8, revealRate: 130, fx: "final" }
+        ];
+        this.finalCutsceneTimer += dt;
+        this.finalCutsceneSkipHintPulse += dt * 6.2;
+        const idx = this.finalCutsceneLineIndex;
+        if (idx < sequence.length) {
+          const current = sequence[idx];
+          this._cutsceneHudLineDur = current.duration || 1;
+          this._cutsceneHudRawLine = current.text;
+          this._cutsceneExecuteActionLine("final", idx, current.text);
+          const displayText = this._cutsceneDialogueText(current.text);
+          this.finalCutsceneLineReveal = Math.min(
+            displayText.length,
+            this.finalCutsceneLineReveal + (current.revealRate || 92) * dt
+          );
+          if (current.fx === "glitch" || current.fx === "alarm" || current.fx === "static" || current.fx === "final") {
+            this.finalCutsceneFlash = Math.min(1, this.finalCutsceneFlash + dt * 8.0);
+          } else {
+            this.finalCutsceneFlash = Math.max(0, this.finalCutsceneFlash - dt * 4.5);
+          }
+          if (this.finalCutsceneTimer >= current.duration) {
+            this.finalCutsceneLineIndex++;
+            this.finalCutsceneTimer = 0;
+            this.finalCutsceneLineReveal = 0;
+          }
+        } else {
+          // Hold on final beat, keep subtle unstable flicker until skipped.
+          this.finalCutsceneFlash = Math.max(0.16, this.finalCutsceneFlash * 0.985);
+        }
+        return;
+      }
       if (this.phase === "loading_next") {
         this.breachTimer = Math.max(0, this.breachTimer - dt);
         if (this.breachTimer <= 0 && this.nextMissionQueued) {
@@ -5845,6 +7053,24 @@
         case "mission_select":
           this.tryMissionSelectClick(mx, my);
           return;
+        case "intro_cutscene":
+          this.skipIntroCutscene();
+          return;
+        case "post_level1_cutscene":
+          this.skipPostLevel1Cutscene();
+          return;
+        case "post_level2_cutscene":
+          this.skipPostLevel2Cutscene();
+          return;
+        case "post_level3_cutscene":
+          this.skipPostLevel3Cutscene();
+          return;
+        case "post_level4_cutscene":
+          this.skipPostLevel4Cutscene();
+          return;
+        case "post_level5_cutscene":
+          this.skipPostLevel5Cutscene();
+          return;
         case "lobby":
           this.tryLobbyClick(mx, my);
           return;
@@ -5856,7 +7082,7 @@
         this.handleHackPointer(mx, my, pointerSerial);
         return;
       }
-      if (this.phase==="mission_win" || this.phase==="mission_fail" || this.phase==="final_cutscene") {
+      if (this.phase==="mission_win" || this.phase==="mission_fail" || this.phase==="final_cutscene" || this.phase==="post_level1_cutscene" || this.phase==="post_level2_cutscene" || this.phase==="post_level3_cutscene" || this.phase==="post_level4_cutscene" || this.phase==="post_level5_cutscene") {
         this.advanceFromOverlay();
         return;
       }
@@ -5884,8 +7110,7 @@
           this.gameMode = "campaign";
           NetworkCoordinator.closeCloudWebSocket();
           NetworkCoordinator.closeLocalChannel();
-          this.localRoom = null;
-          this.roomCode = "";
+          this._leaveLocalRoom("terminal_login_campaign");
           this.multiplayerDedicatedUrl = "";
           if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           this.unlocked = loadUnlock();
@@ -5916,12 +7141,26 @@
       this.multiplayerDedicatedUrl = NH_DEDICATED_WS_URL;
       this._applyMultiplayerDedicatedUrlToWindow();
     },
+    _isMultiplayerTransportReady() {
+      if (this.gameMode !== "online_mock") return false;
+      return !!(NetworkCoordinator.wsConnected && NetworkCoordinator.ws && NetworkCoordinator.ws.readyState === 1);
+    },
+    _hasValidMultiplayerSession() {
+      if (this.gameMode !== "online_mock") return false;
+      return !!(this.localRoom && this.roomCode && LocalRoomService.connectedCount(this.localRoom) >= 1);
+    },
+    _requestMultiplayerConnection(mode) {
+      this._assignDedicatedCloudUrl();
+      this._multiplayerPendingAction = mode || "";
+      if (!this._isMultiplayerTransportReady()) {
+        NetworkCoordinator.tryConnectWebSocket(this.multiplayerDedicatedUrl);
+        this._setHint("Connecting to multiplayer server…", "#8fdfff", 2.2);
+      }
+    },
     _goToMultiplayerMissionSelect() {
       this.gameMode = "online_mock";
       this._assignDedicatedCloudUrl();
-      this.localRoom = null;
-      this.roomCode = "";
-      this.lobbyReady = false;
+      this._leaveLocalRoom("to_multiplayer_mission_select");
       NetworkManager.touchSession();
       this.unlocked = loadUnlock();
       this.setPhase("mission_select");
@@ -5929,6 +7168,10 @@
     openMultiplayerMenu(fromReturn) {
       SFX.play("ui_click");
       this._ensureMultiplayerDedicatedUrlFromWindow();
+      this.gameMode = "online_mock";
+      this._assignDedicatedCloudUrl();
+      NetworkCoordinator.tryConnectWebSocket(this.multiplayerDedicatedUrl);
+      this._multiplayerPendingAction = "";
       this._multiplayerMenuReturnPhase = fromReturn || "terminal_login";
       this.setPhase("multiplayer_menu");
     },
@@ -5937,20 +7180,23 @@
       const cx1 = VIEW_W / 2 + 170;
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
         SFX.play("ui_click");
+        this._multiplayerPendingAction = "";
         this.setPhase(this._multiplayerMenuReturnPhase === "title" ? "title" : "terminal_login");
         return;
       }
-      if (mx > cx0 && mx < cx1) {
-        if (my > 224 && my < 276) {
-          SFX.play("ui_click");
-          NetworkCoordinator.closeCloudWebSocket();
-          this._assignDedicatedCloudUrl();
-          this.localRoom = null;
-          this.roomCode = "";
-          this.lobbyReady = false;
-          this._goToMultiplayerMissionSelect();
-          return;
-        }
+      if (mx > cx0 && mx < cx1 && my > 224 && my < 276) {
+        SFX.play("ui_click");
+        this.gameMode = "online_mock";
+        this._leaveLocalRoom("multiplayer_menu_host");
+        this._requestMultiplayerConnection("host");
+        return;
+      }
+      if (mx > cx0 && mx < cx1 && my > 292 && my < 344) {
+        SFX.play("ui_click");
+        this.gameMode = "online_mock";
+        this._leaveLocalRoom("multiplayer_menu_join");
+        this._requestMultiplayerConnection("join");
+        return;
       }
     },
 
@@ -5961,8 +7207,7 @@
           this.gameMode = "campaign";
           NetworkCoordinator.closeCloudWebSocket();
           NetworkCoordinator.closeLocalChannel();
-          this.localRoom = null;
-          this.roomCode = "";
+          this._leaveLocalRoom("title_campaign");
           this.multiplayerDedicatedUrl = "";
           if (typeof window !== "undefined") window.NEURAL_HEIST_WS = "";
           NetworkManager.touchSession();
@@ -5985,26 +7230,32 @@
           SFX.play("ui_click");
           this.missionId = i;
           if (this.gameMode === "online_mock") {
-            // Dedicated-server multiplayer is the only supported online flow.
-            this._assignDedicatedCloudUrl();
-            this.roomCode = "";
-            this.localRoom = null;
-            this.lobbyReady = false;
-            this.setPhase("briefing");
+            this.enterLobby(i);
           } else this.setPhase("briefing");
           return;
         }
       }
       if (mx>80 && mx<240 && my>VIEW_H-80 && my<VIEW_H-40) { SFX.play("ui_click"); this.setPhase("title"); }
     },
-    enterLobby(mid) {
-      this.missionId = mid;
+    _leaveLocalRoom(reason) {
+      if (!this.localRoom || !this.roomCode) return;
+      LocalRoomService.leaveRoom(this.roomCode, NetworkCoordinator.peerId);
       this.localRoom = null;
       this.roomCode = "";
       this.lobbyReady = false;
+      if (reason && this._dbgLog) this._dbgLog("left local room", { reason });
+    },
+    enterLobby(mid) {
+      this.missionId = mid;
+      this._leaveLocalRoom("enter_lobby");
       this.setPhase("lobby");
     },
     tryLobbyClick(mx, my) {
+      if (!this._isMultiplayerTransportReady()) {
+        this._setHint("Connection lost. Reconnect from multiplayer menu.", "#ffb08a", 2.4);
+        this.setPhase("multiplayer_menu");
+        return;
+      }
       if (mx > VIEW_W / 2 - 260 && mx < VIEW_W / 2 - 80 && my > 468 && my < 516) {
         SFX.play("ui_click");
         if (!this.localRoom) {
@@ -6017,7 +7268,7 @@
       if (mx > VIEW_W / 2 - 60 && mx < VIEW_W / 2 + 120 && my > 468 && my < 516) {
         SFX.play("ui_click");
         const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt("Enter 4-digit room code", this.roomCode || "") : "";
-        const joined = LocalRoomService.joinRoom(entered || this.roomCode);
+        const joined = LocalRoomService.joinRoom(entered || this.roomCode, NetworkCoordinator.peerId);
         if (joined) {
           this.localRoom = joined.room;
           this.roomCode = joined.room.roomCode;
@@ -6035,12 +7286,12 @@
       }
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
         SFX.play("ui_click");
-        this.localRoom = null;
-        this.roomCode = "";
+        this._leaveLocalRoom("lobby_back");
         this.setPhase("mission_select");
       }
     },
     startLobbyMatch() {
+      if (!this._isMultiplayerTransportReady()) return;
       if (!this.localRoom) return;
       const connected = this.localRoom.connectedSlots || [];
       const filled = connected.filter(Boolean).length;
@@ -6049,6 +7300,26 @@
     },
 
     advanceFromOverlay() {
+      if (this.phase === "post_level1_cutscene") {
+        this.finishPostLevel1Cutscene();
+        return;
+      }
+      if (this.phase === "post_level2_cutscene") {
+        this.finishPostLevel2Cutscene();
+        return;
+      }
+      if (this.phase === "post_level3_cutscene") {
+        this.finishPostLevel3Cutscene();
+        return;
+      }
+      if (this.phase === "post_level4_cutscene") {
+        this.finishPostLevel4Cutscene();
+        return;
+      }
+      if (this.phase === "post_level5_cutscene") {
+        this.finishPostLevel5Cutscene();
+        return;
+      }
       if (this.phase === "final_cutscene") {
         this.setPhase("mission_select");
         this.unlocked = loadUnlock();
@@ -6080,7 +7351,7 @@
       const slots = this.gameMode === "online_mock"
         ? clamp(lobbySlots || requestedSlots, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS)
         : 1;
-      if (this.gameMode !== "online_mock") { this.localRoom = null; this.roomCode = ""; }
+      if (this.gameMode !== "online_mock") this._leaveLocalRoom("start_non_online");
       if (this.gameMode === "online_mock" && this.roomCode) {
         NetworkCoordinator.initLocalChannel(this.roomCode, (this.localPlayerId | 0) === 0, this.localPlayerId | 0);
       } else {
@@ -6088,6 +7359,7 @@
       }
       NetworkManager.mode = this.gameMode;
       AuthoritativeSession.reset(w, slots, n => NetworkManager.assignRoles(n));
+      NetworkCoordinator._applyPendingWelcome();
       if (this.gameMode === "online_mock" && this.localRoom) {
         const conn = (this.localRoom.connectedSlots || []).slice(0, slots);
         while (conn.length < slots) conn.push(false);
@@ -6182,9 +7454,348 @@
     },
 
     startPlaying() {
-      this.setPhase("playing");
       this.paused = false;
+      if (this.gameMode === "online_mock") {
+        if (!this._isMultiplayerTransportReady()) {
+          this._setHint("Not connected. Connect to multiplayer server first.", "#ffb08a", 2.6);
+          this.setPhase("multiplayer_menu");
+          return;
+        }
+        if (!this._hasValidMultiplayerSession()) {
+          this._setHint("Create or join a session before starting.", "#ffb08a", 2.6);
+          this.setPhase("lobby");
+          return;
+        }
+      }
+      if (this.missionId === 1) {
+        this.startIntroCutscene();
+        return;
+      }
+      this.setPhase("playing");
       this.startMission(this.missionId);
+    },
+    startIntroCutscene() {
+      this.introCutsceneTimer = 0;
+      this.introCutsceneLineIndex = 0;
+      this.introCutsceneLineReveal = 0;
+      this.introCutsceneSkipHintPulse = 0;
+      this.introCutsceneFlash = 0;
+      this.introCutsceneDeployU = 0;
+      this._cutsceneCueSfxKey = "";
+      this._prepareIntroCutsceneWorld();
+      this.setPhase("intro_cutscene");
+    },
+    /** Load mission 1 geometry for intro visuals (same sector you are about to play). */
+    _prepareIntroCutsceneWorld() {
+      if (typeof globalThis !== "undefined" && globalThis.__NEURAL_HEIST_HEADLESS_SERVER__) return;
+      this.world = MissionLoader.load(1);
+      this._worldStaticCanvas = null;
+      this._worldStaticMissionKey = "";
+      this._buildStaticWorldLayer();
+    },
+    _introCutsceneSequence() {
+      return [
+        { text: "OmniNet arcology — fringe relay sector. The city layer never sleeps.", duration: 3.1, revealRate: 46 },
+        { text: "Live security optics: patrol routes cycling the corridors below.", duration: 3.2, revealRate: 48 },
+        { text: "VOICE (distorted): \"Agent Nyx. Infiltration window is open.\"", duration: 3.0, revealRate: 54 },
+        { text: "\"Breach the relay cluster. Ghost the guards. When it burns — run for extraction.\"", duration: 3.6, revealRate: 50 },
+        { text: "AGENT: NYX  ·  STATUS: ACTIVE", duration: 2.0, revealRate: 88 },
+        { text: "Deploying to mission bounds…", duration: 2.0, revealRate: 56 }
+      ];
+    },
+    _introClampIntroCam(cam, w) {
+      const vw = VIEW_W / cam.scale;
+      const vh = VIEW_H / cam.scale;
+      const maxX = Math.max(0, w.worldW - vw);
+      const maxY = Math.max(0, w.worldH - vh);
+      cam.x = clamp(cam.x, 0, maxX);
+      cam.y = clamp(cam.y, 0, maxY);
+      return cam;
+    },
+    /** Intro ortho camera: center always a relay, guard group, spawn, or moving agent — never empty map space. */
+    _introCutsceneComputeCam(scene, timer, dur, w, t) {
+      const spawn = w.spawn || { x: 160, y: 850 };
+      const ex = w.extraction || { x: 1460, y: 820, w: 180, h: 120 };
+      const du = this.introCutsceneDeployU != null ? this.introCutsceneDeployU : 0;
+      const termCentroid = () => {
+        const ts = w.terminals || [];
+        if (!ts.length) return { x: w.worldW * 0.48, y: w.worldH * 0.35 };
+        let sx = 0, sy = 0;
+        for (let i = 0; i < ts.length; i++) {
+          const tm = ts[i];
+          sx += tm.x + tm.w * 0.5;
+          sy += tm.y + tm.h * 0.5;
+        }
+        return { x: sx / ts.length, y: sy / ts.length };
+      };
+      let cx = spawn.x;
+      let cy = spawn.y;
+      let scale = 0.46;
+      if (scene === "city") {
+        const tc = termCentroid();
+        cx = tc.x + Math.sin(t * 0.42) * 20;
+        cy = Math.max(100, tc.y - 130) + Math.cos(t * 0.36) * 14;
+        scale = 0.31 + Math.sin(t * 0.22) * 0.015;
+      } else if (scene === "cctv") {
+        const gs = w.guards || [];
+        if (gs.length) {
+          let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+          for (let i = 0; i < gs.length; i++) {
+            const g = gs[i];
+            const gx = g._rx != null ? g._rx : g.x;
+            const gy = g._ry != null ? g._ry : g.y;
+            minx = Math.min(minx, gx);
+            miny = Math.min(miny, gy);
+            maxx = Math.max(maxx, gx);
+            maxy = Math.max(maxy, gy);
+          }
+          const spread = Math.max(220, maxx - minx, maxy - miny);
+          cx = (minx + maxx) * 0.5 + Math.sin(t * 0.72) * 18;
+          cy = (miny + maxy) * 0.5 - 40 + Math.cos(t * 0.58) * 14;
+          scale = clamp(VIEW_W / (spread * 1.28), 0.46, 0.74);
+        } else {
+          const tc = termCentroid();
+          cx = tc.x + Math.sin(t * 0.5) * 12;
+          cy = tc.y + Math.cos(t * 0.44) * 10;
+          scale = 0.52;
+        }
+      } else if (scene === "nyx") {
+        cx = spawn.x + 8 + Math.sin(t * 0.48) * 6;
+        cy = spawn.y - 110 + Math.cos(t * 0.42) * 6;
+        scale = 0.46 + Math.sin(t * 0.33) * 0.022;
+      } else {
+        const tx = ex.x + ex.w * 0.52;
+        const ty = ex.y + ex.h * 0.42;
+        const wx = spawn.x + (tx - spawn.x) * du;
+        const wy = spawn.y + (ty - spawn.y) * du;
+        cx = wx + Math.sin(t * 0.38) * 5;
+        cy = wy - 75 + Math.cos(t * 0.32) * 5;
+        scale = 0.48 + du * 0.16;
+      }
+      const viewW = VIEW_W / scale;
+      const viewH = VIEW_H / scale;
+      const cam = { x: cx - viewW * 0.5, y: cy - viewH * 0.5, scale };
+      return this._introClampIntroCam(cam, w);
+    },
+    _introWorldToScreen(wx, wy, cam, sh) {
+      return { x: sh.x + (wx - cam.x) * cam.scale, y: sh.y + (wy - cam.y) * cam.scale };
+    },
+    _drawIntroCutsceneGameWorld(ctx, scene, t, timer, dur) {
+      const w = this.world;
+      if (!w || !this._worldStaticCanvas) {
+        ctx.fillStyle = "#03060c";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        ctx.fillStyle = "#8ab";
+        ctx.font = "14px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("Sector geometry unavailable.", VIEW_W / 2, VIEW_H / 2);
+        ctx.textAlign = "left";
+        return;
+      }
+      const cam = this._introCutsceneComputeCam(scene, timer, dur, w, t);
+      const sh = VisualJuice.screenOffset();
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(sh.x, sh.y, VIEW_W, VIEW_H);
+      ctx.clip();
+      ctx.translate(sh.x, sh.y);
+      ctx.scale(cam.scale, cam.scale);
+      ctx.translate(-cam.x, -cam.y);
+      ctx.drawImage(this._worldStaticCanvas, 0, 0);
+      const terms = w.terminals || [];
+      for (let i = 0; i < terms.length; i++) {
+        const tm = terms[i];
+        ctx.fillStyle = "rgba(8,16,24,0.94)";
+        ctx.fillRect(tm.x, tm.y, tm.w, tm.h);
+        ctx.strokeStyle = "rgba(0,255,220,0.5)";
+        ctx.lineWidth = 2 / Math.max(0.001, cam.scale);
+        ctx.strokeRect(tm.x, tm.y, tm.w, tm.h);
+        ctx.fillStyle = "rgba(0,255,200,0.22)";
+        ctx.fillRect(tm.x + 4, tm.y + 6, tm.w - 8, 8);
+      }
+      if (w.extraction) {
+        const ex = w.extraction;
+        ctx.fillStyle = "rgba(0,255,220,0.1)";
+        ctx.fillRect(ex.x, ex.y, ex.w, ex.h);
+        ctx.strokeStyle = "rgba(0,220,255,0.55)";
+        ctx.lineWidth = 2 / Math.max(0.001, cam.scale);
+        ctx.strokeRect(ex.x, ex.y, ex.w, ex.h);
+        ctx.fillStyle = "#00ffcc";
+        ctx.font = Math.round(12 / cam.scale) + "px monospace";
+        ctx.fillText("EXTRACTION", ex.x + 8, ex.y + 20);
+      }
+      (w.guards || []).forEach(g => g.render(ctx));
+      ctx.restore();
+      if (scene === "city") {
+        const gTop = ctx.createLinearGradient(0, sh.y, 0, sh.y + VIEW_H * 0.55);
+        gTop.addColorStop(0, "rgba(0,0,0,0.05)");
+        gTop.addColorStop(0.45, "rgba(0,0,0,0.38)");
+        gTop.addColorStop(1, "rgba(0,0,0,0.82)");
+        ctx.fillStyle = gTop;
+        ctx.fillRect(sh.x, sh.y, VIEW_W, VIEW_H);
+        for (let i = 0; i < terms.length; i++) {
+          const tm = terms[i];
+          const c = this._introWorldToScreen(tm.x + tm.w * 0.5, tm.y + tm.h * 0.5, cam, sh);
+          const flick = 0.18 + 0.32 * (0.5 + 0.5 * Math.sin(t * 6.8 + i * 2.1));
+          ctx.fillStyle = "rgba(0,255,220," + flick.toFixed(3) + ")";
+          ctx.fillRect(c.x - 10, c.y - 10, 20, 20);
+        }
+        ctx.fillStyle = "rgba(200,255,255,0.42)";
+        ctx.font = "11px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("ESTABLISHING — ARCOLOGY / GRID LIGHTS", sh.x + 18, sh.y + 28);
+        ctx.textAlign = "left";
+      }
+      if (scene === "cctv") {
+        const ft = (t * 44) | 0;
+        for (let gy = 0; gy < VIEW_H; gy += 3) {
+          const a = 0.012 + ((gy * 17 + ft * 3) % 5) * 0.006;
+          ctx.fillStyle = "rgba(0,0,0," + a.toFixed(3) + ")";
+          ctx.fillRect(sh.x, sh.y + gy, VIEW_W, 2);
+        }
+        const rec = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(t * 6.2));
+        ctx.fillStyle = "rgba(255,80,80," + rec.toFixed(3) + ")";
+        ctx.font = "bold 13px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("● REC", sh.x + 20, sh.y + 36);
+        ctx.fillStyle = "rgba(200,255,255,0.45)";
+        ctx.font = "11px monospace";
+        ctx.fillText("SECURITY FOOTAGE — PATROL IN MOTION", sh.x + 20, sh.y + 56);
+        ctx.textAlign = "left";
+      }
+      if (scene === "nyx") {
+        const spawn = w.spawn || { x: 160, y: 850 };
+        const sc = this._introWorldToScreen(spawn.x, spawn.y - 8, cam, sh);
+        const vg = ctx.createRadialGradient(sc.x, sc.y, 40, sc.x, sc.y, 220);
+        vg.addColorStop(0, "rgba(0,0,0,0)");
+        vg.addColorStop(0.55, "rgba(0,0,0,0.55)");
+        vg.addColorStop(1, "rgba(0,0,0,0.78)");
+        ctx.fillStyle = vg;
+        ctx.fillRect(sh.x, sh.y, VIEW_W, VIEW_H);
+        const step = Math.sin(t * 2.8) * 3;
+        this._drawCutsceneNyx(sc.x + step, sc.y, "idle", t);
+        ctx.fillStyle = "rgba(200,255,255,0.4)";
+        ctx.font = "11px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("AGENT NYX — HOLDING IN SHADOW", sh.x + 18, sh.y + VIEW_H - 52);
+        ctx.textAlign = "left";
+      }
+      if (scene === "deploy") {
+        const spawn = w.spawn || { x: 160, y: 850 };
+        const ex = w.extraction || { x: 1460, y: 820, w: 180, h: 120 };
+        const du = this.introCutsceneDeployU != null ? this.introCutsceneDeployU : 0;
+        const wx = spawn.x + (ex.x + ex.w * 0.5 - spawn.x) * du;
+        const wy = spawn.y + (ex.y + ex.h * 0.45 - spawn.y) * du;
+        const sc = this._introWorldToScreen(wx, wy, cam, sh);
+        this._drawCutsceneNyx(sc.x, sc.y, "walk", t);
+        ctx.fillStyle = "rgba(200,255,255,0.42)";
+        ctx.font = "11px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("MISSION START — MOVING TOWARD EXTRACTION LANE", sh.x + 18, sh.y + VIEW_H - 48);
+        ctx.textAlign = "left";
+      }
+    },
+    finishIntroCutscene() {
+      this.setPhase("playing");
+      this.startMission(this.missionId);
+    },
+    skipIntroCutscene() {
+      if (this.phase !== "intro_cutscene") return;
+      this.finishIntroCutscene();
+    },
+    startPostLevel1Cutscene() {
+      this.postLevel1CutsceneTimer = 0;
+      this.postLevel1CutsceneLineIndex = 0;
+      this.postLevel1CutsceneLineReveal = 0;
+      this.postLevel1CutsceneSkipHintPulse = 0;
+      this.postLevel1CutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("post_level1_cutscene");
+    },
+    finishPostLevel1Cutscene() {
+      this.breachTimer = 1.0;
+      this.setPhase("loading_next");
+    },
+    skipPostLevel1Cutscene() {
+      if (this.phase !== "post_level1_cutscene") return;
+      this.finishPostLevel1Cutscene();
+    },
+    startPostLevel2Cutscene() {
+      this.postLevel2CutsceneTimer = 0;
+      this.postLevel2CutsceneLineIndex = 0;
+      this.postLevel2CutsceneLineReveal = 0;
+      this.postLevel2CutsceneSkipHintPulse = 0;
+      this.postLevel2CutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("post_level2_cutscene");
+    },
+    finishPostLevel2Cutscene() {
+      this.breachTimer = 1.0;
+      this.setPhase("loading_next");
+    },
+    skipPostLevel2Cutscene() {
+      if (this.phase !== "post_level2_cutscene") return;
+      this.finishPostLevel2Cutscene();
+    },
+    startPostLevel3Cutscene() {
+      this.postLevel3CutsceneTimer = 0;
+      this.postLevel3CutsceneLineIndex = 0;
+      this.postLevel3CutsceneLineReveal = 0;
+      this.postLevel3CutsceneSkipHintPulse = 0;
+      this.postLevel3CutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("post_level3_cutscene");
+    },
+    finishPostLevel3Cutscene() {
+      this.breachTimer = 1.0;
+      this.setPhase("loading_next");
+    },
+    skipPostLevel3Cutscene() {
+      if (this.phase !== "post_level3_cutscene") return;
+      this.finishPostLevel3Cutscene();
+    },
+    startPostLevel4Cutscene() {
+      this.postLevel4CutsceneTimer = 0;
+      this.postLevel4CutsceneLineIndex = 0;
+      this.postLevel4CutsceneLineReveal = 0;
+      this.postLevel4CutsceneSkipHintPulse = 0;
+      this.postLevel4CutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("post_level4_cutscene");
+    },
+    finishPostLevel4Cutscene() {
+      this.breachTimer = 1.0;
+      this.setPhase("loading_next");
+    },
+    skipPostLevel4Cutscene() {
+      if (this.phase !== "post_level4_cutscene") return;
+      this.finishPostLevel4Cutscene();
+    },
+    startPostLevel5Cutscene() {
+      this.postLevel5CutsceneTimer = 0;
+      this.postLevel5CutsceneLineIndex = 0;
+      this.postLevel5CutsceneLineReveal = 0;
+      this.postLevel5CutsceneSkipHintPulse = 0;
+      this.postLevel5CutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("post_level5_cutscene");
+    },
+    finishPostLevel5Cutscene() {
+      this.breachTimer = 1.0;
+      this.setPhase("loading_next");
+    },
+    skipPostLevel5Cutscene() {
+      if (this.phase !== "post_level5_cutscene") return;
+      this.finishPostLevel5Cutscene();
+    },
+    startFinalCutscene() {
+      this.finalCutsceneTimer = 0;
+      this.finalCutsceneLineIndex = 0;
+      this.finalCutsceneLineReveal = 0;
+      this.finalCutsceneSkipHintPulse = 0;
+      this.finalCutsceneFlash = 0;
+      this._cutsceneCueSfxKey = "";
+      this.setPhase("final_cutscene");
     },
 
     tryFakeTask() {
@@ -6536,9 +8147,29 @@
       const p = this.player;
       if (!w || !p) return;
       NetworkCoordinator.sendInputFrame({ slot: this.localPlayerId, keys: this.keys });
+      // Interpolate remote players toward latest server targets for smooth, low-latency visuals.
+      const now = performance.now();
+      for (let i = 0; i < AuthoritativeSession.players.length; i++) {
+        const rp = AuthoritativeSession.players[i];
+        if (!rp || (rp.id | 0) === (this.localPlayerId | 0)) continue;
+        if (rp._netTargetX == null || rp._netTargetY == null) continue;
+        const ageSec = clamp((now - (rp._netSnapAt || now)) * 0.001, 0, 0.18);
+        const tx = rp._netTargetX + (rp._netTargetVx || 0) * ageSec;
+        const ty = rp._netTargetY + (rp._netTargetVy || 0) * ageSec;
+        const dx = tx - rp.x, dy = ty - rp.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 220 * 220) {
+          rp.x = tx;
+          rp.y = ty;
+        } else {
+          const k = 1 - Math.exp(-13 * dt);
+          rp.x = lerp(rp.x, tx, k);
+          rp.y = lerp(rp.y, ty, k);
+        }
+      }
       this._smoothCameraToward(p, w, dt);
       this.shake *= 0.9;
-      MissionSystem.sync(w, p);
+      // Client never mutates core mission state; server snapshots are authoritative.
       if (MissionSystem.isComplete(w)) this.triggerWin();
     },
 
@@ -6615,6 +8246,7 @@
           if (this.phase==="title") { this.drawTitle(); ctx.restore(); return; }
           if (this.phase==="mission_select") { this.drawMissionSelect(); ctx.restore(); return; }
           if (this.phase==="briefing") { this.drawBriefing(); ctx.restore(); return; }
+          if (this.phase==="intro_cutscene") { this.drawIntroCutscene(); ctx.restore(); return; }
           break;
         case STATES.MULTIPLAYER_LOBBY:
           this.drawLobby();
@@ -6623,6 +8255,11 @@
         case STATES.GAMEOVER:
           if (this.phase==="mission_win") this.drawWin();
           else if (this.phase==="loading_next") this.drawLoadingNext();
+          else if (this.phase==="post_level1_cutscene") this.drawPostLevel1Cutscene();
+          else if (this.phase==="post_level2_cutscene") this.drawPostLevel2Cutscene();
+          else if (this.phase==="post_level3_cutscene") this.drawPostLevel3Cutscene();
+          else if (this.phase==="post_level4_cutscene") this.drawPostLevel4Cutscene();
+          else if (this.phase==="post_level5_cutscene") this.drawPostLevel5Cutscene();
           else if (this.phase==="final_cutscene") this.drawFinalCutscene();
           else this.drawFail();
           ctx.restore();
@@ -7229,6 +8866,8 @@
     },
     drawMultiplayerMenu() {
       const u = VisualJuice.uiT;
+      const connState = NetworkCoordinator.wsConnectionState || "idle";
+      const connected = connState === "connected" && this._isMultiplayerTransportReady();
       const g = ctx.createRadialGradient(VIEW_W / 2, 200, 10, VIEW_W / 2, 360, 460);
       g.addColorStop(0, "rgba(0,70,95,0.28)");
       g.addColorStop(1, "rgba(0,0,0,0)");
@@ -7243,7 +8882,7 @@
       ctx.shadowBlur = 0;
       ctx.fillStyle = "#7a9aac";
       ctx.font = "12px monospace";
-      ctx.fillText("Everyone connects to the same dedicated server — no link or URL to paste.", VIEW_W / 2, 188);
+      ctx.fillText("Connect first, then host or join a room session.", VIEW_W / 2, 188);
       ctx.fillStyle = "#5a6a78";
       ctx.font = "10px monospace";
       const hostLine = NH_DEDICATED_WS_URL.length > 52 ? NH_DEDICATED_WS_URL.slice(0, 49) + "…" : NH_DEDICATED_WS_URL;
@@ -7255,7 +8894,31 @@
       ctx.strokeRect(VIEW_W / 2 - 170, 224, 340, 52);
       ctx.fillStyle = "#0ff";
       ctx.font = "bold 16px monospace";
-      ctx.fillText("PLAY ONLINE (SHARED SERVER)", VIEW_W / 2, 258);
+      ctx.fillText("HOST GAME", VIEW_W / 2, 258);
+      ctx.fillStyle = "rgba(0,52,68,0.94)";
+      ctx.strokeStyle = "rgba(130,220,255," + pulse + ")";
+      ctx.fillRect(VIEW_W / 2 - 170, 292, 340, 52);
+      ctx.strokeRect(VIEW_W / 2 - 170, 292, 340, 52);
+      ctx.fillStyle = "#9fefff";
+      ctx.fillText("JOIN GAME", VIEW_W / 2, 326);
+      let statusText = "SERVER: NOT CONNECTED";
+      let statusColor = "#ffb08a";
+      if (connState === "connecting") {
+        statusText = "SERVER: CONNECTING";
+        statusColor = "#8fdfff";
+      } else if (connected) {
+        statusText = "SERVER: CONNECTED";
+        statusColor = "#9bffcb";
+      } else if (connState === "disconnected") {
+        statusText = "SERVER: DISCONNECTED";
+        statusColor = "#ff8f8f";
+      } else if (connState === "failed") {
+        statusText = "SERVER: DISCONNECTED";
+        statusColor = "#ff8f8f";
+      }
+      ctx.fillStyle = statusColor;
+      ctx.font = "11px monospace";
+      ctx.fillText(statusText, VIEW_W / 2, 368);
       ctx.fillStyle = "#345";
       ctx.fillRect(80, VIEW_H - 80, 160, 40);
       ctx.strokeStyle = "#567";
@@ -7293,6 +8956,7 @@
     },
     drawLobby() {
       const filled = LocalRoomService.connectedCount(this.localRoom);
+      const players = LocalRoomService.playerList(this.localRoom);
       ctx.fillStyle = "rgba(0,20,30,0.94)";
       ctx.fillRect(120, 90, VIEW_W - 240, VIEW_H - 180);
       ctx.strokeStyle = "rgba(0,255,220,0.45)";
@@ -7310,13 +8974,14 @@
       for (let i = 0; i < 4; i++) {
         const x = VIEW_W / 2 - 210 + i * 110, y = 260;
         const on = this.localRoom && this.localRoom.connectedSlots && this.localRoom.connectedSlots[i];
+        const pid = players[i] && players[i].peerId ? String(players[i].peerId).slice(-6) : "";
         ctx.fillStyle = on ? "rgba(0,120,90,0.9)" : "rgba(20,30,40,0.9)";
         ctx.fillRect(x, y, 90, 70);
         ctx.strokeStyle = on ? "rgba(0,255,190,0.9)" : "rgba(120,140,160,0.35)";
         ctx.strokeRect(x, y, 90, 70);
         ctx.fillStyle = on ? "#8ff" : "#789";
         ctx.fillText("SLOT " + (i + 1), x + 45, y + 28);
-        ctx.fillText(on ? "READY" : "OPEN", x + 45, y + 50);
+        ctx.fillText(on ? ("READY " + pid) : "OPEN", x + 45, y + 50);
       }
       ctx.fillStyle = "rgba(0,65,90,0.95)";
       ctx.fillRect(VIEW_W / 2 - 260, 468, 180, 48);
@@ -7340,6 +9005,479 @@
       ctx.fillText("Connected: " + filled + " / 4", VIEW_W / 2, 556);
       ctx.fillStyle="#345"; ctx.fillRect(80,VIEW_H-80,160,40); ctx.strokeStyle="#567"; ctx.strokeRect(80,VIEW_H-80,160,40);
       ctx.fillStyle="#9ab"; ctx.fillText("← Back", 160, VIEW_H-55);
+    },
+    _cutsceneSceneFor(phase, idx) {
+      const line = idx | 0;
+      const isPost = phase.indexOf("post_level") === 0;
+      if (phase === "intro_cutscene") {
+        // Legacy spec: intro uses live mission render + _introSceneFromLineIndex; kept for any callers.
+        const sb = this._cutsceneStoryboardForLine("intro_cutscene", line);
+        if (sb.shot <= 1) return { env: "city", shot: "pan", focus: "skyline", nyxPose: "none" };
+        if (sb.shot === 2) return { env: "surveillance", shot: "pan", focus: "guards", nyxPose: "none" };
+        if (sb.shot === 3) return { env: "facility", shot: "zoom", focus: "shadows", nyxPose: "look" };
+        return { env: "facility", shot: "pan", focus: "entrance", nyxPose: "walk" };
+      }
+      if (phase === "final_cutscene") {
+        const sb = this._cutsceneStoryboardForLine("final_cutscene", line);
+        if (sb.shot === 1) return { env: "facility", shot: "pan", focus: "facility_chaos", nyxPose: "none" };
+        if (sb.shot === 2) return { env: "facility", shot: "pan", focus: "escape_corridor", nyxPose: "run" };
+        if (sb.shot === 3) {
+          return line <= 10
+            ? { env: "surveillance", shot: "zoom", focus: "system_takeover", nyxPose: "hide" }
+            : { env: "surveillance", shot: "zoom", focus: "screen_lock", nyxPose: "none" };
+        }
+        return { env: "city", shot: "pan", focus: "skyline_pattern", nyxPose: "none" };
+      }
+      if (phase === "post_level1_cutscene") {
+        if (line === 0) return { env: "facility", shot: "static", focus: "hall", nyxPose: "idle" };
+        if (line === 1) return { env: "terminal", shot: "pan", focus: "terminal", nyxPose: "walk" };
+        if (line === 2) return { env: "surveillance", shot: "zoom", focus: "screens", nyxPose: "look" };
+        return { env: "facility", shot: "zoom", focus: "hall", nyxPose: "idle" };
+      }
+      // Mid-level tension sequence: one primary focus per cutscene.
+      if (phase === "post_level2_cutscene") {
+        return { env: "terminal", shot: "pan", focus: "terminal_glitch", nyxPose: (line >= 2 ? "hide" : "walk") };
+      }
+      if (phase === "post_level3_cutscene") {
+        return { env: "surveillance", shot: "zoom", focus: "patrol_shift", nyxPose: (line >= 2 ? "hide" : "look") };
+      }
+      if (phase === "post_level4_cutscene") {
+        return { env: "facility", shot: "zoom", focus: "lights_flicker", nyxPose: (line >= 3 ? "hide" : "idle") };
+      }
+      if (phase === "post_level5_cutscene") {
+        return { env: "surveillance", shot: "zoom", focus: "camera_distortion", nyxPose: (line >= 4 ? "hide" : "walk") };
+      }
+      if (isPost) {
+        return { env: "facility", shot: "zoom", focus: "hall", nyxPose: "idle" };
+      }
+      return { env: "facility", shot: "static", focus: "hall", nyxPose: "idle" };
+    },
+    _drawCutsceneNyx(x, y, pose, t) {
+      // Lightweight procedural animation: breathing, walking cadence, subtle turning.
+      const breath = Math.sin(t * 2.2) * 1.15;
+      const bob = breath + Math.sin(t * 3.1) * 0.55;
+      const walkPhase = Math.sin(t * 4.3);
+      const walkStride = pose === "walk" ? walkPhase * 2.1 : 0;
+      const runStride = pose === "run" ? Math.sin(t * 12.5) * 5.4 : 0;
+      const stride = walkStride + runStride;
+      const lookTurn = pose === "look" ? Math.sin(t * 1.8) * 0.22 : 0;
+      const moveTurn = pose === "walk" ? (walkPhase * 0.07) : (pose === "run" ? Math.sin(t * 8.8) * 0.1 : 0);
+      const bodyTurn = lookTurn + moveTurn;
+      const headTurnPx = (pose === "look" ? Math.sin(t * 1.8) * 1.8 : 0) + (pose === "walk" ? walkPhase * 0.55 : 0);
+      ctx.save();
+      ctx.translate(x + stride, y + bob);
+      ctx.rotate(bodyTurn);
+      if (pose === "hide") {
+        ctx.globalAlpha = 0.52;
+        ctx.fillStyle = "rgba(10,16,24,0.96)";
+      } else {
+        ctx.fillStyle = "rgba(18,24,34,0.94)";
+      }
+      ctx.strokeStyle = "rgba(130,245,255,0.48)";
+      ctx.lineWidth = 1.5;
+      // torso
+      ctx.fillRect(-7, -22, 14, 26);
+      // legs
+      const legA = pose === "walk" ? Math.sin(t * 6.2) * 1.6 : (pose === "run" ? Math.sin(t * 13.2) * 2.2 : 0);
+      const legB = -legA;
+      ctx.fillRect(-6 + legA, 3, 4, 14);
+      ctx.fillRect(2 + legB, 3, 4, 14);
+      // head
+      ctx.beginPath();
+      const headY = -28 + breath * 0.28;
+      ctx.arc(headTurnPx * 0.25, headY, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      // visor glow
+      ctx.fillStyle = pose === "hide" ? "rgba(120,250,255,0.46)" : "rgba(120,250,255,0.85)";
+      ctx.fillRect(-4 + headTurnPx * 0.2, -30 + breath * 0.18, 8, 2);
+      ctx.restore();
+    },
+    /** World-space point the cinematic backdrop should keep near frame center (player, guards, relays, extraction). */
+    _cutsceneBackdropWorldFocus(w, spec) {
+      if (!w) return { x: 960, y: 540 };
+      const spawn = w.spawn || { x: w.worldW * 0.5, y: w.worldH * 0.72 };
+      const ex = w.extraction;
+      const guardMid = () => {
+        const gs = w.guards || [];
+        if (!gs.length) return null;
+        let ax = 0, ay = 0;
+        for (let i = 0; i < gs.length; i++) {
+          const g = gs[i];
+          ax += g._rx != null ? g._rx : g.x;
+          ay += g._ry != null ? g._ry : g.y;
+        }
+        return { x: ax / gs.length, y: ay / gs.length };
+      };
+      const termMid = () => {
+        const ts = w.terminals || [];
+        if (!ts.length) return null;
+        let sx = 0, sy = 0;
+        for (let i = 0; i < ts.length; i++) {
+          const tm = ts[i];
+          sx += tm.x + tm.w * 0.5;
+          sy += tm.y + tm.h * 0.5;
+        }
+        return { x: sx / ts.length, y: sy / ts.length };
+      };
+      if (spec.focus === "entrance" || spec.nyxPose === "walk") {
+        if (ex) {
+          return {
+            x: spawn.x * 0.32 + (ex.x + ex.w * 0.5) * 0.68,
+            y: spawn.y * 0.38 + (ex.y + ex.h * 0.5) * 0.62
+          };
+        }
+        return { x: spawn.x, y: spawn.y };
+      }
+      if (spec.focus === "shadows" || spec.nyxPose === "look") {
+        return { x: spawn.x, y: spawn.y - 50 };
+      }
+      if (spec.focus === "hall") {
+        const g = guardMid();
+        if (g) return { x: g.x * 0.55 + spawn.x * 0.45, y: g.y * 0.48 + spawn.y * 0.52 };
+        return { x: spawn.x, y: spawn.y - 30 };
+      }
+      if (spec.focus === "terminal" || spec.focus === "terminal_glitch") {
+        const t = termMid();
+        if (t) return { x: t.x, y: t.y - 35 };
+      }
+      if (spec.focus === "facility_chaos" || spec.focus === "escape_corridor") {
+        const g = guardMid();
+        if (g) return { x: g.x, y: g.y - 25 };
+        return { x: w.worldW * 0.48, y: w.worldH * 0.52 };
+      }
+      if (spec.focus === "lights_flicker") {
+        const g = guardMid();
+        if (g) return { x: g.x * 0.62 + spawn.x * 0.38, y: g.y * 0.52 + spawn.y * 0.48 };
+        return { x: spawn.x + 380, y: spawn.y - 180 };
+      }
+      if (spec.focus === "guards" || spec.focus === "screens" || spec.focus === "patrol_shift" || spec.focus === "camera_distortion") {
+        const g = guardMid();
+        if (g) return { x: g.x, y: g.y - 45 };
+        return termMid() || { x: w.worldW * 0.5, y: w.worldH * 0.45 };
+      }
+      if (spec.focus === "system_takeover" || spec.focus === "screen_lock") {
+        return termMid() || { x: w.worldW * 0.52, y: w.worldH * 0.38 };
+      }
+      if (spec.env === "city" || spec.focus === "skyline_pattern") {
+        const t = termMid();
+        if (t) return { x: t.x, y: Math.max(90, t.y - 120) };
+      }
+      return { x: spawn.x, y: spawn.y - 20 };
+    },
+    _drawCutsceneScene(phase, idx, timer, flash) {
+      const spec = this._cutsceneSceneFor(phase, idx);
+      const t = VisualJuice.uiT + (idx * 0.4);
+      const chaosShake = spec.focus === "facility_chaos" ? (Math.sin(t * 19.3) * (1.4 + flash * 2.6)) : 0;
+      const hasWB = !!(this._worldStaticCanvas && this.world);
+      const tightWorldPan = hasWB && spec.env !== "city" && spec.env !== "black" && spec.env !== "surveillance" && spec.env !== "terminal";
+      const panAmt = (spec.shot === "pan" ? Math.sin(t * 0.55) * (tightWorldPan ? 11 : 34) : 0) + chaosShake;
+      const zoomAmt = spec.shot === "zoom" ? (1 + clamp(timer * 0.42, 0, 0.16)) : 1;
+      const camYRaw = (spec.shot === "pan" ? Math.sin(t * 0.38 + 1.2) * 10 : 0) + (spec.focus === "facility_chaos" ? (Math.cos(t * 17.1) * (0.9 + flash * 2.0)) : 0);
+      const camY = tightWorldPan ? camYRaw * 0.5 : camYRaw;
+      ctx.save();
+      ctx.translate(VIEW_W * 0.5, VIEW_H * 0.5);
+      ctx.scale(zoomAmt, zoomAmt);
+      ctx.translate(-VIEW_W * 0.5 + panAmt, -VIEW_H * 0.5 + camY);
+      // Base background gradient
+      const bg = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+      bg.addColorStop(0, "rgba(5,10,20,0.95)");
+      bg.addColorStop(1, "rgba(2,4,10,0.97)");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      if (spec.env === "black") {
+        ctx.fillStyle = "rgba(6,10,18,0.97)";
+        ctx.fillRect(60, 120, VIEW_W - 120, VIEW_H - 220);
+        for (let r = 0; r < 5; r++) {
+          const rx = 96 + r * ((VIEW_W - 192) / 4);
+          const blink = (Math.floor(t * 6 + r) % 4) < 2;
+          ctx.fillStyle = blink ? "rgba(0,255,200,0.55)" : "rgba(30,55,50,0.35)";
+          ctx.fillRect(rx, VIEW_H - 168, 10, 6);
+        }
+        this._cutsceneDrawTerminalBezel(ctx, VIEW_W * 0.5 - 104, VIEW_H * 0.42, 208, 118, t, 11, { typing: true });
+        ctx.fillStyle = "rgba(160,255,245,0.42)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SUBJECT: SIGNAL RELAY  ·  ACTION: LOCKING ONTO YOUR CHANNEL", VIEW_W * 0.5, VIEW_H * 0.42 + 132);
+        ctx.textAlign = "left";
+        ctx.restore();
+        return;
+      }
+      const hasWorldBackdrop = !!(this._worldStaticCanvas && this.world);
+      if (spec.env === "city") {
+        for (let i = 0; i < 28; i++) {
+          const w = 18 + (i % 3) * 8;
+          const h = 70 + ((i * 37) % 180);
+          const x = 20 + i * 46;
+          const y = VIEW_H - 64 - h;
+          const lit = (Math.floor(t * 8 + i) % 4) !== 0;
+          ctx.fillStyle = lit ? "rgba(70,140,180,0.22)" : "rgba(16,26,42,0.35)";
+          ctx.fillRect(x, y, w, h);
+        }
+        if (spec.focus === "skyline_pattern") {
+          for (let i = 0; i < 20; i++) {
+            const bx = 46 + i * 60;
+            const pulseOn = ((Math.floor(t * 7) + i) % 3) === 0;
+            ctx.fillStyle = pulseOn ? "rgba(255,120,200,0.25)" : "rgba(80,210,255,0.12)";
+            ctx.fillRect(bx, VIEW_H - 156, 20, 26);
+          }
+        } else {
+          ctx.save();
+          ctx.translate(VIEW_W * 0.7, VIEW_H - 102);
+          ctx.scale(0.74, 0.74);
+          this._drawCutsceneNyx(0, 0, "look", t);
+          ctx.restore();
+          ctx.fillStyle = "rgba(190,255,250,0.38)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: NYX  ·  ACTION: READING THE GRID FROM A ROOFTOP", VIEW_W * 0.5, VIEW_H - 28);
+          ctx.textAlign = "left";
+        }
+      } else if (spec.env === "terminal") {
+        ctx.fillStyle = "rgba(10,20,28,0.88)";
+        ctx.fillRect(120, 120, VIEW_W - 240, VIEW_H - 220);
+        for (let i = 0; i < 6; i++) {
+          const x = 170 + i * 170;
+          if (i === 0) {
+            this._cutsceneDrawTerminalBezel(ctx, x, 190, 120, 72, t, i, { typing: true });
+          } else {
+            ctx.fillStyle = "rgba(16,30,42,0.9)";
+            ctx.fillRect(x, 190, 120, 72);
+            ctx.strokeStyle = "rgba(90,240,255,0.42)";
+            ctx.strokeRect(x, 190, 120, 72);
+            ctx.fillStyle = "rgba(0,255,235,0.18)";
+            ctx.fillRect(x + 8, 200, 104, 12 + ((i + (t * 3) | 0) % 3) * 8);
+          }
+        }
+        ctx.fillStyle = "rgba(200,255,255,0.35)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SUBJECT: OPS TERMINALS  ·  ACTION: OPERATORS PUNCHING IN COMMANDS", VIEW_W * 0.5, 176);
+        ctx.textAlign = "left";
+        if (spec.focus === "terminal_glitch") {
+          for (let i = 0; i < 6; i++) {
+            const x = 170 + i * 170;
+            const spike = ((Math.floor(t * 12 + i * 2) % 4) === 0);
+            if (spike || ((Math.floor(t * 8 + i * 3) % 5) < 2)) {
+              ctx.fillStyle = "rgba(255,95,180,0.24)";
+              ctx.fillRect(x + 10, 205, 100, 44);
+            }
+          }
+        }
+      } else if (spec.env === "surveillance") {
+        ctx.fillStyle = "rgba(8,16,26,0.9)";
+        ctx.fillRect(90, 100, VIEW_W - 180, VIEW_H - 180);
+        for (let i = 0; i < 8; i++) {
+          const x = 130 + (i % 4) * 250;
+          const y = 145 + ((i / 4) | 0) * 170;
+          ctx.fillStyle = "rgba(14,26,40,0.95)";
+          ctx.fillRect(x, y, 210, 120);
+          ctx.strokeStyle = "rgba(115,250,255,0.44)";
+          ctx.strokeRect(x, y, 210, 120);
+          if (((Math.floor(t * 10 + i * 4) % 6) < 2) || flash > 0.55) {
+            ctx.fillStyle = "rgba(0,255,235,0.13)";
+            ctx.fillRect(x + 10, y + 10, 190, 100);
+          }
+        }
+        if (spec.focus === "guards") {
+          for (let mi = 0; mi < 8; mi++) {
+            const mx = 130 + (mi % 4) * 250;
+            const my = 145 + ((mi / 4) | 0) * 170;
+            this._cutsceneDrawMonitorFeedNoise(ctx, mx + 10, my + 10, 190, 100, t + mi * 0.35, 72);
+          }
+          for (let g = 0; g < 3; g++) {
+            const gx = 180 + ((t * (18 + g * 5) + g * 240) % (VIEW_W - 360));
+            const gy = 436 + Math.sin(t * 1.7 + g) * 8;
+            this._cutsceneDrawGuardSilhouette(ctx, gx, gy, t, g, "walk");
+          }
+        }
+        if (spec.focus === "patrol_shift") {
+          ctx.fillStyle = "rgba(200,255,255,0.38)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: DISPATCH MAPS  ·  ACTION: GUARD ROUTES REDIRECTING", VIEW_W * 0.5, 128);
+          ctx.textAlign = "left";
+          for (let g = 0; g < 4; g++) {
+            const bx = 118 + (g % 2) * 360;
+            const by = 158 + ((g / 2) | 0) * 200;
+            this._cutsceneDrawMiniPatrolMap(ctx, bx, by, 320, 160, t, g + 3);
+          }
+        }
+        if (spec.focus === "camera_distortion") {
+          const wave = Math.sin(t * 7.5) * (8 + flash * 18);
+          ctx.fillStyle = "rgba(255,95,185,0.12)";
+          ctx.fillRect(90 + wave, 100, VIEW_W - 180, VIEW_H - 180);
+          const scanY = 108 + ((t * 88) % (VIEW_H - 260));
+          ctx.strokeStyle = "rgba(220,240,255,0.2)";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(92, scanY);
+          ctx.lineTo(VIEW_W - 92, scanY + Math.sin(t * 11) * 5);
+          ctx.stroke();
+          this._cutsceneDrawCeilingCamera(ctx, VIEW_W * 0.5 + wave * 0.4, 118, t, false);
+          ctx.fillStyle = "rgba(255,220,240,0.42)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: CCTV FEED  ·  ACTION: LENS / SENSOR WARPING", VIEW_W * 0.5, VIEW_H - 42);
+          ctx.textAlign = "left";
+        }
+        if (spec.focus === "system_takeover" || spec.focus === "screen_lock") {
+          for (let i = 0; i < 8; i++) {
+            const x = 130 + (i % 4) * 250;
+            const y = 145 + ((i / 4) | 0) * 170;
+            ctx.fillStyle = "rgba(255,80,165,0.14)";
+            ctx.fillRect(x + 8, y + 18, 194, 84);
+            ctx.fillStyle = "rgba(255,205,230,0.9)";
+            ctx.font = "bold 12px monospace";
+            ctx.textAlign = "center";
+            ctx.fillText("AGENT: NYX DETECTED", x + 105, y + 66);
+          }
+          if (spec.focus === "screen_lock") {
+            const cx = VIEW_W * 0.5 - 190, cy = VIEW_H * 0.5 - 120;
+            ctx.fillStyle = "rgba(10,18,28,0.92)";
+            ctx.fillRect(cx, cy, 380, 240);
+            ctx.strokeStyle = "rgba(255,120,200,0.75)";
+            ctx.lineWidth = 2.5;
+            ctx.strokeRect(cx, cy, 380, 240);
+            ctx.fillStyle = "rgba(255,80,160,0.18)";
+            ctx.fillRect(cx + 14, cy + 20, 352, 196);
+            ctx.fillStyle = "rgba(255,225,240,0.96)";
+            ctx.font = "bold 20px monospace";
+            ctx.fillText("AGENT: NYX DETECTED", VIEW_W * 0.5, VIEW_H * 0.5 + 8);
+          }
+        }
+      } else {
+        // facility interior
+        if (hasWorldBackdrop) {
+          const w = this.world;
+          const srcW = Math.min(w.worldW, VIEW_W * 1.2);
+          const srcH = Math.min(w.worldH, VIEW_H * 1.2);
+          const focus = this._cutsceneBackdropWorldFocus(w, spec);
+          const bobx = Math.sin(t * 0.29 + idx * 0.65) * 14;
+          const boby = Math.cos(t * 0.23 + idx * 1.05) * 11;
+          const cx = focus.x + bobx;
+          const cy = focus.y + boby;
+          const sx = clamp(Math.round(cx - srcW * 0.5), 0, Math.max(0, (w.worldW - srcW) | 0));
+          const sy = clamp(Math.round(cy - srcH * 0.5), 0, Math.max(0, (w.worldH - srcH) | 0));
+          ctx.globalAlpha = 0.55;
+          ctx.drawImage(this._worldStaticCanvas, sx, sy, srcW, srcH, 60, 88, VIEW_W - 120, VIEW_H - 132);
+          ctx.globalAlpha = 1;
+        } else {
+          ctx.fillStyle = "rgba(8,16,24,0.88)";
+          ctx.fillRect(60, 90, VIEW_W - 120, VIEW_H - 130);
+          for (let i = 0; i < 11; i++) {
+            const x = 90 + i * 104;
+            ctx.fillStyle = "rgba(20,36,52,0.55)";
+            ctx.fillRect(x, 120, 48, VIEW_H - 220);
+          }
+        }
+        ctx.fillStyle = "rgba(20,40,62,0.4)";
+        ctx.fillRect(80, VIEW_H - 170, VIEW_W - 160, 60);
+        if (spec.focus === "entrance") {
+          ctx.fillStyle = "rgba(8,22,30,0.95)";
+          ctx.fillRect(VIEW_W * 0.5 - 84, 134, 168, 240);
+          ctx.strokeStyle = "rgba(120,250,255,0.55)";
+          ctx.strokeRect(VIEW_W * 0.5 - 84, 134, 168, 240);
+          ctx.fillStyle = "rgba(0,255,235,0.12)";
+          ctx.fillRect(VIEW_W * 0.5 - 66, 150, 132, 204);
+        }
+        if (spec.focus === "shadows") {
+          const vg = ctx.createRadialGradient(VIEW_W * 0.5, VIEW_H * 0.58, 40, VIEW_W * 0.5, VIEW_H * 0.58, 340);
+          vg.addColorStop(0, "rgba(0,0,0,0)");
+          vg.addColorStop(1, "rgba(0,0,0,0.6)");
+          ctx.fillStyle = vg;
+          ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        }
+        if (spec.focus === "lights_flicker") {
+          for (let i = 0; i < 9; i++) {
+            const x = 108 + i * 118;
+            const lit = ((Math.floor(t * 14 + i) % 3) !== 0);
+            ctx.fillStyle = lit ? "rgba(130,245,255,0.22)" : "rgba(35,50,65,0.25)";
+            ctx.fillRect(x, 112, 64, 10);
+          }
+          if (((Math.floor(t * 12) % 5) === 0) && flash > 0.35) {
+            ctx.fillStyle = "rgba(235,245,255,0.06)";
+            ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+          }
+          const gx = VIEW_W * 0.8, gy = VIEW_H * 0.58;
+          this._cutsceneDrawGuardSilhouette(ctx, gx, gy, t, 4, "alert");
+          ctx.save();
+          ctx.translate(gx, gy - 10);
+          ctx.rotate(-0.85 + Math.sin(t * 1.85) * 0.55);
+          const grd = ctx.createLinearGradient(0, 0, 260, 0);
+          grd.addColorStop(0, "rgba(255,255,210,0.32)");
+          grd.addColorStop(1, "rgba(255,255,210,0)");
+          ctx.fillStyle = grd;
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(240, 70);
+          ctx.lineTo(240, -70);
+          ctx.closePath();
+          ctx.fill();
+          ctx.restore();
+          ctx.fillStyle = "rgba(200,255,255,0.35)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: SECURITY  ·  ACTION: SWEEPING FLASHLIGHTS DOWN THE HALL", VIEW_W * 0.5, 96);
+          ctx.textAlign = "left";
+        }
+        if (spec.focus === "facility_chaos") {
+          for (let i = 0; i < 10; i++) {
+            const x = 96 + i * 104;
+            const on = ((Math.floor(t * 12 + i) % 2) === 0);
+            ctx.fillStyle = on ? "rgba(255,90,150,0.32)" : "rgba(55,70,90,0.2)";
+            ctx.fillRect(x, 110, 62, 12);
+          }
+          for (let rg = 0; rg < 4; rg++) {
+            this._cutsceneDrawGuardSilhouette(ctx, 130 + rg * 210 + Math.sin(t * 11 + rg) * 18, VIEW_H * 0.66, t, rg + 1, "run");
+          }
+          ctx.fillStyle = "rgba(255,200,210,0.4)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: RESPONSE TEAM  ·  ACTION: SPRINTING THROUGH LOCKED SECTORS", VIEW_W * 0.5, VIEW_H - 36);
+          ctx.textAlign = "left";
+        }
+        if (spec.focus === "escape_corridor") {
+          const close = clamp(timer * 1.45, 0, 1);
+          const leftW = 86 * close, rightW = 86 * close;
+          ctx.fillStyle = "rgba(8,20,28,0.96)";
+          ctx.fillRect(VIEW_W * 0.5 - 86, 150, leftW, 220);
+          ctx.fillRect(VIEW_W * 0.5 + 86 - rightW, 150, rightW, 220);
+          ctx.strokeStyle = "rgba(120,245,255,0.55)";
+          ctx.strokeRect(VIEW_W * 0.5 - 86, 150, 172, 220);
+          ctx.fillStyle = "rgba(200,255,255,0.38)";
+          ctx.font = "10px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText("SUBJECT: NYX  ·  ACTION: SPRINTING AS WALLS PINCH THE EXTRACTION LANE", VIEW_W * 0.5, 102);
+          ctx.textAlign = "left";
+        }
+      }
+      if (spec.env === "surveillance" || spec.focus === "screens" || spec.focus === "terminal") {
+        const sweepY = 96 + ((t * 52) % (VIEW_H - 140));
+        ctx.strokeStyle = "rgba(120,240,255,0.14)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(72, sweepY);
+        ctx.lineTo(VIEW_W - 72, sweepY);
+        ctx.stroke();
+      }
+      // Nyx character presence in all cinematic scenes.
+      if (spec.nyxPose !== "none") {
+        let nyxX = spec.focus === "terminal" ? VIEW_W * 0.44 : (spec.focus === "screens" ? VIEW_W * 0.56 : VIEW_W * 0.48);
+        let nyxY = VIEW_H * 0.74;
+        if (spec.focus === "shadows") nyxX = VIEW_W * 0.34;
+        if (spec.focus === "entrance") nyxX = VIEW_W * 0.5 - 110 + Math.min(100, timer * 44);
+        if (spec.focus === "id_overlay") nyxX = VIEW_W * 0.46;
+        if (spec.focus === "terminal_glitch") nyxX = VIEW_W * 0.38 + Math.sin(t * 1.2) * 26;
+        if (spec.focus === "patrol_shift") nyxX = VIEW_W * 0.26;
+        if (spec.focus === "lights_flicker") nyxX = VIEW_W * 0.44;
+        if (spec.focus === "camera_distortion") nyxX = VIEW_W * 0.52 + Math.sin(t * 0.9) * 18;
+        if (spec.focus === "escape_corridor") nyxX = VIEW_W * 0.5 - 128 + Math.min(150, timer * 88);
+        if (spec.focus === "shadows") ctx.globalAlpha = 0.68;
+        this._drawCutsceneNyx(nyxX, nyxY, spec.nyxPose, t);
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
     },
     drawBriefing() {
       const m = MISSIONS[this.missionId];
@@ -7368,6 +9506,67 @@
       }
       ctx.fillStyle="rgba(0,80,90,0.95)"; ctx.fillRect(VIEW_W/2-140,VIEW_H*0.62,280,48); ctx.strokeStyle="#0ff"; ctx.strokeRect(VIEW_W/2-140,VIEW_H*0.62,280,48);
       ctx.fillStyle="#0ff"; ctx.font="bold 16px monospace"; ctx.fillText("DEPLOY  (click box or Space)", VIEW_W/2, VIEW_H*0.62+32);
+    },
+    drawIntroCutscene() {
+      const sequence = this._introCutsceneSequence();
+      const idx = Math.min(this.introCutsceneLineIndex, sequence.length - 1);
+      const current = sequence[idx];
+      const revealCount = Math.max(0, Math.floor(this.introCutsceneLineReveal));
+      const displayText = current ? this._cutsceneDialogueText(current.text) : "";
+      const shown = displayText.slice(0, revealCount);
+      const t = VisualJuice.uiT;
+      const pulse = 0.46 + Math.sin(t * 4.8) * 0.12;
+      const scene = this._introSceneFromLineIndex(idx);
+      const dur = current ? (current.duration || 1) : 1;
+      this._drawIntroCutsceneGameWorld(ctx, scene, t, this.introCutsceneTimer, dur);
+      this._drawCutsceneStoryboardHud(ctx, "intro_cutscene", idx, 12);
+      const panelX = 72, panelY = VIEW_H - 208, panelW = VIEW_W - 144, panelH = 182;
+      ctx.fillStyle = "rgba(2, 10, 18, 0.72)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(0,255,220," + (0.28 + pulse * 0.32).toFixed(3) + ")";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "rgba(160, 230, 255, 0.55)";
+      ctx.font = "11px monospace";
+      const sb = this._cutsceneStoryboardForLine("intro_cutscene", idx);
+      ctx.fillText("STORYBOARD SHOT " + sb.shot + " / " + sb.total + "  ·  LIVE SECTOR RENDER", panelX + 14, panelY + 22);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#7ee9ff";
+      ctx.font = "12px monospace";
+      ctx.fillText("NEURAL HEIST // MISSION 1 — DATA BREACH INITIATION", VIEW_W / 2, panelY + 44);
+      const isVoice = shown.startsWith("VOICE") || shown.startsWith("\"");
+      const isId = shown.startsWith("AGENT:") || shown.startsWith("STATUS:");
+      ctx.fillStyle = isVoice ? "#c7f8ff" : (isId ? "#8fffae" : "#9be2ff");
+      ctx.font = isId ? "bold 22px monospace" : (isVoice ? "bold 18px monospace" : "bold 19px monospace");
+      ctx.shadowColor = isId ? "rgba(140,255,185,0.38)" : "rgba(0,255,230,0.28)";
+      ctx.shadowBlur = 10;
+      ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, panelY + panelH * 0.55);
+      ctx.shadowBlur = 0;
+      const progress = clamp((idx + (this.introCutsceneTimer > 0 ? 0.12 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 48;
+      const barX = panelX + 24;
+      const barY = panelY + panelH - 28;
+      ctx.strokeStyle = "rgba(0,255,220,0.45)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.42)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      if (idx >= 4 && scene === "deploy") {
+        ctx.fillStyle = "rgba(8,20,28,0.88)";
+        ctx.fillRect(VIEW_W - 248, 36, 216, 76);
+        ctx.strokeStyle = "rgba(120,250,255,0.55)";
+        ctx.strokeRect(VIEW_W - 248, 36, 216, 76);
+        ctx.fillStyle = "#9ef8bf";
+        ctx.font = "bold 18px monospace";
+        ctx.fillText("AGENT: NYX", VIEW_W - 140, 68);
+        ctx.fillStyle = "#a6efff";
+        ctx.font = "14px monospace";
+        ctx.fillText("STATUS: ACTIVE", VIEW_W - 140, 96);
+      }
+      const hintA = 0.52 + Math.sin(this.introCutsceneSkipHintPulse) * 0.36;
+      ctx.fillStyle = "rgba(170,230,245," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, or click to skip", VIEW_W / 2, VIEW_H - 22);
     },
     drawWin() {
       const m = MISSIONS[this.missionId];
@@ -7421,48 +9620,357 @@
       ctx.fillStyle = "rgba(0,255,220,0.45)";
       ctx.fillRect(x + 1, y + 1, (barW - 2) * fill, barH - 2);
     },
-    drawFinalCutscene() {
-      const u = VisualJuice.uiT;
-      const pulse = 0.5 + Math.sin(u * 2.6) * 0.15;
-      ctx.fillStyle = "rgba(6,10,18,0.96)";
-      ctx.fillRect(70, 90, VIEW_W - 140, VIEW_H - 180);
-      ctx.strokeStyle = "rgba(255,110,130," + (0.45 + pulse * 0.35) + ")";
+    drawPostLevel1Cutscene() {
+      const sequence = [
+        "\"Entry confirmed.\"",
+        "\"You're inside the outer layer.\"",
+        "\"...that was too easy.\"",
+        "\"Stay sharp.\""
+      ];
+      const idx = Math.min(this.postLevel1CutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.postLevel1CutsceneLineReveal)));
+      const t = VisualJuice.uiT;
+      const pulse = 0.5 + Math.sin(t * 7.2) * 0.16;
+      const glitch = this.postLevel1CutsceneFlash;
+      this._drawCutsceneScene("post_level1_cutscene", idx, this.postLevel1CutsceneTimer, this.postLevel1CutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "post_level1_cutscene", idx, 12);
+      const panelX = 110, panelY = 170, panelW = VIEW_W - 220, panelH = VIEW_H - 310;
+      ctx.fillStyle = "rgba(2,10,16,0.62)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(0,255,230," + (0.34 + pulse * 0.36).toFixed(3) + ")";
       ctx.lineWidth = 2;
-      ctx.shadowColor = "rgba(255,80,120,0.28)";
-      ctx.shadowBlur = 16;
-      ctx.strokeRect(70, 90, VIEW_W - 140, VIEW_H - 180);
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#8eefff";
+      ctx.font = "12px monospace";
+      ctx.fillText("OUTER LAYER LINK // SECURE CHANNEL", VIEW_W / 2, panelY + 34);
+      ctx.fillStyle = shown.indexOf("too easy") >= 0 ? "#ffd7e8" : "#c7f8ff";
+      ctx.font = "bold 28px monospace";
+      ctx.shadowColor = shown.indexOf("too easy") >= 0 ? "rgba(255,120,190,0.42)" : "rgba(0,255,230,0.35)";
+      ctx.shadowBlur = 16 + glitch * 14;
+      ctx.fillText(shown || " ", VIEW_W / 2, panelY + panelH * 0.58);
       ctx.shadowBlur = 0;
-      if (Math.random() < 0.32) {
-        ctx.fillStyle = "rgba(255,80,120,0.08)";
-        ctx.fillRect(70, 90 + Math.random() * (VIEW_H - 200), VIEW_W - 140, 2 + Math.random() * 2);
+      const progress = clamp((idx + (this.postLevel1CutsceneTimer > 0 ? 0.25 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 72;
+      const barX = panelX + 36;
+      const barY = panelY + panelH - 40;
+      ctx.strokeStyle = "rgba(0,255,220,0.5)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.45)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      const hintA = 0.56 + Math.sin(this.postLevel1CutsceneSkipHintPulse) * 0.36;
+      ctx.fillStyle = "rgba(165,230,245," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 64);
+    },
+    drawPostLevel2Cutscene() {
+      const sequence = [
+        "\"You're moving faster than expected.\"",
+        "\"Grid activity is increasing.\"",
+        "[GLITCH]",
+        "\"...it's reacting to you.\""
+      ];
+      const idx = Math.min(this.postLevel2CutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.postLevel2CutsceneLineReveal)));
+      const t = VisualJuice.uiT;
+      const pulse = 0.48 + Math.sin(t * 8.2) * 0.18;
+      const glitch = this.postLevel2CutsceneFlash;
+      this._drawCutsceneScene("post_level2_cutscene", idx, this.postLevel2CutsceneTimer, this.postLevel2CutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "post_level2_cutscene", idx, 12);
+      const isActionLine = this._cutsceneIsActionLine(full);
+      const panelX = 104, panelY = 164, panelW = VIEW_W - 208, panelH = VIEW_H - 298;
+      ctx.fillStyle = "rgba(4,9,18,0.62)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(255,100,185," + (0.24 + pulse * 0.34).toFixed(3) + ")";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#9cefff";
+      ctx.font = "12px monospace";
+      ctx.fillText("GRID MONITOR // ANOMALY DETECTED", VIEW_W / 2, panelY + 34);
+      const isReactLine = shown.indexOf("reacting") >= 0;
+      if (!isActionLine) {
+        ctx.fillStyle = isReactLine ? "#ffd1e8" : "#c9f8ff";
+        ctx.font = "bold 27px monospace";
+        ctx.shadowColor = isReactLine ? "rgba(255,120,190,0.5)" : "rgba(110,240,255,0.35)";
+        ctx.shadowBlur = 14 + glitch * 16;
+        ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, panelY + panelH * 0.58);
+      }
+      ctx.shadowBlur = 0;
+      const progress = clamp((idx + (this.postLevel2CutsceneTimer > 0 ? 0.24 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 76;
+      const barX = panelX + 38;
+      const barY = panelY + panelH - 40;
+      ctx.strokeStyle = "rgba(0,255,220,0.48)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.42)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      if (isActionLine) {
+        const dur = this._cutsceneHudLineDur || 1;
+        const prog = clamp(this.postLevel2CutsceneTimer / dur, 0, 1);
+        this._cutsceneRenderActionEffects(prog, glitch, t, full);
+      }
+      const hintA = 0.56 + Math.sin(this.postLevel2CutsceneSkipHintPulse) * 0.34;
+      ctx.fillStyle = "rgba(170,230,248," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 62);
+    },
+    drawPostLevel3Cutscene() {
+      const sequence = [
+        "\"Something's off.\"",
+        "\"We're seeing patterns in the system...\"",
+        "\"...like it's predicting your movement.\"",
+        "[STATIC]",
+        "\"Keep going.\""
+      ];
+      const idx = Math.min(this.postLevel3CutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.postLevel3CutsceneLineReveal)));
+      const t = VisualJuice.uiT;
+      const pulse = 0.46 + Math.sin(t * 9.4) * 0.2;
+      const glitch = this.postLevel3CutsceneFlash;
+      this._drawCutsceneScene("post_level3_cutscene", idx, this.postLevel3CutsceneTimer, this.postLevel3CutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "post_level3_cutscene", idx, 12);
+      const isActionLine3 = this._cutsceneIsActionLine(full);
+      const panelX = 98, panelY = 154, panelW = VIEW_W - 196, panelH = VIEW_H - 284;
+      ctx.fillStyle = "rgba(4,8,18,0.6)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(160,245,255," + (0.22 + pulse * 0.38).toFixed(3) + ")";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#a6f1ff";
+      ctx.font = "12px monospace";
+      ctx.fillText("HEURISTIC TRACE // BEHAVIOR MODEL LOCKING", VIEW_W / 2, panelY + 34);
+      const isPredict = shown.indexOf("predicting your movement") >= 0;
+      if (!isActionLine3) {
+        ctx.fillStyle = isPredict ? "#ffdbe9" : "#cbf8ff";
+        ctx.font = "bold 25px monospace";
+        ctx.shadowColor = "rgba(120,240,255,0.38)";
+        ctx.shadowBlur = 14 + glitch * 18;
+        ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, panelY + panelH * 0.56);
+      }
+      ctx.shadowBlur = 0;
+      const progress = clamp((idx + (this.postLevel3CutsceneTimer > 0 ? 0.2 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 74;
+      const barX = panelX + 37;
+      const barY = panelY + panelH - 42;
+      ctx.strokeStyle = "rgba(0,255,220,0.46)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.4)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      if (isActionLine3) {
+        const dur = this._cutsceneHudLineDur || 1;
+        const prog = clamp(this.postLevel3CutsceneTimer / dur, 0, 1);
+        this._cutsceneRenderActionEffects(prog, glitch, t, full);
+      }
+      const hintA = 0.58 + Math.sin(this.postLevel3CutsceneSkipHintPulse) * 0.33;
+      ctx.fillStyle = "rgba(172,232,248," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 60);
+    },
+    drawPostLevel4Cutscene() {
+      const sequence = [
+        "\"You triggered something.\"",
+        "\"Security layers are shifting.\"",
+        "[GLITCH INTENSIFIES]",
+        "\"...this isn't automated anymore.\"",
+        "\"Something is watching.\""
+      ];
+      const idx = Math.min(this.postLevel4CutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.postLevel4CutsceneLineReveal)));
+      const t = VisualJuice.uiT;
+      const pulse = 0.44 + Math.sin(t * 10.2) * 0.22;
+      const glitch = this.postLevel4CutsceneFlash;
+      this._drawCutsceneScene("post_level4_cutscene", idx, this.postLevel4CutsceneTimer, this.postLevel4CutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "post_level4_cutscene", idx, 12);
+      const isActionLine4 = this._cutsceneIsActionLine(full);
+      const panelX = 92, panelY = 146, panelW = VIEW_W - 184, panelH = VIEW_H - 270;
+      ctx.fillStyle = "rgba(6,7,17,0.62)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(255,110,190," + (0.22 + pulse * 0.44).toFixed(3) + ")";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#b4f4ff";
+      ctx.font = "12px monospace";
+      ctx.fillText("SECURITY CASCADE // ACTIVE RESPONSE DETECTED", VIEW_W / 2, panelY + 34);
+      const isWatching = shown.indexOf("Something is watching") >= 0;
+      if (!isActionLine4) {
+        ctx.fillStyle = isWatching ? "#ffd4ea" : "#cff8ff";
+        ctx.font = "bold 26px monospace";
+        ctx.shadowColor = "rgba(120,240,255,0.42)";
+        ctx.shadowBlur = 16 + glitch * 20;
+        if (isWatching) {
+          const ox = Math.sin(t * 11.2) * (2 + glitch * 3);
+          const oy = Math.cos(t * 9.8) * (1.5 + glitch * 2);
+          ctx.fillText(shown, VIEW_W / 2 + ox, panelY + panelH * 0.56 + oy);
+        } else {
+          ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, panelY + panelH * 0.56);
+        }
+      }
+      ctx.shadowBlur = 0;
+      const progress = clamp((idx + (this.postLevel4CutsceneTimer > 0 ? 0.2 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 70;
+      const barX = panelX + 35;
+      const barY = panelY + panelH - 42;
+      ctx.strokeStyle = "rgba(0,255,220,0.5)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.42)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      if (isActionLine4) {
+        const dur = this._cutsceneHudLineDur || 1;
+        const prog = clamp(this.postLevel4CutsceneTimer / dur, 0, 1);
+        this._cutsceneRenderActionEffects(prog, glitch, t, full);
+      }
+      const hintA = 0.58 + Math.sin(this.postLevel4CutsceneSkipHintPulse) * 0.34;
+      ctx.fillStyle = "rgba(176,234,250," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 58);
+    },
+    drawPostLevel5Cutscene() {
+      const sequence = [
+        "\"Nyx... listen carefully.\"",
+        "\"This isn't just a system.\"",
+        "[PAUSE]",
+        "\"It's adapting.\"",
+        "[GLITCH]",
+        "\"If you finish this...\"",
+        "\"...it will know you.\""
+      ];
+      const idx = Math.min(this.postLevel5CutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.postLevel5CutsceneLineReveal)));
+      const t = VisualJuice.uiT;
+      const pulse = 0.42 + Math.sin(t * 11.2) * 0.24;
+      const glitch = this.postLevel5CutsceneFlash;
+      this._drawCutsceneScene("post_level5_cutscene", idx, this.postLevel5CutsceneTimer, this.postLevel5CutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "post_level5_cutscene", idx, 12);
+      const isActionLine5 = this._cutsceneIsActionLine(full);
+      const panelX = 86, panelY = 138, panelW = VIEW_W - 172, panelH = VIEW_H - 248;
+      ctx.fillStyle = "rgba(6,6,16,0.64)";
+      ctx.fillRect(panelX, panelY, panelW, panelH);
+      ctx.strokeStyle = "rgba(255,120,200," + (0.2 + pulse * 0.46).toFixed(3) + ")";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#baf6ff";
+      ctx.font = "12px monospace";
+      ctx.fillText("CORE THRESHOLD // FINAL LEVEL WARNING", VIEW_W / 2, panelY + 34);
+      const isKnow = shown.indexOf("it will know you") >= 0;
+      if (!isActionLine5) {
+        ctx.fillStyle = isKnow ? "#ffd4ea" : "#d3f9ff";
+        ctx.font = "bold 25px monospace";
+        ctx.shadowColor = "rgba(130,245,255,0.45)";
+        ctx.shadowBlur = 18 + glitch * 22;
+        if (isKnow || shown.startsWith("\"It's adapting.\"")) {
+          const ox = Math.sin(t * 10.5) * (2.5 + glitch * 3.5);
+          const oy = Math.cos(t * 8.9) * (2 + glitch * 2.5);
+          ctx.fillText(shown, VIEW_W / 2 + ox, panelY + panelH * 0.56 + oy);
+        } else {
+          ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, panelY + panelH * 0.56);
+        }
+      }
+      ctx.shadowBlur = 0;
+      const progress = clamp((idx + (this.postLevel5CutsceneTimer > 0 ? 0.18 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 68;
+      const barX = panelX + 34;
+      const barY = panelY + panelH - 44;
+      ctx.strokeStyle = "rgba(0,255,220,0.5)";
+      ctx.strokeRect(barX, barY, barW, 9);
+      ctx.fillStyle = "rgba(0,255,220,0.42)";
+      ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      if (isActionLine5) {
+        const dur = this._cutsceneHudLineDur || 1;
+        const prog = clamp(this.postLevel5CutsceneTimer / dur, 0, 1);
+        this._cutsceneRenderActionEffects(prog, glitch, t, full);
+      }
+      const hintA = 0.6 + Math.sin(this.postLevel5CutsceneSkipHintPulse) * 0.32;
+      ctx.fillStyle = "rgba(180,236,250," + hintA.toFixed(3) + ")";
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 56);
+    },
+    drawFinalCutscene() {
+      const sequence = [
+        "[ALARMS DISTORT]",
+        "SYSTEM:",
+        "\"CORE INSTABILITY DETECTED\"",
+        "[GLITCH]",
+        "\"UNAUTHORIZED ACCESS - AGENT: NYX\"",
+        "[PAUSE]",
+        "VOICE (calm, different):",
+        "\"...found you.\"",
+        "[BLACK SCREEN]",
+        "\"You were never outside the system.\"",
+        "[FLASH - CITY LIGHTS]",
+        "\"You were inside it the whole time.\"",
+        "[STATIC]",
+        "\"Connection... maintained.\"",
+        "[FINAL GLITCH]"
+      ];
+      const idx = Math.min(this.finalCutsceneLineIndex, sequence.length - 1);
+      const full = sequence[idx] || "";
+      const shown = this._cutsceneDialogueText(full).slice(0, Math.max(0, Math.floor(this.finalCutsceneLineReveal)));
+      const isActionLine = this._cutsceneIsActionLine(full);
+      const t = VisualJuice.uiT;
+      const pulse = 0.4 + Math.sin(t * 12.5) * 0.26;
+      const glitch = this.finalCutsceneFlash;
+      const isBlackBeat = isActionLine && this._parseCutsceneCue(full) === "black_screen";
+      this._drawCutsceneScene("final_cutscene", idx, this.finalCutsceneTimer, this.finalCutsceneFlash);
+      this._drawCutsceneStoryboardHud(ctx, "final_cutscene", idx, 12);
+      const panelX = 76, panelY = 122, panelW = VIEW_W - 152, panelH = VIEW_H - 214;
+      if (!isBlackBeat) {
+        ctx.fillStyle = "rgba(6,6,16,0.64)";
+        ctx.fillRect(panelX, panelY, panelW, panelH);
+        ctx.strokeStyle = "rgba(255,130,210," + (0.2 + pulse * 0.52).toFixed(3) + ")";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(panelX, panelY, panelW, panelH);
       }
       ctx.textAlign = "center";
-      ctx.fillStyle = "#ff8ea3";
-      ctx.font = "bold 26px monospace";
-      ctx.fillText("CORE BREACH COMPLETE", VIEW_W / 2, 170);
-      ctx.fillStyle = "#cfe7ff";
-      ctx.font = "13px monospace";
-      const lines = [
-        "You escape the facility as surveillance clusters desync across the skyline.",
-        "City control is not destroyed - only destabilized.",
-        "A deeper layer stays online, rerouting through unseen nodes.",
-        "Final trace packet: SUBJECT OBSERVED SINCE FIRST BREACH."
-      ];
-      let y = 228;
-      for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], VIEW_W / 2, y);
-        y += 30;
+      if (!isBlackBeat) {
+        ctx.fillStyle = "#c2f8ff";
+        ctx.font = "12px monospace";
+        ctx.fillText("NEURAL GRID // TERMINAL EVENT", VIEW_W / 2, panelY + 34);
       }
-      ctx.fillStyle = "#89a";
+      const isTwist = shown.indexOf("never outside") >= 0 || shown.indexOf("inside it the whole time") >= 0;
+      const isKnow = shown.indexOf("found you") >= 0 || shown.indexOf("know you") >= 0;
+      if (!isActionLine) {
+        ctx.fillStyle = isTwist ? "#ffe0ee" : "#ddfbff";
+        ctx.font = "bold 25px monospace";
+        ctx.shadowColor = isTwist ? "rgba(255,190,230,0.5)" : "rgba(130,245,255,0.48)";
+        ctx.shadowBlur = 18 + glitch * 24;
+        const textY = isBlackBeat ? (VIEW_H * 0.52) : (panelY + panelH * 0.56);
+        if (isTwist || isKnow) {
+          const ox = Math.sin(t * 10.8) * (3 + glitch * 4);
+          const oy = Math.cos(t * 9.1) * (2.5 + glitch * 3);
+          ctx.fillText(shown.length ? shown : " ", VIEW_W / 2 + ox, textY + oy);
+        } else {
+          ctx.fillText(shown.length ? shown : " ", VIEW_W / 2, textY);
+        }
+      }
+      ctx.shadowBlur = 0;
+      if (isActionLine) {
+        const dur = this._cutsceneHudLineDur || 1;
+        const prog = clamp(this.finalCutsceneTimer / dur, 0, 1);
+        this._cutsceneRenderActionEffects(prog, glitch, t, full);
+      }
+      const progress = clamp((idx + (this.finalCutsceneTimer > 0 ? 0.18 : 0)) / sequence.length, 0, 1);
+      const barW = panelW - 66;
+      const barX = panelX + 33;
+      const barY = panelY + panelH - 44;
+      if (!isBlackBeat) {
+        ctx.strokeStyle = "rgba(0,255,220,0.52)";
+        ctx.strokeRect(barX, barY, barW, 9);
+        ctx.fillStyle = "rgba(0,255,220,0.44)";
+        ctx.fillRect(barX + 1, barY + 1, (barW - 2) * progress, 7);
+      }
+      const hintA = 0.62 + Math.sin(this.finalCutsceneSkipHintPulse) * 0.28;
+      ctx.fillStyle = "rgba(184,238,252," + hintA.toFixed(3) + ")";
       ctx.font = "12px monospace";
-      ctx.fillText("Press R or click to return to mission select", VIEW_W / 2, VIEW_H - 138);
-      ctx.fillStyle = "rgba(120,40,60,0.92)";
-      ctx.fillRect(VIEW_W / 2 - 170, VIEW_H - 112, 340, 46);
-      ctx.strokeStyle = "#ff8ea3";
-      ctx.strokeRect(VIEW_W / 2 - 170, VIEW_H - 112, 340, 46);
-      ctx.fillStyle = "#ffd2db";
-      ctx.font = "bold 14px monospace";
-      ctx.fillText("CONTINUE", VIEW_W / 2, VIEW_H - 82);
+      ctx.fillText("Press Space, Enter, Esc, R, or click to skip", VIEW_W / 2, VIEW_H - 52);
     },
     drawFail() {
       const u = VisualJuice.uiT;
@@ -7523,6 +10031,11 @@
     GameStateManager.player = pl;
     try {
       const k = payload && payload.kind;
+      const allowed = {
+        fake_task: 1, sabotage: 1, investigate: 1, report: 1,
+        interact: 1, hack_click: 1, hack_trace: 1
+      };
+      if (!allowed[k]) return;
       if (k === "fake_task") GameStateManager.tryFakeTask();
       else if (k === "sabotage") GameStateManager.trySabotage();
       else if (k === "investigate") GameStateManager.tryInvestigate();
@@ -7543,6 +10056,10 @@
         }
       }
     } finally {
+      // Action side effects (relay completion / terminal state / objectives) are broadcast by authority immediately.
+      if (NetworkCoordinator.isAuthoritativeHost && NetworkCoordinator.isAuthoritativeHost() && GameStateManager.world) {
+        AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+      }
       GameStateManager.localPlayerId = prevSlot;
       GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
     }

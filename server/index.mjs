@@ -18,6 +18,7 @@ const NH_MISSION_ID = Number(process.env.NH_MISSION_ID || 1);
 const NH_MAX_MISSION = Math.max(1, Number(process.env.NH_MAX_MISSION || 6));
 const NH_SLOT_COUNT = Math.max(2, Math.min(4, Number(process.env.NH_SLOT_COUNT || 2)));
 const NH_TICK_HZ = Math.max(8, Math.min(60, Number(process.env.NH_TICK_HZ || 20)));
+const CLIENT_IDLE_TIMEOUT_MS = Math.max(12000, Number(process.env.NH_CLIENT_IDLE_TIMEOUT_MS || 45000));
 
 function extractGameScript(html) {
   const re = /<script>([\s\S]*?)<\/script>/g;
@@ -110,6 +111,8 @@ function main() {
   /** @type {Map<import('ws').WebSocket, { slot: number }>} */
   const clients = new Map();
   let roomBootstrapped = false;
+  let activeMissionId = NH_MISSION_ID;
+  let activeSlotCount = NH_SLOT_COUNT;
   /** @type {null | ((payload: object) => void)} */
   let broadcastSnapshot = null;
 
@@ -130,6 +133,8 @@ function main() {
     if (roomBootstrapped) return;
     const mid = hello && hello.missionId != null ? clampMissionId(hello.missionId) : NH_MISSION_ID;
     const sc = hello && hello.slotCount != null ? clampSlotCount(hello.slotCount) : NH_SLOT_COUNT;
+    activeMissionId = mid;
+    activeSlotCount = sc;
     broadcastSnapshot = (payload) => {
       const json = JSON.stringify(payload);
       for (const ws of clients.keys()) {
@@ -162,8 +167,18 @@ function main() {
 
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
-      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end(roomBootstrapped ? "ok room" : "ok");
+      const connectedSlots = [];
+      for (const meta of clients.values()) connectedSlots.push(meta.slot);
+      const body = {
+        ok: true,
+        roomBootstrapped,
+        missionId: activeMissionId,
+        slotCount: activeSlotCount,
+        connectedPlayers: connectedSlots.length,
+        connectedSlots: connectedSlots.sort((a, b) => a - b)
+      };
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(body));
       return;
     }
     res.writeHead(404);
@@ -173,7 +188,9 @@ function main() {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
   wss.on("connection", (ws) => {
+    ws._lastSeenAt = Date.now();
     ws.on("message", (raw) => {
+      ws._lastSeenAt = Date.now();
       let msg;
       try {
         msg = JSON.parse(String(raw));
@@ -193,8 +210,8 @@ function main() {
         if (meta && meta.slot != null) return;
 
         const maxSlots = Math.min(
-          NH_SLOT_COUNT,
-          NetworkCoordinator.connectedSlots?.length || NH_SLOT_COUNT
+          activeSlotCount,
+          NetworkCoordinator.connectedSlots?.length || activeSlotCount
         );
 
         let slot = -1;
@@ -221,7 +238,7 @@ function main() {
           v: Net.PROTOCOL_VERSION,
           type: Net.Msg.WELCOME,
           slot,
-          missionId: NH_MISSION_ID,
+          missionId: activeMissionId,
           slotCount: maxSlots
         }));
         return;
@@ -244,10 +261,15 @@ function main() {
       }
 
       if (msg.type === Net.Msg.ACTION) {
+        const seq = msg.seq | 0;
+        const prevSeq = ws._lastActionSeq | 0;
+        if (seq > 0 && prevSeq > 0 && seq <= prevSeq) return;
+        if (seq > 0) ws._lastActionSeq = seq;
         const pay = msg.payload || {};
         const actSlot = msg.slot != null ? msg.slot | 0 : slot;
         if (actSlot !== slot) return;
         RT.applyRemoteMissionAction(actSlot, pay);
+        if (GameStateManager.world) AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
         return;
       }
     });
@@ -261,6 +283,12 @@ function main() {
   const dt = 1 / NH_TICK_HZ;
   setInterval(() => {
     if (!roomBootstrapped) return;
+    const now = Date.now();
+    for (const ws of clients.keys()) {
+      if ((ws._lastSeenAt || 0) + CLIENT_IDLE_TIMEOUT_MS < now) {
+        try { ws.close(); } catch (e) {}
+      }
+    }
     const n = AuthoritativeSession.slotCount || NH_SLOT_COUNT;
     const arr = [];
     for (let i = 0; i < n; i++) arr.push(neutralInput());
