@@ -146,6 +146,44 @@
     }
   };
 
+  /** Per-terminal interaction lifecycle (synced via snapshot `terminalStates`). */
+  const TerminalState = {
+    INACTIVE: "inactive",
+    IN_PROGRESS: "in_progress",
+    COMPLETED: "completed",
+    ensure(t) {
+      if (t && (t.state == null || t.state === "")) t.state = TerminalState.INACTIVE;
+    },
+    set(t, s) {
+      if (t) t.state = s;
+    },
+    isCompleted(t) {
+      if (!t) return false;
+      TerminalState.ensure(t);
+      return t.state === TerminalState.COMPLETED;
+    },
+    isInProgress(t) {
+      if (!t) return false;
+      TerminalState.ensure(t);
+      return t.state === TerminalState.IN_PROGRESS;
+    },
+    /** Rebuild states from progress fields when snapshot has no terminalStates (older hosts). */
+    applyProgressDerivedStates(world) {
+      const w = world;
+      if (!w || !w.terminals) return;
+      const h = w.hackedTerminals || {};
+      for (let i = 0; i < w.terminals.length; i++) {
+        const t = w.terminals[i];
+        TerminalState.ensure(t);
+        if (t.state === TerminalState.IN_PROGRESS) continue;
+        if (t.kind === "primary" && h[t.id]) t.state = TerminalState.COMPLETED;
+        else if (t.kind === "cameras" && w.camerasDisabled) t.state = TerminalState.COMPLETED;
+        else if (t.kind === "bonus_data" && w.flags && w.flags.bonusDataDownloaded) t.state = TerminalState.COMPLETED;
+        else if (t.kind === "door" && t.doorId && w.doorsOpen && w.doorsOpen[t.doorId]) t.state = TerminalState.COMPLETED;
+      }
+    }
+  };
+
   const MULTI_MIN_SLOTS = 2;
   const MULTI_MAX_SLOTS = 4;
   const STATES = { MENU: 0, CAMPAIGN: 1, MULTIPLAYER_LOBBY: 2, HACKING: 3, GAMEOVER: 4 };
@@ -187,6 +225,15 @@
         camerasDisabled: !!world.camerasDisabled,
         objectives: (world.objectives || []).map(o => ({ slot: o.slot, type: o.type, done: !!o.done })),
         doorsOpen: world.doorsOpen ? Object.assign({}, world.doorsOpen) : {},
+        terminalStates: (() => {
+          const ts = {};
+          for (let i = 0; i < (world.terminals || []).length; i++) {
+            const t = world.terminals[i];
+            TerminalState.ensure(t);
+            ts[t.id] = t.state;
+          }
+          return ts;
+        })(),
         flags: {
           package: !!(world.flags && world.flags.package),
           sabotageCooldown: world.flags ? world.flags.sabotageCooldown : 0,
@@ -199,7 +246,10 @@
           lockdownStartedAt: world.flags ? (world.flags.lockdownStartedAt || 0) : 0,
           lockdownEndsAt: world.flags ? (world.flags.lockdownEndsAt || 0) : 0,
           lockdownRemainingSec: world.flags ? (world.flags.lockdownRemainingSec || 0) : 0,
-          lockdownActive: !!(world.flags && world.flags.lockdownActive)
+          lockdownActive: !!(world.flags && world.flags.lockdownActive),
+          lumenSapUntil: world.flags ? (world.flags.lumenSapUntil || 0) : 0,
+          terminalSabotageLocks: world.flags && world.flags.terminalSabotageLocks ? Object.assign({}, world.flags.terminalSabotageLocks) : {},
+          doorSabotageRevert: world.flags ? world.flags.doorSabotageRevert : null
         },
         connectedSlots: (connectedSlots || []).slice(),
         players: players.map(p => ({
@@ -232,6 +282,16 @@
         for (const k of Object.keys(world.hackedTerminals)) delete world.hackedTerminals[k];
         for (const k of Object.keys(snap.hackedTerminals)) world.hackedTerminals[k] = !!snap.hackedTerminals[k];
       }
+      if (snap.terminalStates && world.terminals) {
+        for (let i = 0; i < world.terminals.length; i++) {
+          const t = world.terminals[i];
+          const st = snap.terminalStates[t.id];
+          if (st != null) TerminalState.set(t, st);
+          else TerminalState.ensure(t);
+        }
+      } else if (world.terminals) {
+        TerminalState.applyProgressDerivedStates(world);
+      }
       world.camerasDisabled = snap.camerasDisabled;
       if (Array.isArray(snap.objectives) && Array.isArray(world.objectives)) {
         for (let oi = 0; oi < world.objectives.length; oi++) {
@@ -255,6 +315,14 @@
         world.flags.lockdownEndsAt = f.lockdownEndsAt || 0;
         world.flags.lockdownRemainingSec = f.lockdownRemainingSec || 0;
         world.flags.lockdownActive = !!f.lockdownActive;
+        if (f.lumenSapUntil != null) world.flags.lumenSapUntil = f.lumenSapUntil;
+        if (f.terminalSabotageLocks) {
+          world.flags.terminalSabotageLocks = world.flags.terminalSabotageLocks || {};
+          const L = f.terminalSabotageLocks;
+          for (const k of Object.keys(world.flags.terminalSabotageLocks)) delete world.flags.terminalSabotageLocks[k];
+          for (const k of Object.keys(L)) world.flags.terminalSabotageLocks[k] = L[k];
+        }
+        if (f.doorSabotageRevert !== undefined) world.flags.doorSabotageRevert = f.doorSabotageRevert;
       }
       const plist = snap.players || [];
       for (let i = 0; i < plist.length; i++) {
@@ -477,6 +545,14 @@
               down: !!(k.down || k.s || k.arrowdown),
               sprint: !!(k.sprint || k.shift)
             };
+            return;
+          }
+          if (msg.type === Net.Msg.ACTION) {
+            const slot = this.hostSlots[msg.from];
+            if (slot == null || slot < 1 || slot > 3) return;
+            const actSlot = msg.slot != null ? msg.slot | 0 : slot;
+            if (actSlot !== slot) return;
+            __nhApplyRemoteMissionAction(actSlot, msg.payload || {});
             return;
           }
           return;
@@ -802,12 +878,51 @@
   function aiInvalidateNav(world) {
     if (!world) return;
     world._aiNav = null;
+    world._aiColliderFp = null;
+    world._aiColliders = null;
+  }
+  /** Solid geometry AI must not enter (walls, cover props, terminals/relays). */
+  function aiComposeObstacles(world) {
+    if (!world) return [];
+    const out = (world.walls || []).concat(world.cover || []);
+    const terms = world.terminals || [];
+    for (let i = 0; i < terms.length; i++) {
+      const t = terms[i];
+      if (!t || t.w == null || t.h == null) continue;
+      const w = Math.max(4, t.w | 0), h = Math.max(4, t.h | 0);
+      out.push({ x: t.x, y: t.y, w, h, _aiTerminal: true });
+    }
+    return out;
+  }
+  function aiColliderFingerprint(world) {
+    if (!world) return 0;
+    let h = ((world.walls && world.walls.length) | 0) >>> 0;
+    h = (Math.imul(h, 131) + ((world.cover && world.cover.length) | 0)) >>> 0;
+    const doors = world.doorsOpen || {};
+    const dk = Object.keys(doors).sort();
+    for (let i = 0; i < dk.length; i++) {
+      h = (Math.imul(h, 31) + hashString32(dk[i] + "=" + (doors[dk[i]] ? 1 : 0))) >>> 0;
+    }
+    const terms = world.terminals || [];
+    h = (Math.imul(h, 17) + (terms.length | 0)) >>> 0;
+    for (let ti = 0; ti < terms.length; ti++) {
+      const t = terms[ti];
+      if (!t) continue;
+      h = (Math.imul(h, 31) + hashString32(String(t.id || "") + "|" + (t.x | 0) + "|" + (t.y | 0) + "|" + (t.w | 0) + "|" + (t.h | 0))) >>> 0;
+    }
+    return h >>> 0;
   }
   function aiEnsureColliders(world) {
     if (!world) return [];
-    if (!world._aiColliders) world._aiColliders = (world.walls || []).concat(world.cover || []);
+    const fp = aiColliderFingerprint(world);
+    if (world._aiColliderFp !== fp || !world._aiColliders) {
+      world._aiColliderFp = fp;
+      world._aiColliders = aiComposeObstacles(world);
+      world._aiNav = null;
+    }
     return world._aiColliders;
   }
+  const AI_NAV_PROBE_RADIUS = 18;
   function aiBuildNav(world) {
     if (!world) return null;
     const colliders = aiEnsureColliders(world);
@@ -815,7 +930,7 @@
     const cols = Math.max(1, Math.ceil(world.worldW / cell));
     const rows = Math.max(1, Math.ceil(world.worldH / cell));
     const blocked = new Uint8Array(cols * rows);
-    const probe = { x: 0, y: 0, radius: 14 };
+    const probe = { x: 0, y: 0, radius: AI_NAV_PROBE_RADIUS };
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
         const idx = y * cols + x;
@@ -946,11 +1061,18 @@
     moveCircleSolid(entity, nx * step, ny * step, colliders);
     if (Math.abs(dx) > 0.2) entity.facing = dx > 0 ? 1 : -1;
     const moved = Math.hypot(entity.x - px, entity.y - py);
-    if (moved < 0.02) {
+    if (moved < 0.018) {
       entity._aiStuckSec = (entity._aiStuckSec || 0) + dt;
-      if (entity._aiStuckSec > 0.35) {
-        entity._aiRepathAt = 0;
-        entity._aiStuckSec = 0;
+      if (entity._aiStuckSec > 0.22) {
+        const pth = entity._aiPath;
+        const idx = entity._aiPathIdx | 0;
+        if (pth && idx < pth.length - 1) {
+          entity._aiPathIdx = idx + 1;
+          entity._aiStuckSec = 0;
+        } else if (entity._aiStuckSec > 0.42) {
+          entity._aiRepathAt = 0;
+          entity._aiStuckSec = 0;
+        }
       }
     } else {
       entity._aiStuckSec = 0;
@@ -1044,6 +1166,455 @@
     return h >>> 0;
   }
 
+  /**
+   * Context-aware NPC dialogue: weighted option pools by personality, 2–3 rotating lines,
+   * and replies keyed by (personality × player line category).
+   */
+  const NpcDialogueEngine = {
+    _pick(arr, rng) {
+      if (!arr || !arr.length) return null;
+      return arr[(rng() * arr.length) | 0];
+    },
+    _weightedCategory(weights, rng) {
+      let t = 0;
+      const keys = Object.keys(weights);
+      for (let i = 0; i < keys.length; i++) t += weights[keys[i]] || 0;
+      if (t <= 0) return "neutral";
+      let r = rng() * t;
+      for (let i = 0; i < keys.length; i++) {
+        r -= weights[keys[i]] || 0;
+        if (r <= 0) return keys[i];
+      }
+      return keys[keys.length - 1];
+    },
+    personalityWeights(personality) {
+      const map = {
+        friendly: { neutral: 0.14, friendly: 0.44, casual: 0.26, suspicious: 0.12, aggressive: 0.04 },
+        strict: { neutral: 0.36, friendly: 0.06, casual: 0.05, suspicious: 0.2, aggressive: 0.33 },
+        nervous: { neutral: 0.2, friendly: 0.12, casual: 0.1, suspicious: 0.4, aggressive: 0.04 },
+        sarcastic: { neutral: 0.12, friendly: 0.08, casual: 0.42, suspicious: 0.18, aggressive: 0.2 },
+        glitchy: { neutral: 0.22, friendly: 0.1, casual: 0.22, suspicious: 0.3, aggressive: 0.16 }
+      };
+      return map[personality] || map.strict;
+    },
+    pools: {
+      neutral: [
+        { text: "Routine sweep — logging thermal drift on this deck." },
+        { text: "Just confirming corridor clearance with central dispatch." },
+        { text: "Checking seal integrity before the next shift handoff." },
+        { text: "Authorized pass-through; I will keep it brief." },
+        { text: "Standard telemetry pull. Nothing flagged on my side." },
+        { text: "Following the posted maintenance window for this sector." }
+      ],
+      friendly: [
+        { text: "Hey — need a hand finding the service lift?" },
+        { text: "Rough shift? There is a quieter route past the coolant spine." },
+        { text: "If you are headed core-ward, ping me if patrol timing looks tight." },
+        { text: "I can vouch you were on-task if anyone asks." },
+        { text: "Coffee synth is awful today. Want the good kiosk coords?" },
+        { text: "Stay smooth — I have seen worse days clear without a lockdown." }
+      ],
+      suspicious: [
+        { text: "Heard any odd RF spikes near the relays lately?" },
+        { text: "Patrol chatter mentioned blind spots — you seen anything?" },
+        { text: "Does your clearance actually cover this junction?" },
+        { text: "Someone has been probing camera timing. That you?" },
+        { text: "Word is a ghost account is moving through maintenance logs." },
+        { text: "Security is jumpy. Anything I should know before it escalates?" }
+      ],
+      aggressive: [
+        { text: "Back up. Personal space is not optional in red sectors." },
+        { text: "I do not have time for attitude — state your business or move." },
+        { text: "You are crowding my work envelope. Step off." },
+        { text: "Try that tone with a guard, not with me." },
+        { text: "I am not your obstacle course. Clear the lane." }
+      ],
+      casual: [
+        { text: "If this shift were a subnet, we would be the slow hop." },
+        { text: "Pretty sure the building hates us equally. Solidarity?" },
+        { text: "I told the vending rig my life story. It dispensed silence." },
+        { text: "They call it a smart grid. I call it moody infrastructure." },
+        { text: "My badge photo looks like a war crime. Yours too?" },
+        { text: "Survived three meetings today. Combat pay when?" }
+      ]
+    },
+    /** [personality][category] -> string[] */
+    replies: {
+      friendly: {
+        neutral: ["Got it. Clean logs help everyone.", "Makes sense — thanks for keeping it boring.", "Sounds by the book. I appreciate that."],
+        friendly: ["Love it. Ping me if you need cover language.", "Team player energy. I will remember that.", "That is the spirit. Stay safe out there."],
+        casual: ["Ha — yeah, same circus, different tent.", "I needed that laugh. Do not tell my supervisor.", "Truth. This place runs on spite and caffeine."],
+        suspicious: ["Hm. I will keep ears open — discreetly.", "Interesting. If it is real, tread carefully.", "Could be nothing. Could be a headache. I will watch."],
+        aggressive: ["Whoa. Ease up — we are on the same slab.", "Sharp tone. I will pretend I did not hear half of that.", "Okay, okay — breathing room, please."]
+      },
+      strict: {
+        neutral: ["Acknowledged. Maintain documentation.", "Noted. Keep movement purposeful.", "Understood. Do not obstruct transit lanes."],
+        friendly: ["Cordial, but remain within posted procedures.", "Politeness does not override clearance rules.", "Helpful tone — still verify your route codes."],
+        casual: ["Humor is not in the procedure manual.", "Irreverence noted. Return to task focus.", "Save the comedy for off-duty cycles."],
+        suspicious: ["Report specifics to security channel seven.", "If credible, that is actionable intelligence.", "Vague rumors waste cycles. Clarify or drop it."],
+        aggressive: ["Threat posture logged. Stand down.", "Hostile language violates conduct code.", "Continue and I will flag patrol convergence."]
+      },
+      nervous: {
+        neutral: ["O-okay. That sounds… normal. Good.", "If you say so. I will breathe now.", "Routine is good. Routine is safe."],
+        friendly: ["Th-thanks. I needed something calm.", "That is… actually reassuring.", "You mean that? Okay. Okay."],
+        casual: ["Heh. If we laugh, maybe the alarms do not notice us?", "Funny. Do not make me snort near a mic.", "I should not laugh. I laughed anyway."],
+        suspicious: ["N-no. Tell me you are joking.", "That… tracks with what I feared.", "Please be wrong. Please be wrong."],
+        aggressive: ["Please do not — I spike when people shout.", "That tone makes my hands shake.", "I am backing up. Do not follow me."]
+      },
+      sarcastic: {
+        neutral: ["Thrilling. Truly the Oscar of corridor small talk.", "Neutrality as art form. Bold.", "You paint beige with conviction."],
+        friendly: ["Aww. You almost mean it.", "Friendly — almost suspiciously so.", "Sure, pal. Buy you a byte of cynicism later?"],
+        casual: ["Chef kiss. The abyss giggled.", "I hate that I laughed. Take your upvote.", "Comedy gold. Tragedy platinum."],
+        suspicious: ["Oh fun. Paranoia for lunch again.", "Great. Plot thickens, spine stiffens.", "If true, we are all understudies in a bad thriller."],
+        aggressive: ["Brave. Stupid, but brave.", "Main-character energy. Wrong genre.", "Save the tantrum for someone paid to care."]
+      },
+      glitchy: {
+        neutral: ["copy//acknowledged//buffer_ok", "log: neutral_input // checksum pass", "routine_flag=1 // no-parse-error"],
+        friendly: ["friendship_token++ // thanks?", "warm_packet_received // storing", "help.exe // maybe"],
+        casual: ["humor.dll // segmentation_fault_lol", "joke_cache_hit // 404-serotonin", "wit_overflow // truncating…"],
+        suspicious: ["WARN: rumor_integrity_low", "sensor_echo: maybe_true", "paranoia_flag // escalate? false"],
+        aggressive: ["THREAT_PARSE // backing_off", "hostile_syntax // reduce_volume", "reset_politeness // fail"]
+      }
+    },
+    suspicionDelta(personality, category) {
+      const base = { neutral: 0.4, friendly: -0.6, casual: -0.2, suspicious: 1.8, aggressive: 4.2 };
+      const pMul = { friendly: 0.75, strict: 1.15, nervous: 1.25, sarcastic: 0.9, glitchy: 1.05 };
+      const b = base[category] != null ? base[category] : 0.5;
+      return b * (pMul[personality] || 1);
+    },
+    buildChoices(npc, rng) {
+      const personality = (npc && npc.personality) || "strict";
+      const weights = this.personalityWeights(personality);
+      const k = rng() > 0.42 ? 3 : 2;
+      const used = new Set();
+      const out = [];
+      const poolKeys = ["neutral", "friendly", "suspicious", "aggressive", "casual"];
+      for (let slot = 0; slot < k; slot++) {
+        let line = null;
+        let cat = null;
+        for (let attempt = 0; attempt < 14 && !line; attempt++) {
+          cat = this._weightedCategory(weights, rng);
+          const pool = this.pools[cat] || this.pools.neutral;
+          const pick = this._pick(pool, rng);
+          if (pick && !used.has(pick.text)) {
+            line = pick;
+            used.add(pick.text);
+          }
+        }
+        if (!line) {
+          for (let pi = 0; pi < poolKeys.length && !line; pi++) {
+            const pool = this.pools[poolKeys[pi]];
+            for (let j = 0; j < pool.length; j++) {
+              if (!used.has(pool[j].text)) {
+                line = pool[j];
+                cat = poolKeys[pi];
+                used.add(line.text);
+                break;
+              }
+            }
+          }
+        }
+        if (!line) break;
+        out.push({ id: slot + 1, text: line.text, category: cat });
+      }
+      const workerIntel = npc && npc.npcKind === "worker" && (npc.behavior === "watch" || npc.behavior === "ignore");
+      if (workerIntel && out.length) {
+        let hit = out.find(c => c.category === "suspicious");
+        if (!hit) hit = out.find(c => c.category === "neutral");
+        if (!hit) hit = out[0];
+        hit.meta = "worker_intel";
+      }
+      return out;
+    },
+    resolveReply(npc, choice) {
+      const personality = (npc && npc.personality) || "strict";
+      const cat = (choice && choice.category) || "neutral";
+      const bucket = (this.replies[personality] && this.replies[personality][cat]) || this.replies.strict.neutral;
+      const rng = mulberry32((hashString32((npc && npc.cpuName) || "cpu") ^ hashString32(cat + "|" + String((choice && choice.text) || ""))) >>> 0);
+      const text = this._pick(bucket, rng) || "Move along.";
+      const suspiciousDelta = this.suspicionDelta(personality, cat);
+      return { text, suspiciousDelta };
+    },
+    rngForSession(npc) {
+      const t = performance.now();
+      const gen = (npc && (npc._npcDialogueGen | 0)) >>> 0;
+      const tick = (t >>> 0) ^ ((t * 0.001) >>> 0);
+      return mulberry32((hashString32(String((npc && npc.x) | 0) + "|" + String((npc && npc.y) | 0) + "|" + (npc && npc.cpuName || "") + "|g" + gen) ^ tick) >>> 0);
+    }
+  };
+
+  /**
+   * Gameplay roles (helpful / neutral / hostile): hints, suspicion tuning, escalation.
+   * Dialogue text pools and NpcDialogueEngine are unchanged — only outcomes and ambient pressure hook here.
+   */
+  const NpcRoleSystem = {
+    computeRole(npc) {
+      if (!npc) return "neutral";
+      const kind = npc.npcKind || "worker";
+      const p = npc.personality || "strict";
+      const beh = npc.behavior || "ignore";
+      if (kind === "informant") return "helpful";
+      if (beh === "report") return "hostile";
+      if (kind === "suspicious") {
+        return beh === "watch" ? "neutral" : "hostile";
+      }
+      if (kind === "worker") {
+        if (beh === "watch") {
+          if (p === "friendly" || p === "glitchy") return "helpful";
+          if (p === "strict" || p === "nervous") return "hostile";
+          return "neutral";
+        }
+        if (p === "friendly" || p === "glitchy") return "helpful";
+        return "neutral";
+      }
+      return "neutral";
+    },
+    roleOrCompute(npc) {
+      return (npc && npc.npcGameplayRole) || this.computeRole(npc);
+    },
+    proximitySuspicionMul(npc) {
+      const r = this.roleOrCompute(npc);
+      if (r === "helpful") return 0.74;
+      if (r === "hostile") return 1.2;
+      return 0.96;
+    },
+    _sectorHint(px, py, tx, ty) {
+      const dx = tx - px, dy = ty - py;
+      const NS = dy < -55 ? "north" : dy > 55 ? "south" : "";
+      const EW = dx < -55 ? "west" : dx > 55 ? "east" : "";
+      if (!NS && !EW) return "close to you";
+      if (NS && EW) return NS + "-" + EW;
+      return NS || EW;
+    },
+    buildTacticalHint(world, player) {
+      if (!world || !player) return "";
+      const parts = [];
+      const hacked = world.hackedTerminals || {};
+      const terms = (world.terminals || []).filter(t => t.kind === "primary" && t.label && !TerminalState.isCompleted(t) && !hacked[t.id]);
+      if (terms.length) {
+        let best = terms[0], bd = 1e9;
+        for (let i = 0; i < terms.length; i++) {
+          const t = terms[i];
+          const cx = t.x + t.w * 0.5, cy = t.y + t.h * 0.5;
+          const d = Math.hypot(player.x - cx, player.y - cy);
+          if (d < bd) { bd = d; best = t; }
+        }
+        const cx = best.x + best.w * 0.5, cy = best.y + best.h * 0.5;
+        parts.push("Open relay " + (best.label || "NODE") + " — " + NpcRoleSystem._sectorHint(player.x, player.y, cx, cy) + " from here.");
+      }
+      const guards = world.guards || [];
+      if (guards.length) {
+        let gx = 0, gy = 0;
+        for (let i = 0; i < guards.length; i++) {
+          gx += guards[i].x;
+          gy += guards[i].y;
+        }
+        gx /= guards.length;
+        gy /= guards.length;
+        const q = NpcRoleSystem._sectorHint(player.x, player.y, gx, gy);
+        parts.push((guards.length >= 4 ? "Patrol weight " : "Watch bias ") + q + ".");
+      }
+      return parts.join(" ");
+    },
+    tryGrantHelpfulOpen(npc, gsm) {
+      if (!npc || !gsm || npc.npcGameplayRole !== "helpful") return;
+      const now = performance.now();
+      if ((npc._helpfulHintCd || 0) > now) return;
+      const hint = NpcRoleSystem.buildTacticalHint(gsm.world, gsm.player);
+      if (hint) gsm._setHint("Tip — " + hint, "#9defff", 4.4);
+      if (gsm.player) gsm.player.suspicion = clamp((gsm.player.suspicion || 0) - 3.4, 0, 100);
+      npc._helpfulHintCd = now + 50000;
+    },
+    _reportWarnMs: 2480,
+    _reportCooldownMs: 15800,
+    _isHostileReporter(npc) {
+      if (!npc) return false;
+      const beh = npc.behavior || "ignore";
+      if (beh === "report") return true;
+      return this.roleOrCompute(npc) === "hostile";
+    },
+    _eligibleForDirectedReport(npc, player, near, close) {
+      if (!npc || !player || !this._isHostileReporter(npc)) return false;
+      const sus = player.suspicion || 0;
+      const speed = player.getSpeed01();
+      const oddBeh = speed > 0.72 || (speed < 0.11 && close);
+      const dialogPrimed = (npc._hostileDialogPrimedUntil || 0) > performance.now();
+      if (npc.behavior === "report") {
+        return near && sus >= SOCIAL_REPORT_MIN_SUSPICION;
+      }
+      return near && close && (sus >= 48 || dialogPrimed || oddBeh);
+    },
+    _pickGuardForNpcReport(npc, player, guards) {
+      if (!guards || !guards.length || !npc || !player) return null;
+      let best = null, score = 1e18;
+      for (let i = 0; i < guards.length; i++) {
+        const g = guards[i];
+        const dNpc = Math.hypot(g.x - npc.x, g.y - npc.y);
+        const dPl = Math.hypot(g.x - player.x, g.y - player.y);
+        const s = dNpc * 0.78 + dPl * 0.32;
+        if (s < score) {
+          score = s;
+          best = g;
+        }
+      }
+      return best;
+    },
+    _applyDirectedReport(npc, world, player, guards) {
+      const g = this._pickGuardForNpcReport(npc, player, guards);
+      if (!g || !world) return;
+      world.alarm = clamp((world.alarm || 0) + 7.0, 0, 100);
+      world.exposure = clamp((world.exposure || 0) + 4.6, 0, 100);
+      g.lastKnown = { x: player.x, y: player.y };
+      g.detect = clamp(g.detect + 34, 0, 84);
+      if (g.aiState === "patrol") g._beginInvestigate({ x: player.x, y: player.y });
+      else if (g.aiState === "investigate") {
+        g.investigatePoint = { x: player.x, y: player.y };
+        g.investigateTimer = Math.max(g.investigateTimer || 0, 3.4);
+      } else {
+        g.lastKnown = { x: player.x, y: player.y };
+      }
+      NetworkManager.pushAlert("npc_report", npc.x, npc.y);
+    },
+    tickDirectedNpcReport(npc, world, player, guards, near, close) {
+      if (!npc || !player || !world || !guards || !guards.length) return;
+      const now = performance.now();
+      if ((npc._dirReportCdUntil || 0) > now) {
+        if (npc._hrPhase === 1 && now >= (npc._hrWarnEnd || 0)) {
+          npc._hrPhase = 0;
+          npc._hrWarnEnd = 0;
+          npc._hrWarnShown = false;
+        }
+        return;
+      }
+      if (!this._isHostileReporter(npc)) {
+        npc._hrPhase = 0;
+        return;
+      }
+      const elig = this._eligibleForDirectedReport(npc, player, near, close);
+      if (!elig) {
+        npc._hrPhase = 0;
+        npc._hrWarnEnd = 0;
+        npc._hrWarnShown = false;
+        return;
+      }
+      if (!npc._hrPhase) {
+        npc._hrPhase = 1;
+        npc._hrWarnEnd = now + this._reportWarnMs;
+        npc._hrWarnShown = false;
+      }
+      if (npc._hrPhase === 1) {
+        if (!npc._hrWarnShown && typeof GameStateManager !== "undefined" && GameStateManager._setHint) {
+          npc._hrWarnShown = true;
+          const who = npc.cpuName || "Contact";
+          GameStateManager._setHint(who + " — \"Something's not right…\" (back off)", "#ffccb0", 2.7);
+        }
+        if (now < (npc._hrWarnEnd || 0)) return;
+        const still = this._eligibleForDirectedReport(npc, player, near, close);
+        npc._hrPhase = 0;
+        npc._hrWarnEnd = 0;
+        npc._hrWarnShown = false;
+        if (!still) return;
+        this._applyDirectedReport(npc, world, player, guards);
+        npc._dirReportCdUntil = now + this._reportCooldownMs;
+        if (npc.behavior === "report") npc.reportCd = now + SOCIAL_REPORT_COOLDOWN_MS;
+      }
+    }
+  };
+
+  /** Short optional favors from friendly/neutral NPCs — no main objective block. */
+  const NpcFavorSystem = {
+    propose(world, npc, player) {
+      if (!world || !npc || !player) return null;
+      const rng = mulberry32((hashString32(String((npc.x | 0) + "|" + (npc.y | 0) + "|" + ((world.def && world.def.id) || 0))) ^ 0x5f6176f72) >>> 0);
+      const ex = world.extraction;
+      const roll = rng();
+      if (ex && roll < 0.32) {
+        return {
+          type: "extraction_ping",
+          offerText: "Quick favor — drift through the extraction tile like you belong. My mapper needs a ping.",
+          ttl: 56,
+          needHold: 1.55
+        };
+      }
+      if (roll < 0.68) {
+        const dx = (95 + rng() * 55) * (rng() > 0.48 ? 1 : -1);
+        const dy = -55 - rng() * 55;
+        return {
+          type: "visit_marker",
+          tx: npc.x + dx,
+          ty: npc.y + dy,
+          needNear: 76,
+          holdSec: 1.2,
+          offerText: "Can you shoulder-check that junction for me? Two beats under the blind spot, then peel off.",
+          ttl: 62
+        };
+      }
+      return {
+        type: "linger_npc",
+        radius: 118,
+        needHold: 1.95,
+        offerText: "Run a proximity handshake — two seconds in my bubble, slow feet. Routine cal.",
+        ttl: 50
+      };
+    }
+  };
+
+  /** Small temporary perks from positive NPC chat — capped per mission, not stack-breaking. */
+  const NpcBonusSystem = {
+    _maxGrantsPerMission: 4,
+    _npcCdMs: 50000,
+    _procChance: 0.48,
+    tryGrantFromPositiveChat(world, gsm, npc, choiceObj) {
+      if (!world || !gsm || !npc || !choiceObj || !gsm.player) return;
+      const cat = choiceObj.category;
+      if (!(cat === "friendly" || cat === "casual" || cat === "neutral")) return;
+      const role = npc.npcGameplayRole || NpcRoleSystem.computeRole(npc);
+      if (role === "hostile") return;
+      if (role !== "helpful" && role !== "neutral") return;
+      const now = performance.now();
+      if ((world.flags.npcBonusGrantsThisMission || 0) >= this._maxGrantsPerMission) return;
+      if ((npc._npcBonusCdUntil || 0) > now) return;
+      const seed = (hashString32(String((npc.cpuName || "n") + "|bon|" + ((world.def && world.def.id) | 0) + "|" + (choiceObj.id | 0))) ^ 0x6e706362) >>> 0;
+      const rng = mulberry32(seed);
+      if (role === "neutral" && rng() > 0.32) return;
+      if (rng() > this._procChance) return;
+      const k = rng() * 4 | 0;
+      world.flags.npcBonusGrantsThisMission = (world.flags.npcBonusGrantsThisMission || 0) + 1;
+      npc._npcBonusCdUntil = now + this._npcCdMs;
+      const wf = world.flags;
+      if (k === 0) {
+        wf.npcBonusVisMulUntil = now + 9000;
+        wf.npcBonusVisMul = clamp(wf.npcBonusVisMul || 0.87, 0.82, 0.92);
+        gsm._setHint("Contact: soft sensor gloss on you (~9s).", "#a8f0ff", 2.75);
+      } else if (k === 1) {
+        wf.npcRelayPingUntil = now + 14000;
+        const hint = NpcRoleSystem.buildTacticalHint(world, gsm.player);
+        gsm._setHint(hint ? ("Relay ping — " + hint) : "Relay ping — uplink sketching nearest open relay.", "#9defff", 4.35);
+      } else if (k === 2) {
+        const guards = world.guards || [];
+        let best = null, bd = 1e9;
+        for (let i = 0; i < guards.length; i++) {
+          const g = guards[i];
+          if (!g || g.aiState === "chase") continue;
+          const d = Math.hypot(g.x - gsm.player.x, g.y - gsm.player.y);
+          if (d < bd) { bd = d; best = g; }
+        }
+        if (best) {
+          best.npcBonusBlindUntil = now + 5200;
+          gsm._setHint("Contact: one patrol's optics muddy (~5s).", "#c8e8ff", 2.55);
+        } else {
+          wf.npcBonusVisMulUntil = now + 9000;
+          wf.npcBonusVisMul = 0.87;
+          gsm._setHint("Contact: broad sensor gloss (~9s).", "#a8f0ff", 2.65);
+        }
+      } else {
+        wf.npcHackSnappierUntil = now + 22000;
+        wf.npcHackSnappierMul = 0.93;
+        gsm._setHint("Contact: breach windows slightly snappier (~20s).", "#d4ffc8", 2.65);
+      }
+    }
+  };
+
   /** Seeded relay breach generator with distinct puzzle styles per terminal. */
   const HackEngine = {
     themes: [
@@ -1115,6 +1686,187 @@
         decoyIds: []
       };
     },
+    _sampleBezier(A, B, C, D, steps) {
+      const out = [];
+      const n = Math.max(8, steps | 0);
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const omt = 1 - t;
+        const x = omt * omt * omt * A.x + 3 * omt * omt * t * B.x + 3 * omt * t * t * C.x + t * t * t * D.x;
+        const y = omt * omt * omt * A.y + 3 * omt * omt * t * B.y + 3 * omt * t * t * C.y + t * t * t * D.y;
+        out.push({ x, y });
+      }
+      return out;
+    },
+    _densifyPolyline(pts, maxSegLen) {
+      if (!pts || pts.length < 2) return (pts || []).slice();
+      const maxL = Math.max(10, maxSegLen || 16);
+      const out = [{ x: pts[0].x, y: pts[0].y }];
+      for (let i = 1; i < pts.length; i++) {
+        const ax = out[out.length - 1].x, ay = out[out.length - 1].y;
+        const bx = pts[i].x, by = pts[i].y;
+        const L = Math.hypot(bx - ax, by - ay);
+        const n = Math.max(1, Math.ceil(L / maxL));
+        for (let k = 1; k <= n; k++) {
+          const t = k / n;
+          out.push({ x: ax + (bx - ax) * t, y: ay + (by - ay) * t });
+        }
+      }
+      return out;
+    },
+    _traceBuildCum(poly) {
+      const cum = [0];
+      let total = 0;
+      for (let i = 1; i < poly.length; i++) {
+        total += Math.hypot(poly[i].x - poly[i - 1].x, poly[i].y - poly[i - 1].y);
+        cum.push(total);
+      }
+      return { cum, total: Math.max(total, 1) };
+    },
+    _makeTraceStage(rng, diff, style, stageIdx, missionProgTier) {
+      const mpt = missionProgTier != null ? clamp(missionProgTier | 0, 0, 2) : 1;
+      const cx = VIEW_W * 0.5, cy = VIEW_H * 0.46;
+      let traceShape;
+      if (mpt <= 0) {
+        traceShape = rng() < 0.58 ? "curve" : "zigzag";
+      } else if (mpt === 1) {
+        const shapes = ["curve", "zigzag", "loop"];
+        traceShape = shapes[(stageIdx + ((rng() * 3) | 0)) % 3];
+      } else {
+        const shapes = ["zigzag", "loop", "curve"];
+        traceShape = shapes[(stageIdx + ((rng() * 3) | 0)) % 3];
+      }
+      let raw = [];
+      if (traceShape === "curve") {
+        const flip = rng() > 0.5 ? 1 : -1;
+        const span = mpt <= 0 ? 198 : (mpt === 1 ? 240 : 268);
+        const tight = mpt <= 0 ? 0.72 : (mpt === 1 ? 0.88 : 1);
+        const A = { x: cx - span * flip, y: cy - 22 * tight + rng() * 28 * tight };
+        const D = { x: cx + span * flip, y: cy + 18 * tight + rng() * 32 * tight };
+        const B = { x: cx - (72 + diff * 8) * flip + rng() * 40 * tight, y: cy - (95 + diff * 8) * tight + rng() * 38 * tight };
+        const C = { x: cx + (88 + diff * 8) * flip + rng() * 42 * tight, y: cy + (98 + diff * 10) * tight + rng() * 40 * tight };
+        const steps = mpt <= 0 ? 36 + (diff | 0) * 2 : 48 + (diff | 0) * 4 + (mpt >= 2 ? 6 : 0);
+        raw = this._sampleBezier(A, B, C, D, steps);
+      } else if (traceShape === "zigzag") {
+        const w = (mpt <= 0 ? 248 : (mpt === 1 ? 292 : 318)) + diff * (mpt <= 0 ? 12 : 26);
+        const amp = (mpt <= 0 ? 62 : (mpt === 1 ? 82 : 96)) + diff * (mpt <= 0 ? 6 : 10);
+        const steps = mpt <= 0
+          ? clamp(3 + (rng() > 0.4 ? 1 : 0) + (diff >= 2 ? 1 : 0), 3, 5)
+          : clamp(4 + (diff >= 2 ? 1 : 0) + ((rng() > 0.55) ? 1 : 0) + (mpt >= 2 ? 1 : 0), 4, 8);
+        let x = cx - w * 0.5, y = cy;
+        raw.push({ x, y });
+        for (let i = 0; i < steps; i++) {
+          x += w / steps;
+          y = cy + (i % 2 === 0 ? -amp : amp);
+          raw.push({ x, y });
+        }
+      } else {
+        const rx = (mpt <= 0 ? 108 : (mpt === 1 ? 128 : 148)) + rng() * (mpt <= 0 ? 18 : 32);
+        const ry = (mpt <= 0 ? 48 : (mpt === 1 ? 58 : 68)) + rng() * (mpt <= 0 ? 12 : 20);
+        const loops = mpt >= 2 ? 62 : 56;
+        for (let i = 0; i <= loops; i++) {
+          const t = (i / loops) * Math.PI * 2;
+          raw.push({ x: cx + Math.cos(t) * rx, y: cy + Math.sin(2 * t) * ry });
+        }
+      }
+      const dens = mpt <= 0 ? 16 + (diff >= 2 ? 1 : 0) : (mpt === 1 ? 13 + (diff >= 2 ? 2 : 0) : 11 + diff);
+      const tracePoly = this._densifyPolyline(raw, dens);
+      const { cum: traceCum, total: traceTotalLen } = this._traceBuildCum(tracePoly);
+      let durationSec = 12.8 + diff * 2.1 + (traceShape === "zigzag" ? 0.9 : 0) + (traceShape === "loop" ? 1.1 : 0);
+      if (mpt <= 0) durationSec += 1.4;
+      else if (mpt >= 2) durationSec -= 0.85;
+      durationSec = clamp(durationSec, 11, 20);
+      return {
+        styleType: "trace",
+        traceShape,
+        tracePoly,
+        traceCum,
+        traceTotalLen,
+        durationSec,
+        theme: style,
+        timedWindowSec: 0,
+        decoyIds: [],
+        nodes: [],
+        edges: [],
+        path: []
+      };
+    },
+    _missionProgTier(missionId) {
+      const mid = clamp((missionId || 1) | 0, 1, 99);
+      if (mid <= 2) return 0;
+      if (mid <= 4) return 1;
+      return 2;
+    },
+    _pickNodeStyleType(rng, missionProgTier, diff, avoidDecoy) {
+      if (missionProgTier <= 0) {
+        if (avoidDecoy || diff < 1 || rng() > 0.42) return rng() < 0.52 ? "linear" : "branching";
+        return "decoy";
+      }
+      if (missionProgTier === 1) {
+        const roll = rng();
+        if (roll < 0.34) return "linear";
+        if (roll < 0.7) return "branching";
+        return "decoy";
+      }
+      const roll = rng();
+      if (roll < 0.26) return "linear";
+      if (roll < 0.58) return "branching";
+      return "decoy";
+    },
+    /** Picks stage style types (node vs trace) with variety by mission tier. */
+    _planRelayStageStyles(rng, missionProgTier, stageCount, diff) {
+      const tier = clamp(missionProgTier | 0, 0, 2);
+      const sc = clamp(stageCount | 0, 2, 3);
+      let traceTarget = 0;
+      if (tier <= 0) {
+        const p = 0.18 + (diff >= 1 ? 0.1 : 0) + (sc >= 3 ? 0.06 : 0);
+        traceTarget = rng() < p ? 1 : 0;
+      } else if (tier === 1) {
+        const r = rng();
+        traceTarget = sc === 2 ? (r < 0.48 ? 1 : 0) : (r < 0.24 ? 1 : (r < 0.8 ? 2 : 1));
+        traceTarget = Math.min(traceTarget, sc - 1);
+      } else {
+        const r = rng();
+        traceTarget = sc === 2 ? 1 : (r < 0.22 ? 1 : 2);
+        traceTarget = Math.min(traceTarget, sc - 1);
+      }
+      const traceSlots = [];
+      if (traceTarget > 0) {
+        const cand = [];
+        for (let i = 0; i < sc; i++) cand.push(i);
+        this._shuffle(cand, rng);
+        for (let k = 0; k < traceTarget && k < cand.length; k++) traceSlots.push(cand[k]);
+        traceSlots.sort((a, b) => a - b);
+      }
+      const traceSet = new Set(traceSlots);
+      const out = [];
+      let prevNode = "";
+      for (let si = 0; si < sc; si++) {
+        if (traceSet.has(si)) {
+          out.push("trace");
+          prevNode = "";
+          continue;
+        }
+        let nodeKind = this._pickNodeStyleType(rng, tier, diff, tier <= 0 && si === 0);
+        if (nodeKind === prevNode && (nodeKind === "linear" || nodeKind === "branching")) {
+          nodeKind = nodeKind === "linear" ? "branching" : "linear";
+        }
+        if (tier <= 0 && nodeKind === "decoy" && si === 0) nodeKind = rng() < 0.5 ? "linear" : "branching";
+        out.push(nodeKind);
+        prevNode = nodeKind;
+      }
+      if (tier >= 1 && sc >= 3) {
+        const hasNode = out.some(s => s !== "trace");
+        const hasTrace = out.some(s => s === "trace");
+        if (!hasTrace || !hasNode) {
+          out[sc - 1] = !hasTrace ? "trace" : (rng() < 0.5 ? "linear" : "branching");
+          if (out[sc - 1] !== "trace" && out[sc - 2] === out[sc - 1]) {
+            out[sc - 2] = out[sc - 1] === "linear" ? "branching" : "linear";
+          }
+        }
+      }
+      return out;
+    },
     _makeDecoyStage(rng, diff, style, stageIdx) {
       const coreCount = clamp(4 + diff + (stageIdx > 0 ? 1 : 0), 5, 8);
       const decoyCount = clamp(1 + diff + ((rng() > 0.55) ? 1 : 0), 1, 4);
@@ -1151,6 +1903,11 @@
     },
     _signature(stages) {
       return stages.map(st => {
+        if (st.styleType === "trace") {
+          const poly = st.tracePoly || [];
+          const head = poly.slice(0, 10).map(p => (Math.round(p.x / 10) + ":" + Math.round(p.y / 10))).join("|");
+          return "trace:" + (st.traceShape || "?") + ":" + poly.length + ":" + head;
+        }
         const nodeSig = st.nodes.map(n => (Math.round(n.x / 8) + ":" + Math.round(n.y / 8))).sort().join("|");
         return st.styleType + ":" + st.path.length + ":" + nodeSig;
       }).join("~");
@@ -1163,27 +1920,28 @@
       const totalRelays = Math.max(1, (ctx && ctx.totalRelays) || 1);
       const solvedCount = (ctx && ctx.solvedCount) || 0;
       const attempt = (ctx && ctx.attempt) || 0;
-      const baseSeed = (missionSeed ^ runSeed ^ hashString32(term.id + ":" + relayIndex + ":" + attempt)) >>> 0;
+      const missionId = (ctx && ctx.missionId != null) ? (ctx.missionId | 0) : 1;
+      const missionProgTier = this._missionProgTier(missionId);
+      const baseSeed = (missionSeed ^ runSeed ^ hashString32(term.id + ":" + relayIndex + ":" + attempt) ^ hashString32("m" + missionId)) >>> 0;
       const rng = mulberry32(baseSeed || 0x5a17c9d3);
       const diff = clamp(Math.floor((relayIndex / totalRelays) * 3) + Math.floor(solvedCount / 2), 0, 3);
       const stageCount = clamp(2 + (diff >= 2 ? 1 : 0), 2, 3);
       const theme = this.themes[(relayIndex + ((rng() * this.themes.length) | 0)) % this.themes.length];
-      const stylePool = diff <= 0
-        ? ["linear", "branching"]
-        : diff === 1 ? ["linear", "branching", "decoy"] : ["branching", "decoy", "linear"];
+      const planned = this._planRelayStageStyles(rng, missionProgTier, stageCount, diff);
       const stages = [];
       for (let si = 0; si < stageCount; si++) {
-        const styleType = stylePool[(si + ((rng() * stylePool.length) | 0)) % stylePool.length];
+        const styleType = planned[si];
         let st;
         if (styleType === "linear") st = this._makeLinearStage(rng, diff, theme, si);
         else if (styleType === "decoy") st = this._makeDecoyStage(rng, diff, theme, si);
+        else if (styleType === "trace") st = this._makeTraceStage(rng, diff, theme, si, missionProgTier);
         else st = this._makeBranchStage(rng, diff, theme, si);
         stages.push(st);
       }
       return { terminalId: term.id, relayType: stages[0].styleType, themeName: theme.name, stages, signature: this._signature(stages), seed: baseSeed >>> 0 };
     },
     deepBreach() {
-      return this.buildRelaySpec({ missionSeed: 0x101, sessionSeed: 0x7f4a7c15, relayIndex: 0, totalRelays: 3, solvedCount: 0, terminal: { id: "fallback-relay" }, attempt: 0 });
+      return this.buildRelaySpec({ missionId: 3, missionSeed: 0x101, sessionSeed: 0x7f4a7c15, relayIndex: 0, totalRelays: 3, solvedCount: 0, terminal: { id: "fallback-relay" }, attempt: 0 });
     }
   };
 
@@ -1349,6 +2107,27 @@
           ctx.stroke();
           ctx.setLineDash([]);
         }
+        if (socialOpt.fakeTaskPantomime) {
+          ctx.strokeStyle = "rgba(0,255,200," + (0.22 + 0.18 * Math.sin(animPhase * 2.4)) + ")";
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([3, 4]);
+          ctx.beginPath();
+          ctx.arc(12, -2, 11 + Math.sin(animPhase * 3) * 1.5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(4, 6);
+          ctx.lineTo(18, 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        if (socialOpt.sabotageRipple) {
+          const pr = 0.35 + 0.25 * Math.sin(animPhase * 5);
+          ctx.strokeStyle = "rgba(255,190,90," + pr + ")";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(0, 0, 30 + Math.sin(animPhase * 6) * 3, 0, Math.PI * 2);
+          ctx.stroke();
+        }
       }
       ctx.restore();
     },
@@ -1388,6 +2167,7 @@
       this.accentCircuit = opts.accentCircuit || "#00f0ff";
       this.accentVisor = opts.accentVisor || "#00ffff";
       this.fakeTaskTimer = 0;
+      this.sabotageFxUntil = 0;
       this.socialPulse = 0;
       this.accusedFlash = 0;
       this.reportPulse = 0;
@@ -1447,7 +2227,9 @@
         role: this.role,
         scanPulse: this.socialPulse > 0,
         accusedPulse: this.accusedFlash > 0,
-        reportPing: this.reportPulse > 0
+        reportPing: this.reportPulse > 0,
+        fakeTaskPantomime: this.fakeTaskTimer > 0,
+        sabotageRipple: this.sabotageFxUntil > performance.now()
       });
     }
   }
@@ -1479,6 +2261,14 @@
         : this.npcKind === "suspicious" ? "strict"
         : this.behavior === "ignore" ? "sarcastic" : "nervous");
       this.dialogueCooldownUntil = 0;
+      this.npcGameplayRole = opts.npcGameplayRole || null;
+      this._hostilePressure = 0;
+      this._hostileEscCd = 0;
+      this._hrPhase = 0;
+      this._hrWarnEnd = 0;
+      this._hrWarnShown = false;
+      this._dirReportCdUntil = 0;
+      this._hostileDialogPrimedUntil = 0;
     }
     _wp() {
       if (!this.waypoints.length) return { x: this.baseX, y: this.baseY };
@@ -1504,6 +2294,9 @@
       } else {
         this.watchLevel = clamp(this.watchLevel + (near ? 1.85 + Math.max(0, odd) * 1.2 : -0.65) * dt, 0, 1);
       }
+      if (player.fakeTaskTimer > 0 && close) {
+        this.watchLevel = clamp(this.watchLevel - dt * 0.52, 0, 1);
+      }
       if (near && this.watchLevel > 0.46) {
         this.facing = player.x >= this.x ? 1 : -1;
       }
@@ -1520,29 +2313,48 @@
       this.headYaw = Math.sin(this.animT * 1.4) * (6 + this.watchLevel * 13);
       this.socialPulse = (near && this.watchLevel > 0.35) || this.followBias > 0.15 ? 0.7 : Math.max(0, this.socialPulse - dt * 1.8);
       if (near && close) {
-        const gain = (this.behavior === "ignore" ? 2.6 : this.behavior === "watch" ? 6.1 : 8.2) * dt;
-        player.suspicion = clamp(player.suspicion + gain + Math.max(0, odd * 1.8), 0, 100);
+        let gain = (this.behavior === "ignore" ? 2.6 : this.behavior === "watch" ? 6.1 : 8.2) * dt;
+        let bump = Math.max(0, odd * 1.8);
+        if (player.fakeTaskTimer > 0) {
+          gain *= 0.34;
+          bump *= 0.38;
+        }
+        const roleMul = NpcRoleSystem.proximitySuspicionMul(this);
+        gain *= roleMul;
+        bump *= roleMul;
+        player.suspicion = clamp(player.suspicion + gain + bump, 0, 100);
+      }
+      const gRole = this.npcGameplayRole || NpcRoleSystem.computeRole(this);
+      if (gRole === "neutral" && near && speed > 0.58) {
+        this.watchLevel = clamp(this.watchLevel + dt * 0.22, 0, 1);
+      }
+      if (gRole === "hostile" && near && close) {
+        const sp = player.suspicion || 0;
+        const now = performance.now();
+        if (sp > 36) {
+          this._hostilePressure = (this._hostilePressure || 0) + dt * (0.38 + sp / 200);
+          if ((this._hostileEscCd || 0) <= now && this._hostilePressure > 4.8) {
+            this._hostilePressure = 0;
+            this._hostileEscCd = now + 26000;
+            world.alarm = clamp((world.alarm || 0) + 5.2, 0, 100);
+            world.exposure = clamp((world.exposure || 0) + 3.0, 0, 100);
+            NetworkManager.pushAlert("trace_noise", this.x, this.y);
+          }
+        } else {
+          this._hostilePressure = Math.max(0, (this._hostilePressure || 0) - dt * 1.1);
+        }
+      } else if (gRole === "hostile") {
+        this._hostilePressure = Math.max(0, (this._hostilePressure || 0) - dt * 0.65);
       }
       if (close && player.getSpeed01() > 0.68 && this.behavior === "watch") {
-        player.suspicion = clamp(player.suspicion + dt * 7.5, 0, 100);
+        const spr = dt * 7.5 * NpcRoleSystem.proximitySuspicionMul(this);
+        player.suspicion = clamp(player.suspicion + spr, 0, 100);
       }
       if (!near && speed < 0.45) player.suspicion = clamp(player.suspicion - dt * 1.9, 0, 100);
-      if (this.behavior === "report" && near && player.suspicion >= SOCIAL_REPORT_MIN_SUSPICION) {
-        const now = performance.now();
-        if (this.reportCd <= now) {
-          this.reportCd = now + SOCIAL_REPORT_COOLDOWN_MS;
-          world.alarm = clamp(world.alarm + 8, 0, 100);
-          world.exposure = clamp((world.exposure || 0) + 6.2, 0, 100);
-          const nearest = guards.reduce((best, g) => {
-            const gd = Math.hypot(g.x - player.x, g.y - player.y);
-            return gd < best.d ? { d: gd, g } : best;
-          }, { d: 1e9, g: null });
-          if (nearest.g) {
-            nearest.g.lastKnown = { x: player.x, y: player.y };
-            nearest.g.detect = clamp(nearest.g.detect + 52, 0, 100);
-          }
-          NetworkManager.pushAlert("npc_report", this.x, this.y);
-        }
+      NpcRoleSystem.tickDirectedNpcReport(this, world, player, guards, near, close);
+      if (this._hrPhase === 1 && (this._hrWarnEnd || 0) > performance.now()) {
+        this.headYaw = Math.sin(this.animT * 6.4) * 26;
+        this.watchLevel = clamp(this.watchLevel + dt * 2.0, 0, 1);
       }
     }
     render(ctx) {
@@ -1550,10 +2362,10 @@
       const circuit = isSec ? "#7fa9ff" : "#9ce0ff";
       const visor = isSec ? "#d8e7ff" : "#f0f7ff";
       Renderer.drawPlayerFigure(ctx, this.x, this.y, this.facing, this.animT, this.animT * 1.8, false, circuit, visor, {
-        tension: this.watchLevel,
+        tension: Math.max(this.watchLevel, this._hrPhase === 1 ? 0.62 : 0),
         role: isSec ? "security_agent" : "civilian",
         scanPulse: this.socialPulse > 0.05,
-        accusedPulse: false,
+        accusedPulse: this._hrPhase === 1 && (this._hrWarnEnd || 0) > performance.now(),
         reportPing: this.behavior === "report" && this.watchLevel > 0.6
       });
     }
@@ -1678,19 +2490,24 @@
       const cover = world ? world.cover : [];
       const vis = this.pickVisibleTarget(targets, walls, cover);
       if (vis) {
+        let visStr = vis.str;
+        if (worldFlags && vis.player && (worldFlags.npcBonusVisMulUntil || 0) > now) {
+          visStr *= clamp(worldFlags.npcBonusVisMul || 0.88, 0.78, 0.95);
+        }
+        if ((this.npcBonusBlindUntil || 0) > now) visStr *= 0.55;
         // Fresh visual contact gets a brief reaction window, only at low-mid detect.
         if (this._prevVisStrength < 0.04 && this.detect < 80) {
-          const graceSec = 0.3 + (1 - clamp(vis.str, 0, 1)) * 0.4;
+          const graceSec = 0.3 + (1 - clamp(visStr, 0, 1)) * 0.4;
           this._visionGraceUntil = now + graceSec * 1000;
         }
         const d = this.detect;
         // 3-stage detection ramp: moderate -> faster -> near lock-on.
         const stageMul = d < 40 ? 0.68 : (d < 80 ? 1.08 : 1.72);
-        let gain = this.detectUp * vis.str * dt * stageMul;
+        let gain = this.detectUp * visStr * dt * stageMul;
         if (now < this._visionGraceUntil && d < 80) gain *= 0.08;
         // Keep close-range entry threatening, but avoid instant 100% spikes.
-        if (this._prevVisStrength < 0.12 && vis.str > 0.46 && this._closeSpikeCd <= 0 && !(now < this._visionGraceUntil && d < 80)) {
-          const spike = (d < 40 ? 4.2 : (d < 80 ? 6.6 : 8.8)) + vis.str * 2.8;
+        if (this._prevVisStrength < 0.12 && visStr > 0.46 && this._closeSpikeCd <= 0 && !(now < this._visionGraceUntil && d < 80)) {
+          const spike = (d < 40 ? 4.2 : (d < 80 ? 6.6 : 8.8)) + visStr * 2.8;
           gain += spike;
           this._closeSpikeCd = 0.9;
         }
@@ -1699,7 +2516,7 @@
         gain = Math.min(gain, maxGainPerSec * dt);
         this.detect = clamp(this.detect + gain, 0, 100);
         this.lastKnown = { x: vis.player.x, y: vis.player.y };
-        this._prevVisStrength = vis.str;
+        this._prevVisStrength = visStr;
         if (prevDetect < 70 && this.detect >= 70) SFX.play("guard_alert");
       } else {
         const d = this.detect;
@@ -1900,6 +2717,94 @@
       this.activeTimedWindowSec = 0;
       this.stepTimer = 0;
       this.decoyNodeSet = new Set();
+      this.tracePointerDown = false;
+      this.tracePoly = [];
+      this.traceCum = [];
+      this.traceTotalLen = 1;
+      this.traceProgress = 0;
+      this.traceShape = "";
+      this.traceTracingActive = false;
+      this.traceEverPressed = false;
+      this.traceAccEma = 1;
+      this.traceOffAccum = 0;
+      this.traceLastDist = 1e9;
+      this.traceHoverDist = 1e9;
+      this.tracePathGlow = 0.55;
+      this.traceAssistX = 0;
+      this.traceAssistY = 0;
+      this.traceTrail = [];
+      this._traceLastTickMs = 0;
+      this._traceNetThrottle = 0;
+      this._traceStallU = 0;
+      this._traceStallT = 0;
+    }
+    isTraceStage() {
+      return !!(this.currentStage && this.currentStage.styleType === "trace");
+    }
+    _resetTraceRuntime() {
+      this.tracePointerDown = false;
+      this.tracePoly = [];
+      this.traceCum = [];
+      this.traceTotalLen = 1;
+      this.traceProgress = 0;
+      this.traceShape = "";
+      this.traceTracingActive = false;
+      this.traceEverPressed = false;
+      this.traceAccEma = 1;
+      this.traceOffAccum = 0;
+      this.traceLastDist = 1e9;
+      this.traceHoverDist = 1e9;
+      this.tracePathGlow = 0.55;
+      this.traceAssistX = 0;
+      this.traceAssistY = 0;
+      this.traceTrail = [];
+      this._traceLastTickMs = performance.now();
+      this._traceStallU = 0;
+      this._traceStallT = 0;
+    }
+    _initTraceFromStage(st) {
+      this._resetTraceRuntime();
+      this.tracePoly = (st.tracePoly || []).map(p => ({ x: p.x, y: p.y }));
+      this.traceCum = (st.traceCum && st.traceCum.length === this.tracePoly.length) ? st.traceCum.slice() : null;
+      if (!this.traceCum || this.traceCum.length !== this.tracePoly.length) {
+        const built = HackEngine._traceBuildCum(this.tracePoly);
+        this.traceCum = built.cum;
+        this.traceTotalLen = built.total;
+      } else {
+        this.traceTotalLen = Math.max(st.traceTotalLen || this.traceCum[this.traceCum.length - 1] || 1, 1);
+      }
+      this.traceShape = st.traceShape || "curve";
+      if (this.tracePoly.length) {
+        this.traceAssistX = this.tracePoly[0].x;
+        this.traceAssistY = this.tracePoly[0].y;
+      }
+    }
+    _closestOnTracePoly(mx, my) {
+      const poly = this.tracePoly;
+      const cum = this.traceCum;
+      if (!poly || poly.length < 2 || !cum || cum.length !== poly.length) {
+        return { d: 1e9, u: 0, px: mx, py: my };
+      }
+      let bestD2 = 1e18, bestU = 0, bestPx = mx, bestPy = my;
+      for (let i = 0; i < poly.length - 1; i++) {
+        const ax = poly[i].x, ay = poly[i].y;
+        const bx = poly[i + 1].x, by = poly[i + 1].y;
+        const abx = bx - ax, aby = by - ay;
+        const apx = mx - ax, apy = my - ay;
+        const ab2 = abx * abx + aby * aby || 1e-6;
+        let t = (apx * abx + apy * aby) / ab2;
+        t = clamp(t, 0, 1);
+        const px = ax + t * abx, py = ay + t * aby;
+        const d2 = distSq(mx, my, px, py);
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestPx = px;
+          bestPy = py;
+          const segLen = Math.sqrt(ab2);
+          bestU = cum[i] + t * segLen;
+        }
+      }
+      return { d: Math.sqrt(bestD2), u: bestU, px: bestPx, py: bestPy };
     }
     configure(spec) {
       this.stages = (spec && spec.stages) ? spec.stages : [];
@@ -1916,13 +2821,23 @@
         this.nodes = [];
         this.links = [];
         this.solutionPath = [];
+        this._resetTraceRuntime();
         return;
       }
       this.currentStage = st;
-      this.nodes = st.nodes.map(n => ({ id: n.id, x: n.x, y: n.y, r: 15 }));
-      this.links = st.edges.map(([a, b]) => ({ a, b }));
-      this.solutionPath = st.path.slice();
-      this.hackingPath = this.solutionPath.map(id => ({ id }));
+      if (st.styleType === "trace") {
+        this.nodes = [];
+        this.links = [];
+        this.solutionPath = [];
+        this.hackingPath = [];
+        this._initTraceFromStage(st);
+      } else {
+        this._resetTraceRuntime();
+        this.nodes = st.nodes.map(n => ({ id: n.id, x: n.x, y: n.y, r: 15 }));
+        this.links = st.edges.map(([a, b]) => ({ a, b }));
+        this.solutionPath = st.path.slice();
+        this.hackingPath = this.solutionPath.map(id => ({ id }));
+      }
       this.stageDuration = st.durationSec != null ? st.durationSec : 7;
       this.stageTimer = this.stageDuration;
       this.activeTimedWindowSec = st.timedWindowSec || 0;
@@ -2005,12 +2920,88 @@
       this.lastInteractedNodeID = -1;
       this.hoverNodeId = -1;
       this.stepTimer = this.activeTimedWindowSec > 0 ? this.activeTimedWindowSec : 0;
+      if (this.isTraceStage()) this._traceRestartStageProgress();
     }
     _mistakeReset(reason) {
       this.wrongFlash = 0.65;
       this.wrongMsgUntil = performance.now() + 1100;
       if (this.onMistakeCb) this.onMistakeCb(reason || "sequence");
       this._resetStageProgress();
+    }
+    _traceRestartStageProgress() {
+      this.tracePointerDown = false;
+      this.traceProgress = 0;
+      this.traceTracingActive = false;
+      this.traceEverPressed = false;
+      this.traceAccEma = 1;
+      this.traceOffAccum = 0;
+      this.traceLastDist = 1e9;
+      this.traceTrail = [];
+      this.tracePathGlow = 0.45;
+      if (this.tracePoly.length) {
+        this.traceAssistX = this.tracePoly[0].x;
+        this.traceAssistY = this.tracePoly[0].y;
+      }
+    }
+    _traceApplyPointer(mx, my) {
+      const raw = this._closestOnTracePoly(mx, my);
+      const assistK = clamp(1 - raw.d / 108, 0, 1) * 0.44;
+      const ax = mx + (raw.px - mx) * assistK;
+      const ay = my + (raw.py - my) * assistK;
+      const snap = this._closestOnTracePoly(ax, ay);
+      this.traceAssistX = snap.px;
+      this.traceAssistY = snap.py;
+      this.traceLastDist = snap.d;
+      this.traceHoverDist = snap.d;
+      const bandOk = snap.d < 56;
+      const q = clamp(1 - snap.d / 74, 0, 1);
+      if (this.traceTracingActive && this.tracePointerDown) {
+        this.traceAccEma = this.traceAccEma * 0.87 + q * 0.13;
+      }
+      if (this.traceTrail.length > 60) this.traceTrail.shift();
+      this.traceTrail.push({ x: ax, y: ay });
+      if (!this.traceTracingActive || !this.tracePointerDown) {
+        this.tracePathGlow = lerp(this.tracePathGlow, bandOk ? 0.9 : 0.36, 0.14);
+        return;
+      }
+      if (bandOk) {
+        const fwd = snap.u >= this.traceProgress - 48;
+        const notLeap = snap.u <= this.traceProgress + 118;
+        if (fwd && notLeap) this.traceProgress = Math.max(this.traceProgress, snap.u);
+      }
+      this.tracePathGlow = lerp(this.tracePathGlow, bandOk ? 1 : 0.28 + 0.22 * Math.sin(performance.now() * 0.018), 0.18);
+      if (this.traceProgress >= this.traceTotalLen * 0.965) this._advanceOrComplete();
+    }
+    onTracePointerDown(mx, my, pointerSerial) {
+      if (!this.active || this.success || !this.isTraceStage()) return;
+      if (!this.canInteract || this.isTransitioning) return;
+      if (pointerSerial != null) {
+        if (pointerSerial === this.lastPointerSerial) return;
+        this.lastPointerSerial = pointerSerial;
+      }
+      this.tracePointerDown = true;
+      this.traceEverPressed = true;
+      const close = this._closestOnTracePoly(mx, my);
+      if (!this.traceTracingActive) {
+        const nearStart = close.u <= this.traceTotalLen * 0.16 + 22 && close.d < 52;
+        const d0 = this.tracePoly.length ? Math.hypot(mx - this.tracePoly[0].x, my - this.tracePoly[0].y) : 1e9;
+        if (nearStart || d0 < 70) {
+          this.traceTracingActive = true;
+          this.traceProgress = Math.max(this.traceProgress, Math.min(close.u, this.traceTotalLen * 0.05));
+        }
+      }
+      this._traceApplyPointer(mx, my);
+    }
+    onTracePointerUp() {
+      if (!this.active || this.success || !this.isTraceStage()) return;
+      this.tracePointerDown = false;
+      if (!this.traceEverPressed || !this.traceTracingActive) return;
+      const comp = this.traceProgress / this.traceTotalLen;
+      const acc = clamp(this.traceAccEma, 0, 1);
+      const score = 0.52 * comp + 0.48 * acc;
+      const ok = comp >= 0.82 && acc >= 0.64 && score >= 0.71;
+      if (ok) this._advanceOrComplete();
+      else this._mistakeReset("trace_incomplete");
     }
     releaseInteraction() {
       this.canInteract = true;
@@ -2069,9 +3060,38 @@
       if (this.stageTimer <= 0) {
         this.failCurrentRun();
       }
+      if (!this.success && this.isTraceStage() && this.traceTracingActive && this.tracePointerDown) {
+        if (this.traceLastDist > 78) this.traceOffAccum += dt;
+        else this.traceOffAccum = Math.max(0, this.traceOffAccum - dt * 0.95);
+        if (this.traceOffAccum > 0.68) this._mistakeReset("trace_offpath");
+      }
     }
     setPointer(mx, my) {
       if (!this.active || this.success) { this.hoverNodeId = -1; return; }
+      if (this.isTraceStage()) {
+        if (typeof NetworkCoordinator !== "undefined" && NetworkCoordinator.isAuthoritativeHost && !NetworkCoordinator.isAuthoritativeHost()) {
+          if (this.tracePointerDown) {
+            const now = performance.now();
+            if (now - this._traceNetThrottle > 42) {
+              this._traceNetThrottle = now;
+              NetworkCoordinator.sendMissionAction({ kind: "hack_trace", phase: "move", mx, my }, GameStateManager.localPlayerId);
+            }
+          }
+          const hov = this._closestOnTracePoly(mx, my);
+          this.traceHoverDist = hov.d;
+          this.tracePathGlow = lerp(this.tracePathGlow, hov.d < 60 ? 0.9 : 0.36, 0.15);
+          this.hoverNodeId = -1;
+          return;
+        }
+        if (this.tracePointerDown) this._traceApplyPointer(mx, my);
+        else {
+          const hov = this._closestOnTracePoly(mx, my);
+          this.traceHoverDist = hov.d;
+          this.tracePathGlow = lerp(this.tracePathGlow, hov.d < 64 ? 0.88 : 0.4, 0.12);
+        }
+        this.hoverNodeId = -1;
+        return;
+      }
       const expect = this.solutionPath[this.expectedIndex];
       const target = this.nodes.find(n => n.id === expect);
       if (!target) { this.hoverNodeId = -1; return; }
@@ -2095,6 +3115,10 @@
     }
     handleClick(mx, my, pointerSerial) {
       if (!this.active || this.success) return;
+      if (this.isTraceStage()) {
+        this.onTracePointerDown(mx, my, pointerSerial);
+        return;
+      }
       if (this.isLocked) return;
       if (this.awaitingRelease) return;
       if (!this.canInteract || this.isTransitioning) return;
@@ -2130,6 +3154,133 @@
       if (this.activeTimedWindowSec > 0) this.stepTimer = this.activeTimedWindowSec;
       if (this.currentTargetIndex === this.hackingPath.length) this._advanceOrComplete();
     }
+    _renderTraceVisuals(ctx, now, wrongActive, theme, stageLab, st) {
+      const poly = this.tracePoly;
+      const cum = this.traceCum;
+      const prog = this.traceProgress;
+      const accent = theme.accent || "#00ffee";
+      const glow = clamp(this.tracePathGlow, 0, 1);
+      const shapeLab = (st && st.traceShape) ? st.traceShape : "path";
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      if (poly.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(poly[0].x, poly[0].y);
+        for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
+        ctx.strokeStyle = wrongActive ? "rgba(255,50,100,0.14)" : hexToRgba(accent, 0.14 + (1 - glow) * 0.1);
+        ctx.lineWidth = 16;
+        ctx.stroke();
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < poly.length - 1; i++) {
+          const u0 = cum[i], u1 = cum[i + 1];
+          const seg = u1 - u0 || 1e-6;
+          const ax = poly[i].x, ay = poly[i].y, bx = poly[i + 1].x, by = poly[i + 1].y;
+          if (prog <= u0) break;
+          const t1 = prog >= u1 ? 1 : (prog - u0) / seg;
+          if (!started) {
+            ctx.moveTo(ax, ay);
+            started = true;
+          } else {
+            ctx.lineTo(ax, ay);
+          }
+          if (t1 < 1) {
+            ctx.lineTo(ax + (bx - ax) * t1, ay + (by - ay) * t1);
+            break;
+          }
+          ctx.lineTo(bx, by);
+        }
+        ctx.strokeStyle = wrongActive ? "rgba(255,100,150,0.42)" : hexToRgba(accent, 0.42 + glow * 0.48);
+        ctx.lineWidth = 8 + glow * 8;
+        ctx.shadowColor = accent;
+        ctx.shadowBlur = 6 + glow * 22;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+      ctx.globalCompositeOperation = "source-over";
+      for (let ti = 0; ti < this.traceTrail.length; ti++) {
+        const p = this.traceTrail[ti];
+        const a = (ti / Math.max(1, this.traceTrail.length)) * 0.4 * glow;
+        ctx.fillStyle = hexToRgba(accent, a);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (poly.length) {
+        ctx.strokeStyle = hexToRgba(accent, 0.9);
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.arc(poly[0].x, poly[0].y, 15, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = hexToRgba(accent, 0.18);
+        ctx.fill();
+        ctx.fillStyle = "#061018";
+        ctx.font = "bold 10px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("START", poly[0].x, poly[0].y);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+      }
+      if (poly.length >= 2) {
+        const ex = poly[poly.length - 1].x, ey = poly[poly.length - 1].y;
+        ctx.strokeStyle = hexToRgba(accent, 0.55 + glow * 0.25);
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(ex, ey, 12, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#061018";
+        ctx.font = "bold 9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("END", ex, ey);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+      }
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.shadowColor = accent;
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = accent;
+      ctx.font = "bold 16px monospace";
+      ctx.fillText("NEURAL TRACE — shape lock (" + shapeLab + ")", 40, 40);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#9ab";
+      ctx.font = "12px monospace";
+      ctx.fillText(stageLab + "  |  " + (theme.name || "Relay") + "  ·  drag along path, release at end", 40, 62);
+      const compPct = Math.round((this.traceProgress / this.traceTotalLen) * 100);
+      const accPct = Math.round(clamp(this.traceAccEma, 0, 1) * 100);
+      ctx.fillStyle = "#ddeeff";
+      ctx.fillText("Trace: " + compPct + "%  ·  Line quality: " + accPct + "%", 40, 84);
+      ctx.fillStyle = glow > 0.55 ? "#b8ffe8" : "#9ab";
+      ctx.fillText((this.tracePointerDown ? "Tracing…" : "Pointer up — hold & drag from START") + "  ·  Window: " + this.stageTimer.toFixed(1) + "s", 40, 104);
+      if (wrongActive) {
+        ctx.fillStyle = "#ff6688";
+        ctx.textAlign = "center";
+        ctx.font = "bold 15px monospace";
+        ctx.shadowColor = "#ff0044";
+        ctx.shadowBlur = 8;
+        ctx.fillText("DATA CORRUPTION — stage reset · grid alerted", VIEW_W / 2, VIEW_H - 28);
+        ctx.shadowBlur = 0;
+      }
+      if (this.success) {
+        const pulse = 1 + Math.sin(now * 0.012) * 0.06;
+        ctx.save();
+        ctx.translate(VIEW_W / 2, VIEW_H / 2);
+        ctx.scale(pulse, pulse);
+        ctx.fillStyle = "#00ffcc";
+        ctx.textAlign = "center";
+        ctx.font = "bold 26px monospace";
+        ctx.shadowColor = "#00ffaa";
+        ctx.shadowBlur = 24;
+        ctx.fillText("ACCESS GRANTED", 0, 0);
+        ctx.shadowBlur = 0;
+        ctx.restore();
+      }
+    }
     render(ctx) {
       if (!this.active) return;
       const now = performance.now();
@@ -2156,6 +3307,11 @@
       if (wrongActive && Math.random() < 0.45) {
         ctx.fillStyle = "rgba(255,255,255,0.05)";
         ctx.fillRect(Math.random() * (VIEW_W - 120), Math.random() * (VIEW_H - 80), 100 + Math.random() * 80, 3);
+      }
+      if (this.isTraceStage()) {
+        this._renderTraceVisuals(ctx, now, wrongActive, theme, stageLab, st);
+        ctx.restore();
+        return;
       }
       ctx.globalCompositeOperation = "lighter";
       for (const L of this.links) {
@@ -2558,6 +3714,26 @@
           }
         }
       }
+      if (player.fakeTaskTimer > 0) {
+        let nearObserver = false;
+        for (let ni = 0; ni < npcs.length; ni++) {
+          const n = npcs[ni];
+          const d = Math.hypot(n.x - player.x, n.y - player.y);
+          if (d < 200 && !visionBlocked(n.x, n.y, player.x, player.y, world.walls, world.cover)) { nearObserver = true; break; }
+        }
+        if (!nearObserver) {
+          const Gs = world.guards || [];
+          for (let gi = 0; gi < Gs.length; gi++) {
+            const g = Gs[gi];
+            const d = Math.hypot(g.x - player.x, g.y - player.y);
+            if (d < 250 && !visionBlocked(g.x, g.y, player.x, player.y, world.walls, world.cover)) { nearObserver = true; break; }
+          }
+        }
+        if (nearObserver) {
+          const drain = player.fakeTaskTimer > 3.2 ? 4.5 : 3.0;
+          player.suspicion = clamp(player.suspicion - dt * drain, 0, 100);
+        }
+      }
       if (player.getSpeed01() > 0.42 && player.turnRate > 4.9) {
         player.suspicion = clamp(player.suspicion + dt * 7.8, 0, 100);
       }
@@ -2603,6 +3779,21 @@
         pls[s].update(dt, inp, playerColliders);
         pls[s].x = clamp(pls[s].x, pls[s].radius, w.worldW - pls[s].radius);
         pls[s].y = clamp(pls[s].y, pls[s].radius, w.worldH - pls[s].radius);
+        pls[s].fakeTaskTimer = Math.max(0, (pls[s].fakeTaskTimer || 0) - dt);
+      }
+      if (w.flags) {
+        if (w.flags.doorSabotageRevert && now >= w.flags.doorSabotageRevert.until) {
+          const dr = w.flags.doorSabotageRevert;
+          w.doorsOpen[dr.id] = !!dr.restoreOpen;
+          w.flags.doorSabotageRevert = null;
+          if (gsm.rebuildWalls) gsm.rebuildWalls();
+        }
+        const locks = w.flags.terminalSabotageLocks;
+        if (locks) {
+          for (const k of Object.keys(locks)) {
+            if (locks[k] <= now) delete locks[k];
+          }
+        }
       }
       if (gsm.player && gsm.player.getSpeed01 && gsm.player.getSpeed01() > 0.26) SFX.play("footstep_soft");
       separateCircles(pls, playerColliders);
@@ -3212,10 +4403,11 @@
         missionElapsed: 0,
         minDwellSec: def.minDwellSec != null ? def.minDwellSec : DEFAULT_MIN_DWELL_SEC,
         minMissionSec: def.minMissionSec != null ? def.minMissionSec : DEFAULT_MIN_MISSION_SEC,
-        flags: { package: false, sabotageCooldown: 0, blackoutUntil: 0, cameraJamUntil: 0, fakeAlarmUntil: 0, guardFocus: null, guardInvestigate: null, maxAlarm: 0, bonusDataDownloaded: false, hackSpeedBonus: 0, uiBonusCount: 0, sideRewardsGranted: {} }
+        flags: { package: false, sabotageCooldown: 0, blackoutUntil: 0, cameraJamUntil: 0, fakeAlarmUntil: 0, guardFocus: null, guardInvestigate: null, maxAlarm: 0, bonusDataDownloaded: false, hackSpeedBonus: 0, uiBonusCount: 0, sideRewardsGranted: {}, lumenSapUntil: 0, terminalSabotageLocks: {}, doorSabotageRevert: null }
       };
       world.flags.loreIndex = 0;
       world.flags.loreFragments = [];
+      for (let ti = 0; ti < world.terminals.length; ti++) TerminalState.ensure(world.terminals[ti]);
       world.walls = MissionLoader.solidWalls(world);
       DetectionSystem.init(world);
       MissionSystem.init(world);
@@ -3303,6 +4495,16 @@
       };
       this._pointerUp = (e) => {
         e.preventDefault();
+        if (GameStateManager && GameStateManager.phase === "playing" && GameStateManager.mode === "hack") {
+          const hk = GameStateManager.hack;
+          if (hk && hk.isTraceStage()) {
+            if (NetworkCoordinator.isAuthoritativeHost && !NetworkCoordinator.isAuthoritativeHost()) {
+              NetworkCoordinator.sendMissionAction({ kind: "hack_trace", phase: "up" }, GameStateManager.localPlayerId);
+            } else {
+              hk.onTracePointerUp();
+            }
+          }
+        }
         if (GameStateManager && GameStateManager.hack) GameStateManager.hack.releaseInteraction();
       };
       this._pointerMove = (e) => {
@@ -3389,6 +4591,8 @@
     npcDialogueAwaitingChoice: false,
     npcDialogueNPC: null,
     npcTask: null,
+    npcFavor: null,
+    _favorChoiceSpecById: null,
     _pendingHackSpec: null,
     _worldStaticCanvas: null,
     _worldStaticMissionKey: "",
@@ -3654,7 +4858,15 @@
       this._dbgLog("onHackComplete", payload);
       this._dbgWatchEnd("hack-session-active");
       this.endHacking(!!payload.success);
-      if (!payload.success) return;
+      if (!payload.success) {
+        const w = this.world;
+        const tid = payload && payload.terminalId;
+        if (w && tid) {
+          const tt = (w.terminals || []).find(x => x.id === tid);
+          if (tt && tt.state === TerminalState.IN_PROGRESS) TerminalState.set(tt, TerminalState.INACTIVE);
+        }
+        return;
+      }
       this.emitEvent("onMissionUpdate", {
         runId: payload.runId,
         terminalId: payload.terminalId || "",
@@ -3712,6 +4924,8 @@
           ? "Reach the cyan EXTRACTION zone."
           : "Relay compromised. Move to the next relay node.", "#8fefff", 2.6);
       }
+      const tRemain = (w.terminals || []).find(tt => tt.id === terminalId);
+      if (tRemain) TerminalState.set(tRemain, TerminalState.COMPLETED);
       MissionSystem.sync(w, this.player);
       if (w.primaryDone && MissionSystem.isComplete(w)) this.triggerWin();
     },
@@ -3783,7 +4997,9 @@
       w.flags.dynamicRepairTerminalId = id;
       w.flags.dynamicEventType = "system_failure";
       w.flags.dynamicEventEndsAt = 0;
-      w.terminals.push({ id, x: pick.x, y: pick.y, w: panelW, h: panelH, kind: "repair_panel", label: "REPAIR PANEL" });
+      const panel = { id, x: pick.x, y: pick.y, w: panelW, h: panelH, kind: "repair_panel", label: "REPAIR PANEL" };
+      TerminalState.ensure(panel);
+      w.terminals.push(panel);
       this._showEventBanner("SYSTEM LOCKDOWN - FIND OVERRIDE PANEL", "#ff6c5a", 3.2);
       this._setHint("SYSTEM FAILURE — reach panel and hold E to repair.", "#ff8f6b", 3.0);
       return true;
@@ -3892,6 +5108,49 @@
       if (p.role === "technician") r += 30;
       return r;
     },
+    _distSqPointToRect(px, py, r) {
+      const nx = clamp(px, r.x, r.x + r.w);
+      const ny = clamp(py, r.y, r.y + r.h);
+      const dx = px - nx, dy = py - ny;
+      return dx * dx + dy * dy;
+    },
+    /** Nearest sabotage coupling: terminal, door wall, or security camera (all within radius). */
+    _probeSabotageTarget() {
+      const p = this.player, w = this.world;
+      if (!p || !w) return null;
+      const R = 238;
+      const R2 = R * R;
+      let best = null;
+      let bestD2 = 1e15;
+      const tryBest = (d2, pri, payload) => {
+        if (d2 > R2) return;
+        if (!best || d2 < bestD2 - 2 || (Math.abs(d2 - bestD2) <= 2 && pri < best.pri)) {
+          bestD2 = d2;
+          best = Object.assign({ d2, pri }, payload);
+        }
+      };
+      const terms = w.terminals || [];
+      for (let i = 0; i < terms.length; i++) {
+        const t = terms[i];
+        if (TerminalState.isCompleted(t)) continue;
+        const cx = t.x + t.w * 0.5, cy = t.y + t.h * 0.5;
+        const dx = p.x - cx, dy = p.y - cy;
+        tryBest(dx * dx + dy * dy, 0, { kind: "terminal", terminal: t });
+      }
+      const walls = w.wallsAll || [];
+      for (let wi = 0; wi < walls.length; wi++) {
+        const W = walls[wi];
+        if (!W || !W.door || !W.id) continue;
+        tryBest(this._distSqPointToRect(p.x, p.y, W), 1, { kind: "door", wall: W, doorId: W.id });
+      }
+      const cams = w.cameras || [];
+      for (let ci = 0; ci < cams.length; ci++) {
+        const c = cams[ci];
+        const dx = p.x - c.x, dy = p.y - c.y;
+        tryBest(dx * dx + dy * dy, 2, { kind: "camera", camera: c, camIndex: ci });
+      }
+      return best;
+    },
     _nearestTerminalInRange() {
       const p = this.player;
       const w = this.world;
@@ -3900,6 +5159,8 @@
       const maxD2 = maxD * maxD;
       let nearest = null, nearestD2 = Infinity;
       for (const t of w.terminals) {
+        TerminalState.ensure(t);
+        if (t.state === TerminalState.COMPLETED) continue;
         const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
         const dx = p.x - cx, dy = p.y - cy;
         const d2 = dx * dx + dy * dy;
@@ -3920,8 +5181,10 @@
     },
     _beginRepairPanel(panel) {
       if (!panel || panel.kind !== "repair_panel") return;
+      if (TerminalState.isCompleted(panel)) return;
       if (this.activeRepair && this.activeRepair.terminalId === panel.id) return;
       SFX.ensure();
+      TerminalState.set(panel, TerminalState.IN_PROGRESS);
       this.activeRepair = {
         terminalId: panel.id,
         holdSec: 0,
@@ -3931,8 +5194,13 @@
       };
       this._setHint("Hold E to reconnect circuit.", "#8ff1ff", 1.8);
     },
-    _failRepairPenalty() {
+    _failRepairPenalty(terminalId) {
       const w = this.world;
+      const rid = terminalId != null ? terminalId : (this.activeRepair && this.activeRepair.terminalId);
+      if (w && rid) {
+        const pt = (w.terminals || []).find(tt => tt.id === rid);
+        if (pt) TerminalState.set(pt, TerminalState.INACTIVE);
+      }
       if (!w) return;
       SFX.play("hack_fail");
       w.alarm = clamp((w.alarm || 0) + 9, 0, 100);
@@ -3972,8 +5240,9 @@
       if (!probe.ok) {
         rp.holdSec = Math.max(0, rp.holdSec - dt * 1.8);
         if (rp.elapsedSec >= rp.failAfterSec) {
+          const tid = rp.terminalId;
           this.activeRepair = null;
-          this._failRepairPenalty();
+          this._failRepairPenalty(tid);
         }
         return;
       }
@@ -3986,8 +5255,9 @@
         this._completeRepairPanel(probe.t);
         this.activeRepair = null;
       } else if (rp.elapsedSec >= rp.failAfterSec) {
+        const tid = rp.terminalId;
         this.activeRepair = null;
-        this._failRepairPenalty();
+        this._failRepairPenalty(tid);
       }
     },
     _nearestTalkNpc() {
@@ -4010,13 +5280,6 @@
       this.npcDialogueAwaitingChoice = false;
       this.npcDialogueNPC = null;
     },
-    _npcChoiceSet() {
-      return [
-        { id: 1, text: "Just doing maintenance." },
-        { id: 2, text: "Seen anything suspicious?" },
-        { id: 3, text: "Stay out of my way." }
-      ];
-    },
     _npcIdentitySeed(npc, idx) {
       const wid = (this.world && this.world.def && this.world.def.id) || 0;
       const sx = Math.round((npc && npc.x) || 0);
@@ -4024,88 +5287,177 @@
       const base = "m" + wid + "|n" + idx + "|" + sx + "|" + sy + "|" + (npc && npc.role || "worker");
       return hashString32(base);
     },
-    _buildNpcIdentity(npc, idx) {
-      const seed = this._npcIdentitySeed(npc, idx);
+    _buildNpcIdentity(npc, idx, nameSalt) {
+      const seed = (this._npcIdentitySeed(npc, idx) ^ (((nameSalt | 0) & 0xffff) * 0x9e3779b1)) >>> 0;
       const rng = mulberry32(seed >>> 0);
       const unitTags = ["K-47", "Node-9", "SYS-Delta", "Luma", "VX-31", "Rook-12", "Axiom-7", "Nyx-04", "Patch-88", "Drift-5"];
       const callsigns = ["Kara", "Nemo", "Dax", "Luma", "Hex", "Mira", "Zero", "Nyra", "Flux", "Iris"];
       const personalities = ["nervous", "friendly", "sarcastic", "strict", "glitchy"];
-      const p = personalities[Math.floor(rng() * personalities.length)] || "strict";
+      let p = personalities[Math.floor(rng() * personalities.length)] || "strict";
+      if (npc.npcKind === "informant") p = rng() > 0.55 ? "friendly" : (rng() > 0.5 ? "sarcastic" : "glitchy");
+      else if (npc.npcKind === "suspicious") p = rng() > 0.4 ? "strict" : (rng() > 0.55 ? "nervous" : "sarcastic");
+      else if (npc.npcKind === "worker" && npc.behavior === "ignore") p = rng() > 0.45 ? "sarcastic" : "friendly";
       const tA = unitTags[Math.floor(rng() * unitTags.length)] || "CPU-" + (100 + idx);
       const tB = callsigns[Math.floor(rng() * callsigns.length)] || ("Unit" + (idx + 1));
       const kindLabel = (npc.role === "security") ? "Unit" : "Worker Unit";
       const cpuName = kindLabel + " " + tA + ' "' + tB + '"';
       const localZone = ["north conduit", "east lane", "service spine", "relay mezz", "coolant walk"][Math.floor(rng() * 5)];
-      const lore = STORY_BEATS[(this.world && this.world.def && this.world.def.id) || 0] || [];
-      const loreLine = lore.length ? lore[(idx + (this.world && this.world.flags && this.world.flags.loreIndex || 0)) % lore.length] : "";
       const profiles = {
         nervous: {
-          opener: "Wh-what? Keep it short. Sensors are twitchy.",
-          r1: "Maintenance? Fine. Stay off my feed in the " + localZone + ".",
-          r2: "Suspicious? Yeah. Patrols doubled near the relay backbone. " + loreLine,
-          r3: "No threats, please. I trigger alarms when people posture."
+          opener: "Wh-what? Keep it short. Sensors are twitchy in the " + localZone + "."
         },
         friendly: {
-          opener: "Hey. You need something? I can help.",
-          r1: "Maintenance checks out. Cut through " + localZone + " to avoid cameras.",
-          r2: "Yep - security keeps looping the same lane. Good gap opens every few seconds. " + loreLine,
-          r3: "Easy there. We both want to leave with all our parts."
+          opener: "Hey. You need something? I can help — especially around " + localZone + "."
         },
         sarcastic: {
-          opener: "Oh good, another hero in a maintenance vest.",
-          r1: "Sure, 'maintenance.' Try not to explode the " + localZone + " this time.",
-          r2: "Suspicious? Only everything. Guards panic, then pretend it was planned. " + loreLine,
-          r3: "Bold line. Let me file that under 'bad ideas.'"
+          opener: "Oh good, another hero in a maintenance vest near " + localZone + "."
         },
         strict: {
-          opener: "Identify purpose. Keep to authorized paths.",
-          r1: "Maintenance personnel do not loiter. Move through " + localZone + " and proceed.",
-          r2: "Security note: high attention around relay approaches. Stay compliant. " + loreLine,
-          r3: "Threat language recorded. Continue and expect scrutiny."
+          opener: "Identify purpose. Keep to authorized paths through " + localZone + "."
         },
         glitchy: {
-          opener: "ha-hello // token mismatch // continue?",
-          r1: "maint..maintenance accepted(?) route: " + localZone + " // do-not-trip.",
-          r2: "sus-picious feed: red pings near relay cluster // pattern repeats. " + loreLine,
-          r3: "stay // out // of-my-way? parsing... denied."
+          opener: "ha-hello // token mismatch // " + localZone + " // continue?"
         }
       };
       const pr = profiles[p] || profiles.strict;
       return {
         cpuName,
         personality: p,
-        responses: { 1: pr.r1, 2: pr.r2, 3: pr.r3 },
         opener: pr.opener
       };
     },
     _assignNpcIdentities() {
       const w = this.world;
       if (!w || !w.npcs || !w.npcs.length) return;
+      const usedNames = new Set();
       for (let i = 0; i < w.npcs.length; i++) {
         const n = w.npcs[i];
-        const id = this._buildNpcIdentity(n, i);
+        let id = null;
+        for (let salt = 0; salt < 40; salt++) {
+          id = this._buildNpcIdentity(n, i, salt);
+          if (!usedNames.has(id.cpuName)) break;
+        }
+        if (usedNames.has(id.cpuName)) {
+          id = Object.assign({}, id, { cpuName: id.cpuName.replace(/"$/, " ·" + (i + 1) + '"') });
+        }
+        usedNames.add(id.cpuName);
         n.cpuName = id.cpuName;
         n.personality = id.personality;
         n.dialogueProfile = id;
+        n.npcGameplayRole = NpcRoleSystem.computeRole(n);
       }
     },
     _openNpcChoiceDialogue(npc) {
+      npc._npcDialogueGen = ((npc._npcDialogueGen | 0) + 1) >>> 0;
       const fallbackSpeaker = (npc.npcKind === "informant") ? "Informant CPU" : (npc.npcKind === "suspicious" ? "Security CPU" : "Worker CPU");
-      const profile = npc.dialogueProfile || this._buildNpcIdentity(npc, 0);
+      const profile = npc.dialogueProfile || this._buildNpcIdentity(npc, 0, 0);
       this.npcDialogueSpeaker = npc.cpuName || profile.cpuName || fallbackSpeaker;
       this.npcDialogueText = profile.opener || "State your business.";
       this.npcDialogueUntil = performance.now() + 7000;
-      this.npcDialogueChoices = this._npcChoiceSet();
+      this.npcDialogueChoices = NpcDialogueEngine.buildChoices(npc, NpcDialogueEngine.rngForSession(npc));
       this.npcDialogueAwaitingChoice = true;
       this.npcDialogueNPC = npc;
+      if (npc.npcGameplayRole === "helpful") NpcRoleSystem.tryGrantHelpfulOpen(npc, this);
+      this._maybeInjectFavorChoice(npc);
+    },
+    _maybeInjectFavorChoice(npc) {
+      this._favorChoiceSpecById = {};
+      const w = this.world;
+      if (!w || !npc || this.npcFavor || this.phase !== "playing" || this.mode !== "play") return;
+      if ((w.flags.npcFavorDoneCount || 0) >= 2) return;
+      const role = npc.npcGameplayRole || NpcRoleSystem.computeRole(npc);
+      if (role === "hostile") return;
+      const now = performance.now();
+      if ((npc._favorOfferCd || 0) > now) return;
+      const spec = NpcFavorSystem.propose(w, npc, this.player);
+      if (!spec) return;
+      const rng = mulberry32((hashString32((npc.cpuName || "f") + "|offer") ^ (w.def && w.def.id | 0)) >>> 0);
+      if (rng() > 0.4) return;
+      const ch = this.npcDialogueChoices;
+      if (!ch || !ch.length) return;
+      const slot = (rng() * ch.length) | 0;
+      const origId = ch[slot].id;
+      ch[slot] = { id: origId, text: spec.offerText, category: "friendly", meta: "npc_favor" };
+      this._favorChoiceSpecById = this._favorChoiceSpecById || {};
+      this._favorChoiceSpecById[origId] = spec;
+    },
+    _startNpcFavor(spec, giverNpc) {
+      const w = this.world;
+      if (!w || !spec || !giverNpc || this.npcFavor) return false;
+      const idx = (w.npcs || []).indexOf(giverNpc);
+      this.npcFavor = Object.assign({}, spec, {
+        hold: 0,
+        done: false,
+        giverNpcIndex: idx >= 0 ? idx : 0,
+        giverCpu: giverNpc.cpuName || "Contact"
+      });
+      const tag = spec.type === "linger_npc" ? "handshake" : spec.type === "extraction_ping" ? "tile ping" : "junction check";
+      this._setHint("Side favor (" + tag + ") — optional. Skip anytime.", "#a8e0ff", 2.6);
+      return true;
+    },
+    _completeNpcFavor() {
+      const f = this.npcFavor;
+      const w = this.world;
+      const p = this.player;
+      if (!f || f.done) return;
+      f.done = true;
+      this.npcFavor = null;
+      if (p) p.suspicion = Math.max(0, (p.suspicion || 0) - 5.0);
+      if (w) {
+        w.flags.npcFavorDoneCount = (w.flags.npcFavorDoneCount || 0) + 1;
+        const ng = (w.npcs || [])[f.giverNpcIndex | 0];
+        if (ng) {
+          w.flags.guardInvestigate = { x: ng.x + 95, y: ng.y - 20, until: performance.now() + 8200 };
+        }
+        const intel = NpcRoleSystem.buildTacticalHint(w, p);
+        const tail = intel ? (" Intel: " + intel) : " Trace eased.";
+        this._setHint("Favor complete." + tail, "#b8ffd8", 3.6);
+      }
+      SFX.play("hack_ok");
+    },
+    _updateNpcFavor(dt) {
+      const f = this.npcFavor;
+      const w = this.world;
+      const p = this.player;
+      if (!f || f.done || !p || !w || this.phase !== "playing" || this.mode !== "play") return;
+      f.ttl = (f.ttl != null ? f.ttl : 55) - dt;
+      if (f.ttl <= 0) {
+        this.npcFavor = null;
+        this._setHint("Favor window closed — no penalty.", "#9ab0c8", 1.9);
+        return;
+      }
+      const spd = p.getSpeed01();
+      if (f.type === "linger_npc") {
+        const ng = (w.npcs || [])[f.giverNpcIndex | 0];
+        if (!ng) {
+          this.npcFavor = null;
+          return;
+        }
+        const d = Math.hypot(p.x - ng.x, p.y - ng.y);
+        if (d < (f.radius || 120) && spd < 0.38) f.hold = (f.hold || 0) + dt;
+        else f.hold = Math.max(0, (f.hold || 0) - dt * 0.75);
+        if (f.hold >= (f.needHold || 1.95)) this._completeNpcFavor();
+      } else if (f.type === "extraction_ping") {
+        const ex = w.extraction;
+        if (!ex) {
+          this.npcFavor = null;
+          return;
+        }
+        const inZ = p.x >= ex.x - 18 && p.x <= ex.x + ex.w + 18 && p.y >= ex.y - 18 && p.y <= ex.y + ex.h + 18;
+        if (inZ && spd < 0.34) f.hold = (f.hold || 0) + dt;
+        else f.hold = Math.max(0, (f.hold || 0) - dt * 0.55);
+        if (f.hold >= (f.needHold || 1.55)) this._completeNpcFavor();
+      } else if (f.type === "visit_marker") {
+        const d = Math.hypot(p.x - (f.tx || 0), p.y - (f.ty || 0));
+        if (d < (f.needNear || 76) && spd < 0.42) f.hold = (f.hold || 0) + dt;
+        else f.hold = Math.max(0, (f.hold || 0) - dt * 0.9);
+        if (f.hold >= (f.holdSec || 1.2)) this._completeNpcFavor();
+      }
     },
     _resolveNpcChoice(npc, choiceId) {
-      const profile = npc.dialogueProfile || this._buildNpcIdentity(npc, 0);
-      let text = (profile.responses && profile.responses[choiceId]) || "Move along.";
-      let suspiciousDelta = 0;
-      if (choiceId === 3) suspiciousDelta = npc.personality === "strict" ? 6 : (npc.personality === "sarcastic" ? 4.5 : 3);
-      else if (choiceId === 1 && npc.personality === "nervous") suspiciousDelta = 1.2;
-      return { speaker: (npc.cpuName || this.npcDialogueSpeaker || "CPU"), text, suspiciousDelta };
+      const choice = (this.npcDialogueChoices || []).find(c => c.id === choiceId);
+      const out = NpcDialogueEngine.resolveReply(npc, choice || { category: "neutral", text: "" });
+      return { speaker: (npc.cpuName || this.npcDialogueSpeaker || "CPU"), text: out.text, suspiciousDelta: out.suspiciousDelta };
     },
     selectNpcDialogueChoice(choiceId) {
       if (!this.npcDialogueAwaitingChoice || !this.npcDialogueNPC) return;
@@ -4116,13 +5468,46 @@
         return;
       }
       const npc = this.npcDialogueNPC;
+      const choiceObj = (this.npcDialogueChoices || []).find(c => c.id === choiceId);
+      if (choiceObj && choiceObj.meta === "npc_favor") {
+        const spec = this._favorChoiceSpecById && this._favorChoiceSpecById[choiceId];
+        if (spec && !this.npcFavor) {
+          this._showNPCDialogue(npc.cpuName || "CPU", "Solid — quick and quiet.", 2600);
+          SFX.play("npc_talk");
+          this._startNpcFavor(spec, npc);
+          npc._favorOfferCd = performance.now() + 70000;
+        } else {
+          this._showNPCDialogue(npc.cpuName || "CPU", "Another time — I cannot run that favor right now.", 2200);
+          SFX.play("npc_talk");
+        }
+        if (this._favorChoiceSpecById) delete this._favorChoiceSpecById[choiceId];
+        this.npcDialogueAwaitingChoice = false;
+        this.npcDialogueChoices = [];
+        this.npcDialogueNPC = null;
+        return;
+      }
       const out = this._resolveNpcChoice(npc, choiceId);
       this._showNPCDialogue(out.speaker, out.text, 3200);
       SFX.play("npc_talk");
-      if (out.suspiciousDelta && this.player) {
+      if (this.player && typeof out.suspiciousDelta === "number" && !Number.isNaN(out.suspiciousDelta)) {
         this.player.suspicion = clamp((this.player.suspicion || 0) + out.suspiciousDelta, 0, 100);
       }
-      if (choiceId === 2 && npc.npcKind === "worker") {
+      const gRole = npc.npcGameplayRole || NpcRoleSystem.computeRole(npc);
+      if (gRole === "helpful" && choiceObj) {
+        const cat = choiceObj.category;
+        if (cat === "friendly" || cat === "casual" || cat === "neutral") {
+          this.player.suspicion = clamp((this.player.suspicion || 0) - 1.6, 0, 100);
+        }
+      }
+      if (choiceObj && this.world) {
+        NpcBonusSystem.tryGrantFromPositiveChat(this.world, this, npc, choiceObj);
+      }
+      if (gRole === "hostile" && choiceObj && (choiceObj.category === "aggressive" || choiceObj.category === "suspicious") && this.world) {
+        this.world.alarm = clamp((this.world.alarm || 0) + 2.4, 0, 100);
+        this.world.exposure = clamp((this.world.exposure || 0) + 1.4, 0, 100);
+        npc._hostileDialogPrimedUntil = performance.now() + 11000;
+      }
+      if (choiceObj && choiceObj.meta === "worker_intel" && npc.npcKind === "worker") {
         this._assignWorkerTask();
       }
     },
@@ -4155,7 +5540,7 @@
       const lore = STORY_BEATS[(w && w.def && w.def.id) || 0] || [];
       const loreLine = lore.length ? lore[((w.flags.loreIndex || 0) % lore.length)] : "";
       if (kind === "informant") {
-        const terminals = (w && w.terminals) ? w.terminals.filter(t => t.kind === "primary" && !w.hackedTerminals[t.id]) : [];
+        const terminals = (w && w.terminals) ? w.terminals.filter(t => t.kind === "primary" && !TerminalState.isCompleted(t) && !w.hackedTerminals[t.id]) : [];
         const relayHint = terminals.length ? ("Next live relay: " + terminals[0].label + ".") : "No live relays left. Move to extraction.";
         const guardHint = (w && w.guards && w.guards.length > 4)
           ? "Heavy patrol overlap in central lanes."
@@ -4294,6 +5679,7 @@
       });
     },
     recoverToGameplay(reason) {
+      const pendingId = this.pendingTerminal && this.pendingTerminal.id;
       this._dbgLog("recoverToGameplay()", {
         reason,
         phase: this.phase,
@@ -4319,6 +5705,10 @@
       this.queueState(STATES.CAMPAIGN);
       forceExitHacking();
       this.syncStateFromPhase();
+      if (pendingId && this.world) {
+        const tt = (this.world.terminals || []).find(x => x.id === pendingId);
+        if (tt && tt.state === TerminalState.IN_PROGRESS) TerminalState.set(tt, TerminalState.INACTIVE);
+      }
     },
     validateRuntimeState(now) {
       if (this.phase !== "playing") return;
@@ -4370,6 +5760,7 @@
     },
     _startTaskForTerminal(t) {
       if (!t || !this.task) return;
+      TerminalState.set(t, TerminalState.IN_PROGRESS);
       this.mode = "task";
       const kind = t.kind;
       const type = kind === "repair_task" ? "repair_hold" : kind === "circuit_task" ? "circuit_align" : "timed_input";
@@ -4400,6 +5791,7 @@
     _onTaskFail(t) {
       const w = this.world;
       this.mode = "play";
+      if (t) TerminalState.set(t, TerminalState.INACTIVE);
       if (w) {
         w.alarm = clamp((w.alarm || 0) + 8, 0, 100);
         w.exposure = clamp((w.exposure || 0) + 5, 0, 100);
@@ -4443,7 +5835,11 @@
     handleHackPointer(mx, my, pointerSerial) {
       if (this.phase !== "playing" || this.mode !== "hack") return;
       if (!NetworkCoordinator.isAuthoritativeHost()) {
-        NetworkCoordinator.sendMissionAction({ kind: "hack_click", mx, my }, this.localPlayerId);
+        if (this.hack && this.hack.isTraceStage()) {
+          NetworkCoordinator.sendMissionAction({ kind: "hack_trace", phase: "down", mx, my, ps: pointerSerial }, this.localPlayerId);
+        } else {
+          NetworkCoordinator.sendMissionAction({ kind: "hack_click", mx, my }, this.localPlayerId);
+        }
         return;
       }
       this.hack.handleClick(mx, my, pointerSerial);
@@ -4705,6 +6101,8 @@
       this.npcDialogueAwaitingChoice = false;
       this.npcDialogueNPC = null;
       this.npcTask = null;
+      this.npcFavor = null;
+      this._favorChoiceSpecById = null;
       this.activeRepair = null;
       this.failTimer = 0;
       this.exposureMaxTimer = 0;
@@ -4714,6 +6112,9 @@
       w.missionElapsed = 0;
       w.flags.package = false;
       w.flags.sabotageCooldown = 0;
+      w.flags.lumenSapUntil = 0;
+      w.flags.terminalSabotageLocks = {};
+      w.flags.doorSabotageRevert = null;
       w.flags.redAlertTimer = null;
       w.primaryProgress = 0;
       w.primaryRequired = w.def.primaryRequired != null ? w.def.primaryRequired : 1;
@@ -4724,16 +6125,23 @@
       w.flags.hackSpeedBonus = 0;
       w.flags.uiBonusCount = 0;
       w.flags.sideRewardsGranted = {};
-      (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; });
+      w.flags.npcFavorDoneCount = 0;
+      w.flags.npcBonusGrantsThisMission = 0;
+      w.flags.npcBonusVisMulUntil = 0;
+      w.flags.npcBonusVisMul = 0;
+      w.flags.npcRelayPingUntil = 0;
+      w.flags.npcHackSnappierUntil = 0;
+      w.flags.npcHackSnappierMul = 0;
+      (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; n._npcBonusCdUntil = 0; });
+      (w.guards || []).forEach(g => { if (g) g.npcBonusBlindUntil = 0; });
       DetectionSystem.reset(w);
       MissionSystem.init(w);
       if (w.doorsOpen) Object.keys(w.doorsOpen).forEach(k => { w.doorsOpen[k] = false; });
       this.rebuildWalls();
-      w._aiColliders = (w.walls || []).concat(w.cover || []);
-      aiInvalidateNav(w);
       AuthoritativeSession.players.forEach(p => {
         p.suspicion = 0;
         p.fakeTaskTimer = 0;
+        p.sabotageFxUntil = 0;
         p.socialPulse = 0;
         p.accusedFlash = 0;
         p.reportPulse = 0;
@@ -4755,7 +6163,6 @@
     rebuildWalls() {
       const w = this.world;
       w.walls = MissionLoader.solidWalls(w);
-      w._aiColliders = (w.walls || []).concat(w.cover || []);
       aiInvalidateNav(w);
       this._worldStaticCanvas = null;
       this._worldStaticMissionKey = "";
@@ -4774,13 +6181,34 @@
         NetworkCoordinator.sendMissionAction({ kind: "fake_task" }, this.localPlayerId);
         return;
       }
-      const p = this.player, tlist = this.world.terminals;
-      let near = false;
-      for (const t of tlist) {
+      const p = this.player, w = this.world, tlist = w.terminals || [];
+      const maxD = this._interactionRadiusForPlayer(p);
+      const maxD2 = maxD * maxD;
+      let nearTerminal = false;
+      for (let i = 0; i < tlist.length; i++) {
+        const t = tlist[i];
+        if (TerminalState.isCompleted(t)) continue;
         const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
-        if (Math.hypot(p.x - cx, p.y - cy) < 210) { near = true; break; }
+        const dx = p.x - cx, dy = p.y - cy;
+        if (dx * dx + dy * dy <= maxD2) { nearTerminal = true; break; }
       }
-      if (near) p.fakeTaskTimer = 3.2;
+      let nearNpc = false;
+      const npcs = w.npcs || [];
+      for (let ni = 0; ni < npcs.length; ni++) {
+        if (Math.hypot(p.x - npcs[ni].x, p.y - npcs[ni].y) < 158) { nearNpc = true; break; }
+      }
+      if (nearTerminal) {
+        p.fakeTaskTimer = 5.2;
+        SFX.play("ui_click");
+        this._setHint("Feigning routine maintenance at console…", "#a8e8ff", 2.2);
+      } else if (nearNpc) {
+        p.fakeTaskTimer = 2.8;
+        SFX.play("npc_talk");
+        this._setHint("Blending in with nearby crew…", "#9fd7e8", 2.0);
+      } else {
+        SFX.play("interact_fail");
+        this._setHint("Move closer to a terminal or NPC to feign work.", "#9bb0cc", 2.3);
+      }
     },
     trySabotage() {
       if (this.phase !== "playing" || this.mode !== "play" || this.paused || !this.world || !this.player) return;
@@ -4788,31 +6216,46 @@
         NetworkCoordinator.sendMissionAction({ kind: "sabotage" }, this.localPlayerId);
         return;
       }
-      if (this.player.role !== "saboteur") return;
-      const now = performance.now();
-      const cd = 13800;
-      if (this.world.flags.sabotageCooldown > now) return;
-      const w = this.world;
-      let nearest = 1e9;
-      for (let gi = 0; gi < w.guards.length; gi++) {
-        const d = Math.hypot(w.guards[gi].x - this.player.x, w.guards[gi].y - this.player.y);
-        if (d < nearest) nearest = d;
+      const w = this.world, p = this.player, now = performance.now();
+      const cd = p.role === "saboteur" ? 15000 : 17000;
+      if ((w.flags.sabotageCooldown || 0) > now) {
+        this._setHint("Sabotage kit recalibrating…", "#aabbcc", 1.5);
+        SFX.play("interact_fail");
+        return;
       }
-      const subtle = nearest > 400;
+      const hit = this._probeSabotageTarget();
+      const R2 = 238 * 238;
+      if (!hit || hit.d2 > R2) {
+        SFX.play("interact_fail");
+        this._setHint("No systems in range — move to a door, console, or light rig.", "#9bb0cc", 2.4);
+        return;
+      }
+      w.flags.terminalSabotageLocks = w.flags.terminalSabotageLocks || {};
+      const durM = p.role === "saboteur" ? 1.12 : 1;
+      if (hit.kind === "terminal") {
+        w.flags.terminalSabotageLocks[hit.terminal.id] = now + 6400 * durM;
+        this._setHint("Console jammed — power cycling.", "#ffd38a", 2.1);
+      } else if (hit.kind === "door") {
+        const id = hit.doorId;
+        if (w.flags.doorSabotageRevert && w.flags.doorSabotageRevert.id === id) {
+          const prev = w.flags.doorSabotageRevert;
+          w.doorsOpen[prev.id] = !!prev.restoreOpen;
+          w.flags.doorSabotageRevert = null;
+        }
+        const wasOpen = !!w.doorsOpen[id];
+        w.doorsOpen[id] = !wasOpen;
+        w.flags.doorSabotageRevert = { id, restoreOpen: wasOpen, until: now + 5200 * durM };
+        this.rebuildWalls();
+        this._setHint(wasOpen ? "Door slammed — forced re-lock." : "Mag-strike — bulkhead briefly opened.", "#ffcc8a", 2.15);
+      } else {
+        w.flags.lumenSapUntil = now + 8200 * durM;
+        this._setHint("Fixture tapped — local lights sapped.", "#cfe8ff", 2.05);
+      }
       w.flags.sabotageCooldown = now + cd;
-      const k = this._sabIdx || 0;
-      this._sabIdx = (k + 1) % 3;
-      const guardBump = subtle ? 7 : 15;
-      const alarmFake = subtle ? 22 : 42;
-      if (k === 0) w.flags.blackoutUntil = now + 7000;
-      else if (k === 1) w.flags.cameraJamUntil = now + 9000;
-      else {
-        w.flags.fakeAlarmUntil = now + 5000;
-        w.alarm = clamp(w.alarm + alarmFake, 0, 100);
-      }
-      w.exposure = clamp((w.exposure || 0) + guardBump * 0.45, 0, 100);
-      this.player.suspicion = clamp(this.player.suspicion + (subtle ? 2.5 : 9), 0, 100);
-      NetworkManager.pushAlert(k === 0 ? "blackout" : k === 1 ? "camera_jam" : "fake_alarm", this.player.x, this.player.y);
+      w.alarm = clamp((w.alarm || 0) + (hit.kind === "door" ? 3.5 : 2.2), 0, 100);
+      p.sabotageFxUntil = now + 620;
+      NetworkManager.pushAlert("trace_noise", p.x, p.y);
+      SFX.play("alarm_ping");
     },
 
     tryInvestigate() {
@@ -4883,10 +6326,15 @@
       const probe = this._nearestTerminalInRange();
       if (probe.terminal) {
         const t = probe.terminal;
-        if ((t.kind === "primary" && this.world.hackedTerminals && this.world.hackedTerminals[t.id]) ||
-            (t.kind === "cameras" && this.world.camerasDisabled)) {
+        if (TerminalState.isCompleted(t)) {
           this._setHint("Node already completed.", "#8fdfff", 1.8);
           SFX.play("ui_click");
+          return true;
+        }
+        const locks = this.world.flags.terminalSabotageLocks;
+        if (locks && locks[t.id] > performance.now()) {
+          this._setHint("Console locked — sabotage cycling power…", "#ffcc88", 2.0);
+          SFX.play("interact_fail");
           return true;
         }
         if (probe.terminal.kind === "repair_panel") {
@@ -4945,6 +6393,7 @@
     _configureHackForPendingTerminal(applyNow) {
       const w = this.world, t = this.pendingTerminal;
       if (!w || !t) return null;
+      if (TerminalState.isCompleted(t)) return null;
       const shouldApply = applyNow !== false;
       const relays = (w.terminals || []).filter(tt => tt.kind === "primary");
       const relayIndex = Math.max(0, relays.findIndex(tt => tt.id === t.id));
@@ -4956,6 +6405,7 @@
       let spec = null;
       while (tries < 7) {
         spec = HackEngine.buildRelaySpec({
+          missionId: (w.def && w.def.id) != null ? (w.def.id | 0) : 1,
           missionSeed: ((w.def && w.def.rngSeed) || 0) >>> 0,
           sessionSeed: (((NetworkManager && NetworkManager.sessionSeed) || 0) ^ (w.worldW << 3) ^ (w.worldH << 7)) >>> 0,
           relayIndex,
@@ -4971,6 +6421,10 @@
       if (spec && w.flags && w.flags.hackSpeedBonus > 0) {
         const factor = clamp(1 - w.flags.hackSpeedBonus, 0.72, 1);
         spec.stages = spec.stages.map(st => Object.assign({}, st, { durationSec: (st.durationSec || 7) * factor }));
+      }
+      if (spec && w.flags && performance.now() < (w.flags.npcHackSnappierUntil || 0)) {
+        const sn = clamp(w.flags.npcHackSnappierMul || 0.93, 0.88, 0.98);
+        spec.stages = spec.stages.map(st => Object.assign({}, st, { durationSec: (st.durationSec || 7) * sn }));
       }
       if (spec) {
         w._hackSignatures[t.id] = spec.signature;
@@ -5023,6 +6477,7 @@
             return;
           }
           this._pendingHackSpec = null;
+          if (this.pendingTerminal) TerminalState.set(this.pendingTerminal, TerminalState.IN_PROGRESS);
           InputManager.enterHackingMode();
           this._dbgWatchStart("hack-session-active", 2500, { terminalId });
           this.emitEvent("onHackStart", {
@@ -5036,6 +6491,8 @@
       }
       if (this.mode === "hack") {
         if (!this.hackingSession || !this.hackingSession.hacking || !this.hack.active) {
+          const ht = this.pendingTerminal;
+          if (ht && ht.state === TerminalState.IN_PROGRESS) TerminalState.set(ht, TerminalState.INACTIVE);
           // Never allow dead-end hack mode: force transition back to gameplay.
           this.mode = "play";
           this.currentState = STATES.CAMPAIGN;
@@ -5050,11 +6507,13 @@
       if (!NetworkCoordinator.isAuthoritativeHost()) {
         this._remoteClientFrame(dt);
         this._updateNpcTask(dt);
+        this._updateNpcFavor(dt);
         this._updateRepair(dt);
         return;
       }
       SimulationRunner.runMissionTick(dt, this);
       this._updateNpcTask(dt);
+      this._updateNpcFavor(dt);
       this._updateRepair(dt);
     },
 
@@ -5201,27 +6660,37 @@
       const maxD = this._interactionRadiusForPlayer(p);
       const maxD2 = maxD * maxD;
       w.terminals.forEach(t => {
-        const done = (t.kind==="primary" && !!w.hackedTerminals[t.id]) || (t.kind==="cameras" && w.camerasDisabled);
+        TerminalState.ensure(t);
+        const done = TerminalState.isCompleted(t);
+        const inProg = TerminalState.isInProgress(t);
         const tx = t.x + t.w * 0.5, ty = t.y + t.h * 0.5;
         const dx = p ? (p.x - tx) : 0;
         const dy = p ? (p.y - ty) : 0;
         const inRange = !!(p && this.mode === "play" && (dx * dx + dy * dy) <= maxD2);
-        const gc = done ? "#5cff9c" : (inRange ? "#6dffef" : "#00ffcc");
-        Renderer.withGlow(ctx, gc, done ? 8 : 18, () => { ctx.fillStyle=done?"#0b1d16":"#0e1218"; ctx.fillRect(t.x,t.y,t.w,t.h); });
-        ctx.strokeStyle = done ? "rgba(92,255,156,0.98)" : (inRange ? "rgba(130,255,240,0.98)" : "rgba(0,255,220,0.65)");
-        ctx.lineWidth = done ? 2.8 : (inRange ? 2.6 : 1.5);
+        const gc = done ? "#5cff9c" : inProg ? "#ffcc66" : (inRange ? "#6dffef" : "#00ffcc");
+        Renderer.withGlow(ctx, gc, done ? 8 : (inProg ? 12 : 18), () => {
+          ctx.fillStyle = done ? "rgba(8,22,14,0.92)" : inProg ? "rgba(28,22,8,0.9)" : "#0e1218";
+          ctx.fillRect(t.x, t.y, t.w, t.h);
+        });
+        ctx.strokeStyle = done ? "rgba(92,255,156,0.98)" : inProg ? "rgba(255,200,100,0.95)" : (inRange ? "rgba(130,255,240,0.98)" : "rgba(0,255,220,0.65)");
+        ctx.lineWidth = done ? 2.8 : inProg ? 2.4 : (inRange ? 2.6 : 1.5);
         ctx.shadowColor = gc;
-        ctx.shadowBlur = done ? 10 : (inRange ? 20 : 12);
+        ctx.shadowBlur = done ? 10 : inProg ? 14 : (inRange ? 20 : 12);
         ctx.strokeRect(t.x,t.y,t.w,t.h);
         ctx.shadowBlur = 0;
-        ctx.fillStyle = done ? "#b7ffd5" : "#cceeff";
+        ctx.fillStyle = done ? "#b7ffd5" : inProg ? "#ffe8c0" : "#cceeff";
         ctx.font="10px monospace";
         ctx.fillText(t.label, t.x+6, t.y+16);
-        if (inRange && !done) {
+        if (inRange && !done && !inProg) {
           ctx.fillStyle = "rgba(180,255,244,0.95)";
           ctx.font = "9px monospace";
           const lab = t.kind === "repair_panel" ? "HOLD [E] REPAIR" : "IN RANGE [E]";
           ctx.fillText(lab, t.x + 6, t.y + t.h - 6);
+        }
+        if (inProg && !done) {
+          ctx.fillStyle = "rgba(255,220,160,0.95)";
+          ctx.font = "bold 8px monospace";
+          ctx.fillText("ACTIVE", t.x + 6, t.y + t.h - 6);
         }
         if (done) {
           const badgeW = 42, badgeH = 12;
@@ -5438,6 +6907,8 @@
     },
 
     drawPostFX() {
+      const wfx = this.world;
+      const lum = wfx && wfx.flags && wfx.flags.lumenSapUntil && performance.now() < wfx.flags.lumenSapUntil;
       const t = performance.now() * 0.001;
       const ep = VisualJuice.exposurePulse;
       ctx.save();
@@ -5469,6 +6940,16 @@
       ctx.fillStyle = "rgba(0,255,240," + (0.03 + ep * 0.04) + ")";
       ctx.fillRect(0, 0, VIEW_W, VIEW_H);
       ctx.globalCompositeOperation = "source-over";
+      if (lum) {
+        ctx.fillStyle = "rgba(0,0,0,0.22)";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        ctx.fillStyle = "rgba(255,220,160,0.04)";
+        ctx.fillRect(0, 0, VIEW_W, VIEW_H * 0.35);
+        ctx.fillStyle = "rgba(180,255,255,0.06)";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("LOCAL LIGHTS SAPPED", 14, VIEW_H - 62);
+      }
       ctx.restore();
     },
 
@@ -5572,7 +7053,7 @@
         ly += 13;
       });
       ctx.fillStyle="#678"; ctx.font="8px monospace";
-      ctx.fillText("WASD · Shift (blend or sprint) · E hack · Q talk · F fake task · G sabotage · Esc", 24, hudH - 8);
+      ctx.fillText("WASD · Shift · E hack · Q talk · F faux work (near crew/console) · G sabotage (near door/console/cam) · Esc", 24, hudH - 8);
       if (coop) {
         const other = AuthoritativeSession.players.find(pl => pl !== p);
         if (other) {
@@ -5592,6 +7073,15 @@
         ctx.font = "9px monospace";
         const pct = Math.round((this.npcTask.progressSec / this.npcTask.targetSec) * 100);
         ctx.fillText("NPC TASK: " + this.npcTask.label + " (" + pct + "%)", 24, hudH - 36);
+      }
+      if (this.npcFavor && !this.npcFavor.done) {
+        const f = this.npcFavor;
+        const lab = f.type === "linger_npc" ? "Linger near contact" : f.type === "extraction_ping" ? "Ping extraction tile" : "Mark junction";
+        const need = f.type === "linger_npc" ? (f.needHold || 1.95) : f.type === "extraction_ping" ? (f.needHold || 1.55) : (f.holdSec || 1.2);
+        const pct = Math.min(100, Math.round(((f.hold || 0) / need) * 100));
+        ctx.fillStyle = "#d4c4ff";
+        ctx.font = "9px monospace";
+        ctx.fillText("FAVOR (opt): " + lab + " " + pct + "% · " + Math.max(0, Math.ceil(f.ttl || 0)) + "s", 24, hudH - (this.npcTask && !this.npcTask.done ? 52 : 36));
       }
       const npcDialogActive = this.mode === "play" && this.phase === "playing" && this.npcDialogueText && performance.now() < this.npcDialogueUntil;
       if (!npcDialogActive && this.npcDialogueAwaitingChoice) {
@@ -6014,6 +7504,9 @@
     ProgressionController,
     AISystem,
     HackEngine,
+    NpcRoleSystem,
+    NpcFavorSystem,
+    NpcBonusSystem,
     ServerAuthorityFactory,
     ServerAuthority,
     LocalRoomService
@@ -6039,6 +7532,17 @@
       else if (k === "interact") GameStateManager.tryInteract();
       else if (k === "hack_click" && payload.mx != null && payload.my != null) {
         GameStateManager.handleHackPointer(payload.mx, payload.my, 1);
+      } else if (k === "hack_trace") {
+        const hk = GameStateManager.hack;
+        if (!hk || !hk.isTraceStage()) return;
+        const ph = payload && payload.phase;
+        if (ph === "down" && payload.mx != null && payload.my != null) {
+          hk.onTracePointerDown(payload.mx, payload.my, payload.ps != null ? payload.ps : 0);
+        } else if (ph === "up") {
+          hk.onTracePointerUp();
+        } else if (ph === "move" && payload.mx != null && payload.my != null && hk.tracePointerDown) {
+          hk._traceApplyPointer(payload.mx, payload.my);
+        }
       }
     } finally {
       GameStateManager.localPlayerId = prevSlot;

@@ -11,7 +11,7 @@ import { WebSocketServer } from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
-const HTML_PATH = path.join(ROOT, "neural-heist.html");
+const HTML_PATH = path.join(ROOT, "index.html");
 
 const PORT = Number(process.env.PORT || 8787);
 const NH_MISSION_ID = Number(process.env.NH_MISSION_ID || 1);
@@ -23,7 +23,7 @@ function extractGameScript(html) {
   let m;
   let last = null;
   while ((m = re.exec(html)) !== null) last = m[1];
-  if (!last) throw new Error("No <script> block found in neural-heist.html");
+  if (!last) throw new Error("No <script> block found in index.html");
   return last;
 }
 
@@ -92,7 +92,7 @@ function loadGameRuntime() {
   installHeadlessGlobals();
   const html = fs.readFileSync(HTML_PATH, "utf8");
   const code = extractGameScript(html);
-  vm.runInThisContext(code, { filename: "neural-heist-bundle.js" });
+  vm.runInThisContext(code, { filename: "index-bundle.js" });
   const RT = globalThis.__NeuralHeistServerRuntime__;
   if (!RT) throw new Error("Game bundle did not export __NeuralHeistServerRuntime__");
   return RT;
