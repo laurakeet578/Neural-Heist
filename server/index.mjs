@@ -112,6 +112,10 @@ function main() {
 
   /** @type {Map<import('ws').WebSocket, { slot: number }>} */
   const clients = new Map();
+  /** @type {Map<string, { roomCode: string, slots: Array<import('ws').WebSocket | null> }>} */
+  const rooms = new Map();
+  /** @type {Map<import('ws').WebSocket, string>} */
+  const roomByClient = new Map();
   let roomBootstrapped = false;
   let activeMissionId = NH_MISSION_ID;
   let activeSlotCount = NH_SLOT_COUNT;
@@ -134,6 +138,62 @@ function main() {
     const v = Number(n) | 0;
     if (!Number.isFinite(v)) return NH_SLOT_COUNT;
     return Math.max(2, Math.min(4, v));
+  }
+
+  function normalizeRoomCode(raw) {
+    const out = String(raw || "").trim().toUpperCase();
+    if (!/^[A-Z0-9]{4,8}$/.test(out)) return "";
+    return out;
+  }
+
+  function randomRoomCode() {
+    return String(1000 + ((Math.random() * 9000) | 0));
+  }
+
+  function removeClientFromRoom(ws) {
+    const code = roomByClient.get(ws);
+    if (!code) return;
+    roomByClient.delete(ws);
+    const room = rooms.get(code);
+    if (!room) return;
+    for (let i = 0; i < room.slots.length; i++) {
+      if (room.slots[i] === ws) room.slots[i] = null;
+    }
+    const connected = room.slots.filter(Boolean).length;
+    log("room player removed", { roomCode: code, connected });
+    if (connected <= 0) {
+      rooms.delete(code);
+      log("room deleted (empty)", { roomCode: code });
+    }
+  }
+
+  function sendRoomJoinResult(ws, payload) {
+    ws.send(JSON.stringify({
+      v: Net.PROTOCOL_VERSION,
+      type: Net.Msg.ROOM_JOIN_RESULT || "room_join_result",
+      ...payload
+    }));
+  }
+
+  function assignClientToRoom(ws, code, created) {
+    const room = rooms.get(code);
+    if (!room) return { ok: false, error: "Room not found." };
+    if (roomByClient.get(ws) && roomByClient.get(ws) !== code) removeClientFromRoom(ws);
+    let slot = room.slots.indexOf(ws);
+    if (slot < 0) slot = room.slots.findIndex((sock) => !sock);
+    if (slot < 0) return { ok: false, error: "Room is full." };
+    room.slots[slot] = ws;
+    roomByClient.set(ws, code);
+    const connectedSlots = room.slots.map(Boolean);
+    return {
+      ok: true,
+      created: !!created,
+      roomCode: code,
+      slot,
+      slotCount: room.slots.length,
+      connectedSlots,
+      connectedCount: connectedSlots.filter(Boolean).length
+    };
   }
 
   /** First HELLO picks mission + slot count so browser clients stay in sync with the host world. */
@@ -207,14 +267,16 @@ function main() {
     ws.on("message", (raw) => {
       try {
         ws._lastSeenAt = Date.now();
+        log("raw message", { raw: String(raw) });
         let msg;
         try {
           msg = JSON.parse(String(raw));
-        } catch {
+        } catch (parseErr) {
+          log("message parse error", { error: String(parseErr && parseErr.stack ? parseErr.stack : parseErr), raw: String(raw) });
           return;
         }
         if (!msg || msg.v !== Net.PROTOCOL_VERSION) return;
-        if (msg.type) log("message received", { type: msg.type });
+        if (msg.type) log("message received", { type: msg.type, payload: msg });
 
         if (msg.type === Net.Msg.PING) {
           ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PONG, t: msg.t }));
@@ -262,6 +324,37 @@ function main() {
           return;
         }
 
+        if (msg.type === (Net.Msg.ROOM_CREATE || "room_create")) {
+          let code = randomRoomCode();
+          while (rooms.has(code)) code = randomRoomCode();
+          rooms.set(code, { roomCode: code, slots: new Array(activeSlotCount).fill(null) });
+          log("room created", { roomCode: code, slotCount: activeSlotCount });
+          const result = assignClientToRoom(ws, code, true);
+          log("room create assign", result);
+          sendRoomJoinResult(ws, result);
+          return;
+        }
+
+        if (msg.type === (Net.Msg.ROOM_JOIN || "room_join")) {
+          const code = normalizeRoomCode(msg.roomCode);
+          log("room join request", { requested: msg.roomCode, normalized: code });
+          if (!code) {
+            sendRoomJoinResult(ws, { ok: false, error: "Invalid room code." });
+            return;
+          }
+          const room = rooms.get(code);
+          if (!room) {
+            log("room not found", { roomCode: code });
+            sendRoomJoinResult(ws, { ok: false, error: "Room not found." });
+            return;
+          }
+          log("room found", { roomCode: code, connectedCount: room.slots.filter(Boolean).length });
+          const result = assignClientToRoom(ws, code, false);
+          log("room player added", result);
+          sendRoomJoinResult(ws, result);
+          return;
+        }
+
         const meta = clients.get(ws);
         if (!meta || meta.slot == null) return;
         const slot = meta.slot;
@@ -301,6 +394,7 @@ function main() {
     ws.on("close", (code, reasonRaw) => {
       const reason = reasonRaw ? String(reasonRaw) : "";
       log("connection closed", { code, reason });
+      removeClientFromRoom(ws);
       clients.delete(ws);
       syncPresence();
     });

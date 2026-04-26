@@ -146,7 +146,10 @@
       MISSION: "mission",
       PING: "ping",
       PONG: "pong",
-      ERROR: "error"
+      ERROR: "error",
+      ROOM_CREATE: "room_create",
+      ROOM_JOIN: "room_join",
+      ROOM_JOIN_RESULT: "room_join_result"
     }
   };
 
@@ -583,6 +586,7 @@
         this.ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          this._logWs("message received", { type: msg && msg.type, payload: msg });
           if (msg.type === Net.Msg.PONG) {
             this.wsLastPongAt = Date.now();
             return;
@@ -606,6 +610,13 @@
             this.pendingWelcomeSlot = msg.slot | 0;
             if (msg.slotCount != null) this.pendingWelcomeSlotCount = msg.slotCount | 0;
             this._applyPendingWelcome();
+            return;
+          }
+          if (msg.type === Net.Msg.ROOM_JOIN_RESULT) {
+            if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
+              GameStateManager._onRoomJoinResult(msg);
+            }
+            return;
           }
         };
         this.ws.onerror = () => {
@@ -6613,10 +6624,14 @@
           this._multiplayerPendingAction = "";
           this.enterLobby(this.missionId || 1);
           if (act === "host" && !this.localRoom) {
-            this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
-            this.roomCode = this.localRoom.roomCode;
-            this.localPlayerId = 0;
-            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
+            if (NetworkCoordinator.mode === "ws_client") {
+              this._sendWsRoomCreateRequest();
+            } else {
+              this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
+              this.roomCode = this.localRoom.roomCode;
+              this.localPlayerId = 0;
+              this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
+            }
           }
         }
       }
@@ -7162,6 +7177,67 @@
         this._setHint("Connecting to multiplayer server…", "#8fdfff", 2.2);
       }
     },
+    _sendWsRoomCreateRequest() {
+      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) {
+        this._setHint("Not connected to server.", "#ffb08a", 2.4);
+        return;
+      }
+      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.ROOM_CREATE };
+      this._dbgLog("sending room create request", payload);
+      try {
+        NetworkCoordinator.ws.send(JSON.stringify(payload));
+      } catch (e) {
+        this._dbgLog("room create send failed", { error: String(e && e.message ? e.message : e) });
+        this._setHint("Failed to request room creation.", "#ffb08a", 2.8);
+      }
+    },
+    _sendWsRoomJoinRequest(code) {
+      const roomCode = String(code || "").trim().toUpperCase();
+      if (!roomCode) {
+        this._setHint("Enter a room code first.", "#ffb08a", 2.4);
+        return;
+      }
+      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) {
+        this._setHint("Not connected to server.", "#ffb08a", 2.4);
+        return;
+      }
+      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.ROOM_JOIN, roomCode };
+      this._dbgLog("sending room join request", payload);
+      try {
+        NetworkCoordinator.ws.send(JSON.stringify(payload));
+      } catch (e) {
+        this._dbgLog("room join send failed", { error: String(e && e.message ? e.message : e), payload });
+        this._setHint("Failed to send join request.", "#ffb08a", 2.8);
+      }
+    },
+    _onRoomJoinResult(msg) {
+      this._dbgLog("room join result received", msg);
+      if (!msg || msg.ok !== true) {
+        const reason = String((msg && msg.error) || "Unable to join room.");
+        this._setHint(reason, "#ffb08a", 3.4);
+        return;
+      }
+      const roomCode = String(msg.roomCode || "").toUpperCase();
+      const slotCount = clamp(msg.slotCount | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
+      const connectedCount = clamp(msg.connectedCount | 0, 0, slotCount);
+      const connectedSlots = new Array(slotCount).fill(false);
+      if (Array.isArray(msg.connectedSlots)) {
+        for (let i = 0; i < slotCount; i++) connectedSlots[i] = !!msg.connectedSlots[i];
+      } else {
+        for (let i = 0; i < connectedCount; i++) connectedSlots[i] = true;
+      }
+      this.localRoom = {
+        roomCode,
+        slotCount,
+        connectedSlots,
+        peerBySlot: new Array(slotCount).fill(null)
+      };
+      this.roomCode = roomCode;
+      if (msg.slot != null) this.localPlayerId = msg.slot | 0;
+      this.lobbyReady = connectedCount >= 2;
+      if (msg.created) this._setHint("Room created: " + roomCode, "#8fdfff", 3.2);
+      else this._setHint("Joined room " + roomCode, "#8fdfff", 3.2);
+    },
     _goToMultiplayerMissionSelect() {
       this.gameMode = "online_mock";
       this._assignDedicatedCloudUrl();
@@ -7263,23 +7339,31 @@
       }
       if (mx > VIEW_W / 2 - 260 && mx < VIEW_W / 2 - 80 && my > 468 && my < 516) {
         SFX.play("ui_click");
-        if (!this.localRoom) {
-          this.localRoom = LocalRoomService.hostRoom(this.missionId);
-          this.roomCode = this.localRoom.roomCode;
+        if (NetworkCoordinator.mode === "ws_client") {
+          this._sendWsRoomCreateRequest();
+        } else {
+          if (!this.localRoom) {
+            this.localRoom = LocalRoomService.hostRoom(this.missionId);
+            this.roomCode = this.localRoom.roomCode;
+          }
+          this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
         }
-        this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
         return;
       }
       if (mx > VIEW_W / 2 - 60 && mx < VIEW_W / 2 + 120 && my > 468 && my < 516) {
         SFX.play("ui_click");
         const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt("Enter 4-digit room code", this.roomCode || "") : "";
-        const joined = LocalRoomService.joinRoom(entered || this.roomCode, NetworkCoordinator.peerId);
-        if (joined) {
-          this.localRoom = joined.room;
-          this.roomCode = joined.room.roomCode;
-          this.localPlayerId = joined.slot;
-          this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
-          if (this.lobbyReady) this.startLobbyMatch();
+        if (NetworkCoordinator.mode === "ws_client") {
+          this._sendWsRoomJoinRequest(entered || this.roomCode);
+        } else {
+          const joined = LocalRoomService.joinRoom(entered || this.roomCode, NetworkCoordinator.peerId);
+          if (joined) {
+            this.localRoom = joined.room;
+            this.roomCode = joined.room.roomCode;
+            this.localPlayerId = joined.slot;
+            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 4;
+            if (this.lobbyReady) this.startLobbyMatch();
+          }
         }
         return;
       }
