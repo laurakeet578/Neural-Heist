@@ -297,6 +297,12 @@ function main() {
       matchId,
       phase: activeMatch.phase
     });
+    log("match_started_sent", {
+      roomCode,
+      matchId,
+      recipients: room.slots.filter(Boolean).length,
+      reason: "new_match_started"
+    });
     // Critical unlock contract: after match_started, immediately send another
     // snapshot so clients waiting on first post-start snapshot can transition.
     emitSnapshot(activeMatch, "post_match_started_snapshot");
@@ -428,6 +434,10 @@ function main() {
 
         if (type === "request_start") {
           const roomCode = normalizeRoomCode(msg.roomCode || clientRoomBySocket.get(ws));
+          log("request_start_received", {
+            roomCode: roomCode || null,
+            requestedMissionId: msg.missionId != null ? (msg.missionId | 0) : null
+          });
           if (!roomCode) {
             sendMatchError(ws, "Invalid room code.");
             return;
@@ -442,12 +452,21 @@ function main() {
             return;
           }
           if (activeMatch && activeMatch.roomCode === roomCode && activeMatch.phase === RoomPhase.RUNNING) {
-            sendMatchEvent(ws, "match_started", {
+            const out = {
+              v: PROTOCOL_VERSION,
+              type: "match_started",
               roomCode,
               missionId: activeMatch.missionId,
               connectedCount: room.slots.filter(Boolean).length,
               matchId: activeMatch.matchId,
               phase: activeMatch.phase
+            };
+            broadcastRoomMessage(roomCode, out);
+            log("match_started_sent", {
+              roomCode,
+              matchId: activeMatch.matchId,
+              recipients: room.slots.filter(Boolean).length,
+              reason: "already_running_match"
             });
             return;
           }

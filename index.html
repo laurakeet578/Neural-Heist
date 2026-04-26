@@ -4946,6 +4946,11 @@
     pendingStartMatchId: "",
     snapshotWaitStartedAt: 0,
     snapshotWaitWarned: false,
+    startRequestSentAt: 0,
+    startRequestRetryCount: 0,
+    lobbyAutoStartAt: 0,
+    lobbyAutoStartNextRetryAt: 0,
+    lobbyAutoStartRetryCount: 0,
     /** Optional wss:// URL for Render/dedicated host; empty = same-browser / local lobby. */
     multiplayerDedicatedUrl: "",
     /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
@@ -6691,7 +6696,67 @@
       resetClock();
     },
     updateMeta(dt) {
+      if (this.phase === "lobby" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
+        const isHost = this.localPlayerId === 0;
+        const roomActive = !!(this.localRoom && this.roomCode);
+        const connectedSlots = roomActive && Array.isArray(this.localRoom.connectedSlots)
+          ? this.localRoom.connectedSlots
+          : [];
+        const connectedCount = connectedSlots.filter(Boolean).length;
+        if (isHost && roomActive) {
+          const now = Date.now();
+          if (!this.lobbyAutoStartAt) {
+            this.lobbyAutoStartAt = now + 1400;
+            this.lobbyAutoStartNextRetryAt = this.lobbyAutoStartAt;
+            this.lobbyAutoStartRetryCount = 0;
+          }
+          // Auto-start trigger (works even when host is alone; server decides readiness).
+          if (now >= this.lobbyAutoStartAt && now >= this.lobbyAutoStartNextRetryAt && this.lobbyAutoStartRetryCount < 5) {
+            this.lobbyAutoStartRetryCount++;
+            this.lobbyAutoStartNextRetryAt = now + 3500;
+            this._dbgLog("lobby auto request_start", {
+              roomCode: this.roomCode,
+              connectedCount,
+              retry: this.lobbyAutoStartRetryCount
+            });
+            this._sendWsStartMatchRequest();
+          }
+          // Timeout protection: force retry cadence after extended lobby idle.
+          if ((now - this.lobbyAutoStartAt) > 12000 && now >= this.lobbyAutoStartNextRetryAt) {
+            this.lobbyAutoStartNextRetryAt = now + 2800;
+            this._dbgLog("lobby timeout request_start", {
+              roomCode: this.roomCode,
+              connectedCount
+            });
+            this._sendWsStartMatchRequest();
+          }
+        } else {
+          this.lobbyAutoStartAt = 0;
+          this.lobbyAutoStartNextRetryAt = 0;
+          this.lobbyAutoStartRetryCount = 0;
+        }
+      }
       if (this.phase === "starting_match") {
+        const canRetryStart = this.gameMode === "online_mock"
+          && NetworkCoordinator.mode === "ws_client"
+          && this.localPlayerId === 0
+          && !!this.roomCode
+          && !!(NetworkCoordinator.ws && NetworkCoordinator.ws.readyState === 1);
+        if (canRetryStart && this.startRequestSentAt > 0 && (Date.now() - this.startRequestSentAt) > 3500 && this.startRequestRetryCount < 3) {
+          this.startRequestRetryCount++;
+          this.startRequestSentAt = Date.now();
+          this._dbgLog("retry request_start", { roomCode: this.roomCode, retry: this.startRequestRetryCount });
+          try {
+            NetworkCoordinator.ws.send(JSON.stringify({
+              v: Net.PROTOCOL_VERSION,
+              type: Net.Msg.REQUEST_START,
+              roomCode: String(this.roomCode || "").trim().toUpperCase(),
+              missionId: this.missionId | 0
+            }));
+          } catch (e) {
+            this._dbgLog("retry request_start failed", { error: String(e && e.message ? e.message : e) });
+          }
+        }
         if (!this.snapshotWaitStartedAt) this.snapshotWaitStartedAt = Date.now();
         const waitMs = Date.now() - this.snapshotWaitStartedAt;
         if (!this.snapshotWaitWarned && waitMs > 5000) {
@@ -6704,6 +6769,8 @@
           this.pendingStartMatchId = "";
           this.snapshotWaitStartedAt = 0;
           this.snapshotWaitWarned = false;
+          this.startRequestSentAt = 0;
+          this.startRequestRetryCount = 0;
           this.setPhase("lobby");
           this._setHint("Snapshot delayed. Returned to lobby - retry start.", "#ffb08a", 3.0);
         }
@@ -7324,6 +7391,9 @@
       this._dbgLog("host clicked start", payload);
       try {
         NetworkCoordinator.ws.send(JSON.stringify(payload));
+        this.startRequestSentAt = Date.now();
+        this.startRequestRetryCount = 0;
+        this.lobbyAutoStartNextRetryAt = Date.now() + 2600;
         this._setHint("Waiting for server start...", "#8fdfff", 2.2);
       } catch (e) {
         this._dbgLog("start match send failed", { error: String(e && e.message ? e.message : e), payload });
@@ -7371,12 +7441,28 @@
       if (incomingMatchId && this.currentMatchId && this.currentMatchId === incomingMatchId && this.phase === "playing") return;
       if (incomingMatchId) this.currentMatchId = incomingMatchId;
       if (msg.missionId != null) this.missionId = msg.missionId | 0;
-      this.pendingStartMatchId = incomingMatchId || this.pendingStartMatchId || this.currentMatchId;
+      this.pendingStartMatchId = "";
       this.snapshotWaitStartedAt = Date.now();
       this.snapshotWaitWarned = false;
-      if (this.phase === "playing" || this.phase === "intro_cutscene") return;
-      this.setPhase("starting_match");
-      this._setHint("Match starting... waiting for first snapshot.", "#8fdfff", 2.4);
+      this.startRequestSentAt = 0;
+      this.startRequestRetryCount = 0;
+      this.lobbyAutoStartAt = 0;
+      this.lobbyAutoStartNextRetryAt = 0;
+      this.lobbyAutoStartRetryCount = 0;
+      if (this.phase === "playing") return;
+      this._dbgLog("match_started immediate gameplay transition", {
+        roomCode: code || this.roomCode || "",
+        matchId: incomingMatchId || this.currentMatchId || ""
+      });
+      try {
+        this.startPlaying();
+        this.snapshotWaitStartedAt = 0;
+        this.snapshotWaitWarned = false;
+      } catch (e) {
+        this._dbgLog("match_started transition failed", { error: String(e && e.stack ? e.stack : e) });
+        this.setPhase("starting_match");
+        this._setHint("Match starting... loading gameplay...", "#8fdfff", 2.4);
+      }
     },
     _unlockClientAfterFirstSnapshot(matchId) {
       if (!matchId || this.pendingStartMatchId !== matchId) return;
@@ -7384,6 +7470,11 @@
       this.pendingStartMatchId = "";
       this.snapshotWaitStartedAt = 0;
       this.snapshotWaitWarned = false;
+      this.startRequestSentAt = 0;
+      this.startRequestRetryCount = 0;
+      this.lobbyAutoStartAt = 0;
+      this.lobbyAutoStartNextRetryAt = 0;
+      this.lobbyAutoStartRetryCount = 0;
       try {
         this.startPlaying();
       } catch (e) {
@@ -7516,6 +7607,11 @@
       this.localRoom = null;
       this.roomCode = "";
       this.lobbyReady = false;
+      this.startRequestSentAt = 0;
+      this.startRequestRetryCount = 0;
+      this.lobbyAutoStartAt = 0;
+      this.lobbyAutoStartNextRetryAt = 0;
+      this.lobbyAutoStartRetryCount = 0;
       if (reason && this._dbgLog) this._dbgLog("left local room", { reason });
     },
     enterLobby(mid) {
