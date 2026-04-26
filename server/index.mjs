@@ -476,7 +476,18 @@ function main() {
           } catch (startErr) {
             const errText = String(startErr && startErr.stack ? startErr.stack : startErr);
             log("match_start_failure", { roomCode, error: errText });
-            sendMatchError(ws, "Match start failed: " + errText, { roomCode });
+            const code = String(startErr && startErr.message ? startErr.message : startErr || "match_start_failed");
+            if (code === "minimum_players_not_met") {
+              sendMatchError(ws, "Waiting for more players before match start.", {
+                roomCode,
+                code,
+                connectedCount: room.slots.filter(Boolean).length
+              });
+            } else if (code === "room_not_found" || code === "room_not_in_lobby" || code === "another_match_active") {
+              sendMatchError(ws, "Unable to start match right now.", { roomCode, code });
+            } else {
+              sendMatchError(ws, "Match start failed.", { roomCode, code: "match_start_failed" });
+            }
           }
           return;
         }
