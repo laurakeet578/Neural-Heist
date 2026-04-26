@@ -565,7 +565,7 @@
             }
             // Only enforce snapshot stall once a mission is actively running.
             const phase = GameStateManager ? GameStateManager.phase : "";
-            const needsSnapshotFeed = phase === "playing" || phase === "briefing";
+            const needsSnapshotFeed = phase === "playing";
             if (needsSnapshotFeed && Date.now() - this.wsLastSnapshotAt > 14000) {
               try { sock.close(); } catch (e) {}
               return;
@@ -611,7 +611,7 @@
         this.ws.onerror = () => {
           this._logWs("error", { url: connectUrl });
         };
-        this.ws.onclose = () => {
+        this.ws.onclose = (ev) => {
           const wasManual = !!this._wsManualClose;
           this.wsConnected = false;
           if (this.wsDisconnectUiTimer) clearTimeout(this.wsDisconnectUiTimer);
@@ -619,7 +619,12 @@
             this.wsConnectionState = "disconnected";
             this.wsDisconnectUiTimer = null;
           }, 1200);
-          this._logWs("closed", { manual: wasManual, url: connectUrl });
+          this._logWs("closed", {
+            manual: wasManual,
+            url: connectUrl,
+            code: ev && ev.code != null ? ev.code : null,
+            reason: ev && ev.reason ? ev.reason : ""
+          });
           this.mode = "embedded";
           this.ws = null;
           if (this.wsHeartbeatTimer) {

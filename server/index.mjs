@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 import vm from "vm";
 import { fileURLToPath } from "url";
+import { setInterval as nodeSetInterval } from "timers";
 import { WebSocketServer } from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,7 @@ const NH_MAX_MISSION = Math.max(1, Number(process.env.NH_MAX_MISSION || 6));
 const NH_SLOT_COUNT = Math.max(2, Math.min(4, Number(process.env.NH_SLOT_COUNT || 2)));
 const NH_TICK_HZ = Math.max(8, Math.min(60, Number(process.env.NH_TICK_HZ || 20)));
 const CLIENT_IDLE_TIMEOUT_MS = Math.max(12000, Number(process.env.NH_CLIENT_IDLE_TIMEOUT_MS || 45000));
+const WS_HEARTBEAT_MS = Math.max(5000, Number(process.env.NH_WS_HEARTBEAT_MS || 15000));
 
 function extractGameScript(html) {
   const re = /<script>([\s\S]*?)<\/script>/g;
@@ -116,6 +118,12 @@ function main() {
   /** @type {null | ((payload: object) => void)} */
   let broadcastSnapshot = null;
 
+  function log(tag, payload) {
+    const at = new Date().toISOString();
+    if (payload !== undefined) console.log(`[WS ${at}] ${tag}`, payload);
+    else console.log(`[WS ${at}] ${tag}`);
+  }
+
   function clampMissionId(m) {
     const v = Number(m) | 0;
     if (!Number.isFinite(v) || v < 1) return NH_MISSION_ID;
@@ -187,101 +195,131 @@ function main() {
 
   const wss = new WebSocketServer({ server, path: "/ws" });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req) => {
     ws._lastSeenAt = Date.now();
-    ws.on("message", (raw) => {
+    ws._isAlive = true;
+    const remote = req?.socket?.remoteAddress || "unknown";
+    log("connection open", { remote });
+    ws.on("pong", () => {
+      ws._isAlive = true;
       ws._lastSeenAt = Date.now();
-      let msg;
+    });
+    ws.on("message", (raw) => {
       try {
-        msg = JSON.parse(String(raw));
-      } catch {
-        return;
-      }
-      if (!msg || msg.v !== Net.PROTOCOL_VERSION) return;
-
-      if (msg.type === Net.Msg.PING) {
-        ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PONG, t: msg.t }));
-        return;
-      }
-
-      if (msg.type === Net.Msg.HELLO) {
-        ensureRoom(msg);
-        const meta = clients.get(ws);
-        if (meta && meta.slot != null) return;
-
-        const maxSlots = Math.min(
-          activeSlotCount,
-          NetworkCoordinator.connectedSlots?.length || activeSlotCount
-        );
-
-        let slot = -1;
-        const used = new Set();
-        for (const m of clients.values()) used.add(m.slot);
-        for (let i = 0; i < maxSlots; i++) {
-          if (!used.has(i)) {
-            slot = i;
-            break;
-          }
-        }
-        if (slot < 0) {
-          ws.send(JSON.stringify({
-            v: Net.PROTOCOL_VERSION,
-            type: Net.Msg.ERROR,
-            message: "Room is full."
-          }));
-          ws.close();
+        ws._lastSeenAt = Date.now();
+        let msg;
+        try {
+          msg = JSON.parse(String(raw));
+        } catch {
           return;
         }
-        clients.set(ws, { slot });
-        syncPresence();
-        ws.send(JSON.stringify({
-          v: Net.PROTOCOL_VERSION,
-          type: Net.Msg.WELCOME,
-          slot,
-          missionId: activeMissionId,
-          slotCount: maxSlots
-        }));
-        return;
-      }
+        if (!msg || msg.v !== Net.PROTOCOL_VERSION) return;
+        if (msg.type) log("message received", { type: msg.type });
 
-      const meta = clients.get(ws);
-      if (!meta || meta.slot == null) return;
-      const slot = meta.slot;
+        if (msg.type === Net.Msg.PING) {
+          ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PONG, t: msg.t }));
+          return;
+        }
 
-      if (msg.type === Net.Msg.INPUT && msg.payload) {
-        const keys = msg.payload.keys || msg.payload;
-        ws._lastInput = {
-          left: !!(keys.left || keys.a || keys.arrowleft),
-          right: !!(keys.right || keys.d || keys.arrowright),
-          up: !!(keys.up || keys.w || keys.arrowup),
-          down: !!(keys.down || keys.s || keys.arrowdown),
-          sprint: !!(keys.sprint || keys.shift)
-        };
-        return;
-      }
+        if (msg.type === Net.Msg.HELLO) {
+          ensureRoom(msg);
+          const meta = clients.get(ws);
+          if (meta && meta.slot != null) return;
 
-      if (msg.type === Net.Msg.ACTION) {
-        const seq = msg.seq | 0;
-        const prevSeq = ws._lastActionSeq | 0;
-        if (seq > 0 && prevSeq > 0 && seq <= prevSeq) return;
-        if (seq > 0) ws._lastActionSeq = seq;
-        const pay = msg.payload || {};
-        const actSlot = msg.slot != null ? msg.slot | 0 : slot;
-        if (actSlot !== slot) return;
-        RT.applyRemoteMissionAction(actSlot, pay);
-        if (GameStateManager.world) AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
-        return;
+          const maxSlots = Math.min(
+            activeSlotCount,
+            NetworkCoordinator.connectedSlots?.length || activeSlotCount
+          );
+
+          let slot = -1;
+          const used = new Set();
+          for (const m of clients.values()) used.add(m.slot);
+          for (let i = 0; i < maxSlots; i++) {
+            if (!used.has(i)) {
+              slot = i;
+              break;
+            }
+          }
+          if (slot < 0) {
+            ws.send(JSON.stringify({
+              v: Net.PROTOCOL_VERSION,
+              type: Net.Msg.ERROR,
+              message: "Room is full."
+            }));
+            ws.close(1008, "room full");
+            return;
+          }
+          clients.set(ws, { slot });
+          syncPresence();
+          ws.send(JSON.stringify({
+            v: Net.PROTOCOL_VERSION,
+            type: Net.Msg.WELCOME,
+            slot,
+            missionId: activeMissionId,
+            slotCount: maxSlots
+          }));
+          log("assigned slot", { slot });
+          return;
+        }
+
+        const meta = clients.get(ws);
+        if (!meta || meta.slot == null) return;
+        const slot = meta.slot;
+
+        if (msg.type === Net.Msg.INPUT && msg.payload) {
+          const keys = msg.payload.keys || msg.payload;
+          ws._lastInput = {
+            left: !!(keys.left || keys.a || keys.arrowleft),
+            right: !!(keys.right || keys.d || keys.arrowright),
+            up: !!(keys.up || keys.w || keys.arrowup),
+            down: !!(keys.down || keys.s || keys.arrowdown),
+            sprint: !!(keys.sprint || keys.shift)
+          };
+          return;
+        }
+
+        if (msg.type === Net.Msg.ACTION) {
+          const seq = msg.seq | 0;
+          const prevSeq = ws._lastActionSeq | 0;
+          if (seq > 0 && prevSeq > 0 && seq <= prevSeq) return;
+          if (seq > 0) ws._lastActionSeq = seq;
+          const pay = msg.payload || {};
+          const actSlot = msg.slot != null ? msg.slot | 0 : slot;
+          if (actSlot !== slot) return;
+          RT.applyRemoteMissionAction(actSlot, pay);
+          if (GameStateManager.world) AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+          return;
+        }
+      } catch (err) {
+        log("message handler error", { error: String(err && err.stack ? err.stack : err) });
       }
     });
 
-    ws.on("close", () => {
+    ws.on("error", (err) => {
+      log("socket error", { error: String(err && err.stack ? err.stack : err) });
+    });
+    ws.on("close", (code, reasonRaw) => {
+      const reason = reasonRaw ? String(reasonRaw) : "";
+      log("connection closed", { code, reason });
       clients.delete(ws);
       syncPresence();
     });
   });
 
   const dt = 1 / NH_TICK_HZ;
-  setInterval(() => {
+  nodeSetInterval(() => {
+    for (const ws of clients.keys()) {
+      if (ws.readyState !== 1) continue;
+      if (!ws._isAlive) {
+        try { ws.terminate(); } catch (e) {}
+        continue;
+      }
+      ws._isAlive = false;
+      try { ws.ping(); } catch (e) {}
+    }
+  }, WS_HEARTBEAT_MS);
+
+  nodeSetInterval(() => {
     if (!roomBootstrapped) return;
     const now = Date.now();
     for (const ws of clients.keys()) {
@@ -304,6 +342,13 @@ function main() {
       NetworkCoordinator._authoritativeRemoteInputs = null;
     }
   }, Math.round(1000 / NH_TICK_HZ));
+
+  process.on("uncaughtException", (err) => {
+    log("uncaughtException", { error: String(err && err.stack ? err.stack : err) });
+  });
+  process.on("unhandledRejection", (err) => {
+    log("unhandledRejection", { error: String(err && err.stack ? err.stack : err) });
+  });
 
   server.listen(PORT, () => {
     console.log(`Neural Heist server listening on ${PORT} (WebSocket path /ws, health GET /health)`);
