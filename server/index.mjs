@@ -15,6 +15,7 @@ const NH_TICK_HZ = Math.max(8, Math.min(60, Number(process.env.NH_TICK_HZ || 20)
 const CLIENT_IDLE_TIMEOUT_MS = Math.max(12000, Number(process.env.NH_CLIENT_IDLE_TIMEOUT_MS || 45000));
 const WS_HEARTBEAT_MS = Math.max(5000, Number(process.env.NH_WS_HEARTBEAT_MS || 15000));
 const CONNECTION_READY_DELAY_MS = Math.max(50, Number(process.env.NH_CONNECTION_READY_DELAY_MS || 120));
+const CUTSCENE_AUTO_END_MS = Math.max(1000, Number(process.env.NH_CUTSCENE_AUTO_END_MS || 9000));
 
 const RoomPhase = {
   LOBBY: "LOBBY",
@@ -220,6 +221,11 @@ function main() {
       tick: match.tick,
       timestamp: Date.now(),
       missionId: match.missionId,
+      gamePhase: match.state.gamePhase,
+      cutscenePhase: match.state.cutscenePhase,
+      cutscene_active: !!match.state.cutsceneActive,
+      connectedSlots,
+      players,
       state: {
         matchId: match.matchId,
         roomCode: match.roomCode,
@@ -227,6 +233,7 @@ function main() {
         missionId: match.missionId,
         gamePhase: match.state.gamePhase,
         cutscenePhase: match.state.cutscenePhase,
+        cutsceneActive: !!match.state.cutsceneActive,
         connectedSlots,
         players
       }
@@ -263,7 +270,7 @@ function main() {
     room.phase = RoomPhase.STARTING;
     room.matchId = matchId;
     room.missionId = missionId;
-    room.state = { gamePhase: "intro_cutscene", cutscenePhase: "intro_cutscene" };
+    room.state = { gamePhase: "intro_cutscene", cutscenePhase: "intro_cutscene", cutsceneActive: true };
     activeMatch = {
       roomCode,
       matchId,
@@ -280,6 +287,7 @@ function main() {
     activeMatch.firstSnapshotSent = true;
     activeMatch.phase = RoomPhase.RUNNING;
     room.phase = RoomPhase.RUNNING;
+    log("match_started", { roomCode, matchId, missionId, connectedCount });
     broadcastRoomMessage(roomCode, {
       v: PROTOCOL_VERSION,
       type: "match_started",
@@ -289,12 +297,15 @@ function main() {
       matchId,
       phase: activeMatch.phase
     });
+    // Critical unlock contract: after match_started, immediately send another
+    // snapshot so clients waiting on first post-start snapshot can transition.
+    emitSnapshot(activeMatch, "post_match_started_snapshot");
     log("match_start_success", { roomCode, matchId, missionId });
   }
 
   function updateCutsceneState(match, requestedPhase) {
     if (!match || match.phase !== RoomPhase.RUNNING) throw new Error("match_not_running");
-    if (!match.state) match.state = { gamePhase: "playing", cutscenePhase: null };
+    if (!match.state) match.state = { gamePhase: "playing", cutscenePhase: null, cutsceneActive: false };
     // Match state is intentionally minimal on this decoupled server.
     // Accept any allowed skip intent and advance to playable phase.
     if (match.state.cutscenePhase !== requestedPhase && match.state.gamePhase !== requestedPhase) {
@@ -306,6 +317,7 @@ function main() {
     }
     match.state.cutscenePhase = null;
     match.state.gamePhase = "playing";
+    match.state.cutsceneActive = false;
   }
 
   const server = http.createServer((req, res) => {
@@ -465,6 +477,17 @@ function main() {
             sendMatchError(ws, "Invalid room code.");
             return;
           }
+          const room = rooms.get(roomCode);
+          if (!room) {
+            sendMatchError(ws, "Room not found.", { roomCode });
+            return;
+          }
+          const requesterInRoom = room.slots.includes(ws);
+          if (!requesterInRoom) {
+            log("cutscene_skip_rejected_not_in_room", { roomCode });
+            sendMatchError(ws, "Requester is not part of this match room.", { roomCode });
+            return;
+          }
           if (!allowed.has(phase)) {
             sendMatchError(ws, "Invalid cutscene phase.", { roomCode });
             return;
@@ -474,6 +497,7 @@ function main() {
             return;
           }
           try {
+            log("cutscene_skip_request", { roomCode, phase, matchId: activeMatch.matchId });
             updateCutsceneState(activeMatch, phase);
             emitSnapshot(activeMatch, "cutscene_skip");
           } catch (skipErr) {
@@ -530,6 +554,16 @@ function main() {
     }
     if (!activeMatch || activeMatch.phase !== RoomPhase.RUNNING) return;
     try {
+      if (activeMatch.state && activeMatch.state.cutsceneActive && (Date.now() - activeMatch.startedAt) >= CUTSCENE_AUTO_END_MS) {
+        activeMatch.state.cutsceneActive = false;
+        activeMatch.state.cutscenePhase = null;
+        activeMatch.state.gamePhase = "playing";
+        log("cutscene_auto_end", {
+          roomCode: activeMatch.roomCode,
+          matchId: activeMatch.matchId,
+          elapsedMs: Date.now() - activeMatch.startedAt
+        });
+      }
       emitSnapshot(activeMatch, "tick");
     } catch (err) {
       panicMatch("snapshot_tick_failure", { error: String(err && err.stack ? err.stack : err) });

@@ -565,9 +565,9 @@
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
             if (!sock || sock.readyState !== 1) return;
-            // Only enforce snapshot stall once a mission is actively running.
+            // Enforce snapshot health during startup and active gameplay.
             const phase = GameStateManager ? GameStateManager.phase : "";
-            const needsSnapshotFeed = phase === "playing";
+            const needsSnapshotFeed = phase === "playing" || phase === "starting_match";
             if (needsSnapshotFeed) {
               const sinceSnap = Date.now() - this.wsLastSnapshotAt;
               if (this.wsEverReceivedSnapshot && sinceSnap > 20000) {
@@ -575,9 +575,12 @@
                 try { sock.close(); } catch (e) {}
                 return;
               }
-              if (!this.wsEverReceivedSnapshot && sinceSnap > 30000) {
+              if (!this.wsEverReceivedSnapshot && sinceSnap > 8000) {
                 // During mission transitions, first snapshot can be delayed; warn but keep connection alive.
                 this._logWs("waiting for first snapshot", { sinceOpenMs: sinceSnap, phase });
+                if (GameStateManager && GameStateManager.phase === "starting_match" && GameStateManager._setHint) {
+                  GameStateManager._setHint("Waiting for server snapshot... loading.", "#8fdfff", 1.4);
+                }
               }
             }
           }, 10000);
@@ -608,6 +611,11 @@
               return;
             }
             this._logWs("snapshot received", { matchId, tick: msg.tick != null ? msg.tick : null });
+            if (GameStateManager) {
+              GameStateManager.snapshotWaitStartedAt = 0;
+              GameStateManager.snapshotWaitWarned = false;
+            }
+            const cutsceneActive = !!msg.cutscene_active;
             const snapshotGamePhase = String(msg.gamePhase || "");
             if (snapshotGamePhase && GameStateManager && typeof GameStateManager.setPhase === "function"
               && GameStateManager.phase !== snapshotGamePhase) {
@@ -615,6 +623,16 @@
               const cutsceneLike = localPhase.includes("cutscene") || snapshotGamePhase.includes("cutscene");
               if (cutsceneLike) {
                 GameStateManager.setPhase(snapshotGamePhase);
+              }
+            }
+            if (!cutsceneActive && GameStateManager) {
+              const localPhase = String(GameStateManager.phase || "");
+              if (localPhase.includes("cutscene")) {
+                if (typeof GameStateManager.setPhase === "function") GameStateManager.setPhase("playing");
+                GameStateManager.mode = "play";
+                GameStateManager.currentState = STATES.CAMPAIGN;
+                if (typeof GameStateManager.syncStateFromPhase === "function") GameStateManager.syncStateFromPhase();
+                this._logWs("cutscene->gameplay transition applied", { matchId, tick: msg.tick != null ? msg.tick : null });
               }
             }
             if (matchId && GameStateManager && GameStateManager.pendingStartMatchId === matchId
@@ -4926,6 +4944,8 @@
     lobbyReady: false,
     currentMatchId: "",
     pendingStartMatchId: "",
+    snapshotWaitStartedAt: 0,
+    snapshotWaitWarned: false,
     /** Optional wss:// URL for Render/dedicated host; empty = same-browser / local lobby. */
     multiplayerDedicatedUrl: "",
     /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
@@ -6671,6 +6691,23 @@
       resetClock();
     },
     updateMeta(dt) {
+      if (this.phase === "starting_match") {
+        if (!this.snapshotWaitStartedAt) this.snapshotWaitStartedAt = Date.now();
+        const waitMs = Date.now() - this.snapshotWaitStartedAt;
+        if (!this.snapshotWaitWarned && waitMs > 5000) {
+          this.snapshotWaitWarned = true;
+          this._dbgLog("snapshot delayed while starting_match", { waitMs, pendingStartMatchId: this.pendingStartMatchId || "" });
+          this._setHint("Loading match state from server...", "#8fdfff", 1.8);
+        }
+        if (waitMs > 18000) {
+          this._dbgLog("starting_match timeout recovery -> lobby", { waitMs, pendingStartMatchId: this.pendingStartMatchId || "" });
+          this.pendingStartMatchId = "";
+          this.snapshotWaitStartedAt = 0;
+          this.snapshotWaitWarned = false;
+          this.setPhase("lobby");
+          this._setHint("Snapshot delayed. Returned to lobby - retry start.", "#ffb08a", 3.0);
+        }
+      }
       if (this.phase === "multiplayer_menu" && this._multiplayerPendingAction) {
         if (this._isMultiplayerTransportReady()) {
           const act = this._multiplayerPendingAction;
@@ -7335,6 +7372,8 @@
       if (incomingMatchId) this.currentMatchId = incomingMatchId;
       if (msg.missionId != null) this.missionId = msg.missionId | 0;
       this.pendingStartMatchId = incomingMatchId || this.pendingStartMatchId || this.currentMatchId;
+      this.snapshotWaitStartedAt = Date.now();
+      this.snapshotWaitWarned = false;
       if (this.phase === "playing" || this.phase === "intro_cutscene") return;
       this.setPhase("starting_match");
       this._setHint("Match starting... waiting for first snapshot.", "#8fdfff", 2.4);
@@ -7343,6 +7382,8 @@
       if (!matchId || this.pendingStartMatchId !== matchId) return;
       this._dbgLog("clients unlocked", { matchId });
       this.pendingStartMatchId = "";
+      this.snapshotWaitStartedAt = 0;
+      this.snapshotWaitWarned = false;
       try {
         this.startPlaying();
       } catch (e) {
