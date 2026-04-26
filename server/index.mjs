@@ -284,7 +284,8 @@ function main() {
       firstSnapshotSent: false,
       firstSnapshotTick: -1,
       worldRef: null,
-      ackedSockets: new Set()
+      ackedSockets: new Set(),
+      unlockAckLogged: false
     };
 
     RT.bootstrapDedicatedRoom({
@@ -658,6 +659,9 @@ function main() {
           };
           log("room broadcast triggered", out);
           broadcastRoomMessage(code, out);
+          // Ensure at least one snapshot is emitted after match_started so clients can
+          // deterministically unlock even if tick-driven snapshots are delayed.
+          pushSnapshotNow("post_match_started_snapshot", false);
           return;
         }
 
@@ -696,11 +700,23 @@ function main() {
           const roomCode = roomByClient.get(ws);
           if (roomCode !== activeMatch.roomCode) return;
           activeMatch.ackedSockets.add(ws);
+          const room = rooms.get(activeMatch.roomCode);
+          const connected = room ? room.slots.filter(Boolean).length : 0;
           log("snapshot ack received", {
             roomCode: activeMatch.roomCode,
             matchId: activeMatch.matchId,
-            acked: activeMatch.ackedSockets.size
+            acked: activeMatch.ackedSockets.size,
+            connected
           });
+          if (!activeMatch.unlockAckLogged && connected > 0 && activeMatch.ackedSockets.size >= connected) {
+            activeMatch.unlockAckLogged = true;
+            log("clients unlocked", {
+              roomCode: activeMatch.roomCode,
+              matchId: activeMatch.matchId,
+              acked: activeMatch.ackedSockets.size,
+              connected
+            });
+          }
           return;
         }
 
