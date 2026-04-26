@@ -7537,6 +7537,12 @@
         return;
       }
       this._missionInitInProgress = true;
+      console.log("B: game init started");
+      if (typeof globalThis !== "undefined" && globalThis.NH_GAME_START_SAFE_MODE) {
+        console.log("GAME START SAFE MODE");
+        this._missionInitInProgress = false;
+        return;
+      }
       this._dbgLog("game start triggered", {
         missionId: mid,
         gameMode: this.gameMode,
@@ -7566,6 +7572,7 @@
           NetworkCoordinator.closeLocalChannel();
         }
         NetworkManager.mode = this.gameMode;
+        console.log("C: spawning players");
         AuthoritativeSession.reset(w, slots, n => NetworkManager.assignRoles(n));
         NetworkCoordinator._applyPendingWelcome();
         if (this.gameMode === "online_mock" && this.localRoom) {
@@ -7657,6 +7664,7 @@
             NetworkCoordinator.ws = null;
           }
         }
+        console.log("D: starting game loop");
         NetworkCoordinator.onMissionStart();
         this._dbgLog("game loop started", { authoritative: NetworkCoordinator.isAuthoritativeHost(), wsMode: NetworkCoordinator.mode });
         AuthoritativeSession.broadcastSnapshot(w);
@@ -7923,6 +7931,7 @@
       }
     },
     finishIntroCutscene() {
+      console.log("A: cutscene finished");
       this._dbgLog("cutscene ended", { phase: "intro_cutscene" });
       this.setPhase("playing");
       this.startMission(this.missionId);
