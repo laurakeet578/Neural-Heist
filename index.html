@@ -611,7 +611,7 @@
           if (msg.type === Net.Msg.ERROR && msg.message && GameStateManager._setHint) {
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
           }
-          if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world) {
+          if (msg.type === Net.Msg.SNAPSHOT) {
             this.wsLastSnapshotAt = Date.now();
             this.wsEverReceivedSnapshot = true;
             const matchId = String(msg.matchId || "");
@@ -625,15 +625,21 @@
                 this._logWs("snapshot ACK send failed", { error: String(e && e.message ? e.message : e), ack });
               }
             }
-            if (Array.isArray(msg.players) && msg.players.length) {
-              this._ensureSessionPlayersForCount(msg.players.length);
+            if (matchId && GameStateManager && GameStateManager.pendingStartMatchId === matchId
+              && typeof GameStateManager._unlockClientAfterFirstSnapshot === "function") {
+              GameStateManager._unlockClientAfterFirstSnapshot(matchId);
             }
-            const byId = {};
-            AuthoritativeSession.players.forEach(p => { byId[p.id] = p; });
-            NetProtocol.applySnapshotV1(GameStateManager.world, byId, msg);
-            GameStateManager.rebuildWalls();
-            if (msg.tick != null) this.lastAppliedTick = msg.tick;
-            GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
+            if (GameStateManager.world) {
+              if (Array.isArray(msg.players) && msg.players.length) {
+                this._ensureSessionPlayersForCount(msg.players.length);
+              }
+              const byId = {};
+              AuthoritativeSession.players.forEach(p => { byId[p.id] = p; });
+              NetProtocol.applySnapshotV1(GameStateManager.world, byId, msg);
+              GameStateManager.rebuildWalls();
+              if (msg.tick != null) this.lastAppliedTick = msg.tick;
+              GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
+            }
           }
           if (msg.type === Net.Msg.WELCOME && msg.slot != null) {
             this.pendingWelcomeSlot = msg.slot | 0;
@@ -906,25 +912,8 @@
         if (typeof console !== "undefined" && console.error) {
           console.error("SNAPSHOT BUILD ERROR:", err);
         }
-        // Fallback payload keeps clients connected and allows recovery while logs expose root cause.
-        payload = {
-          v: Net.PROTOCOL_VERSION,
-          type: Net.Msg.SNAPSHOT,
-          tick: this.serverTick | 0,
-          missionElapsed: world && world.missionElapsed != null ? world.missionElapsed : 0,
-          connectedSlots: Array.isArray(NetworkCoordinator.connectedSlots) ? NetworkCoordinator.connectedSlots.slice() : [],
-          players: Array.isArray(this.players) ? this.players.map((p) => ({
-            id: p && p.id != null ? p.id : 0,
-            x: p && p.x != null ? p.x : 0,
-            y: p && p.y != null ? p.y : 0,
-            vx: p && p.vx != null ? p.vx : 0,
-            vy: p && p.vy != null ? p.vy : 0,
-            role: p && p.role ? p.role : "security_agent",
-            suspicion: p && p.suspicion != null ? p.suspicion : 0,
-            fakeTaskTimer: p && p.fakeTaskTimer != null ? p.fakeTaskTimer : 0,
-            facing: p && p.facing != null ? p.facing : 0
-          })) : []
-        };
+        if (typeof globalThis !== "undefined" && globalThis.__NEURAL_HEIST_HEADLESS_SERVER__) throw err;
+        return;
       }
       try {
         this.transport.emit(Net.Msg.SNAPSHOT, payload);
@@ -4958,6 +4947,8 @@
     roomCode: "",
     localRoom: null,
     lobbyReady: false,
+    currentMatchId: "",
+    pendingStartMatchId: "",
     /** Optional wss:// URL for Render/dedicated host; empty = same-browser / local lobby. */
     multiplayerDedicatedUrl: "",
     /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
@@ -6666,6 +6657,7 @@
     },
     syncStateFromPhase() {
       if (this.phase === "lobby") this.currentState = STATES.MULTIPLAYER_LOBBY;
+      else if (this.phase === "starting_match") this.currentState = STATES.MULTIPLAYER_LOBBY;
       else if (this.phase === "playing") this.currentState = this.mode === "hack" ? STATES.HACKING : STATES.CAMPAIGN;
       else if (this.phase === "mission_win" || this.phase === "mission_fail" || this.phase === "final_cutscene") this.currentState = STATES.GAMEOVER;
       else if (this.phase === "loading_next") this.currentState = STATES.GAMEOVER;
@@ -7359,9 +7351,16 @@
       const incomingMatchId = String(msg.matchId || "");
       if (incomingMatchId && this.currentMatchId && this.currentMatchId === incomingMatchId && this.phase === "playing") return;
       if (incomingMatchId) this.currentMatchId = incomingMatchId;
-      if (this.phase === "playing" || this.phase === "intro_cutscene") return;
       if (msg.missionId != null) this.missionId = msg.missionId | 0;
-      this._setHint("Match starting...", "#8fdfff", 2.4);
+      this.pendingStartMatchId = incomingMatchId || this.pendingStartMatchId || this.currentMatchId;
+      if (this.phase === "playing" || this.phase === "intro_cutscene") return;
+      this.setPhase("starting_match");
+      this._setHint("Match starting... waiting for first snapshot.", "#8fdfff", 2.4);
+    },
+    _unlockClientAfterFirstSnapshot(matchId) {
+      if (!matchId || this.pendingStartMatchId !== matchId) return;
+      this._dbgLog("clients unlocked", { matchId });
+      this.pendingStartMatchId = "";
       try {
         this.startPlaying();
       } catch (e) {
