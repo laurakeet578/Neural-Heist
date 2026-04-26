@@ -138,17 +138,7 @@
   const Net = {
     PROTOCOL_VERSION: 1,
     Msg: {
-      HELLO: "hello",
-      WELCOME: "welcome",
-      INPUT: "input",
       SNAPSHOT: "snapshot",
-      ACTION: "action",
-      PLAYER_JOINED: "player_joined",
-      PLAYER_LEFT: "player_left",
-      MISSION: "mission",
-      PING: "ping",
-      PONG: "pong",
-      ERROR: "error",
       CREATE_MATCH: "create_match",
       JOIN_MATCH: "join_match",
       REQUEST_START: "request_start",
@@ -156,8 +146,7 @@
       MATCH_CREATED: "match_created",
       MATCH_JOINED: "match_joined",
       MATCH_STARTED: "match_started",
-      CUTSCENE_SKIPPED: "cutscene_skipped",
-      SNAPSHOT_ACK: "snapshot_ack"
+      MATCH_ERROR: "match_error"
     }
   };
 
@@ -464,7 +453,8 @@
     wsEverReceivedSnapshot: false,
     _wsManualClose: false,
     wsConnected: false,
-    wsConnectionState: "idle",
+    wsConnectionState: "disconnected",
+    wsReadyTimer: null,
     wsDisconnectUiTimer: null,
     pendingWelcomeSlot: null,
     pendingWelcomeSlotCount: null,
@@ -482,9 +472,11 @@
       if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
       if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
       if (this.wsDisconnectUiTimer) clearTimeout(this.wsDisconnectUiTimer);
+      if (this.wsReadyTimer) clearTimeout(this.wsReadyTimer);
       this.wsReconnectTimer = null;
       this.wsHeartbeatTimer = null;
       this.wsDisconnectUiTimer = null;
+      this.wsReadyTimer = null;
     },
     _scheduleWsReconnect(reason) {
       if (this._wsManualClose || !this.wsUrl || typeof window === "undefined") return;
@@ -563,10 +555,9 @@
             this.wsDisconnectUiTimer = null;
           }
           this.wsConnected = true;
-          this.wsConnectionState = "connected";
+          this.wsConnectionState = "connecting";
           this._logWs("connect success", { url: connectUrl });
           this.wsReconnectAttempt = 0;
-          this.wsLastPongAt = Date.now();
           this.wsLastSnapshotAt = Date.now();
           this.wsEverReceivedSnapshot = false;
           this.wsAckedMatchId = "";
@@ -574,10 +565,6 @@
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
             if (!sock || sock.readyState !== 1) return;
-            if (Date.now() - this.wsLastPongAt > 35000) {
-              try { sock.close(); } catch (e) {}
-              return;
-            }
             // Only enforce snapshot stall once a mission is actively running.
             const phase = GameStateManager ? GameStateManager.phase : "";
             const needsSnapshotFeed = phase === "playing";
@@ -593,39 +580,41 @@
                 this._logWs("waiting for first snapshot", { sinceOpenMs: sinceSnap, phase });
               }
             }
-            try { sock.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PING, t: Date.now() })); } catch (e) {}
           }, 10000);
-          const hello = { v: Net.PROTOCOL_VERSION, type: Net.Msg.HELLO, client: "neural-heist-web" };
-          const maxM = Math.max(1, MISSIONS.length - 1);
-          hello.missionId = clamp((GameStateManager.missionId | 0) || 1, 1, maxM);
-          if (typeof window !== "undefined" && window.NEURAL_HEIST_SLOTS != null) {
-            hello.slotCount = clamp(window.NEURAL_HEIST_SLOTS | 0, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS);
-          }
-          this.ws.send(JSON.stringify(hello));
+          if (this.wsReadyTimer) clearTimeout(this.wsReadyTimer);
+          this.wsReadyTimer = setTimeout(() => {
+            this.wsReadyTimer = null;
+            if (this.ws && this.ws.readyState === 1) {
+              this.wsConnectionState = "ready";
+              this._logWs("connection ready", { url: connectUrl });
+            }
+          }, 180);
         };
         this.ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch (e) { return; }
           this._logWs("message received", { type: msg && msg.type, payload: msg });
-          if (msg.type === Net.Msg.PONG) {
-            this.wsLastPongAt = Date.now();
-            return;
-          }
-          if ((msg.type === Net.Msg.ERROR || msg.type === "match_error") && msg.message && GameStateManager._setHint) {
+          if (msg.type === Net.Msg.MATCH_ERROR && msg.message && GameStateManager._setHint) {
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
+            return;
           }
           if (msg.type === Net.Msg.SNAPSHOT) {
             this.wsLastSnapshotAt = Date.now();
             this.wsEverReceivedSnapshot = true;
             const matchId = String(msg.matchId || "");
-            if (matchId && this.wsAckedMatchId !== matchId && this.ws && this.ws.readyState === 1) {
-              this.wsAckedMatchId = matchId;
-              const ack = { v: Net.PROTOCOL_VERSION, type: Net.Msg.SNAPSHOT_ACK, matchId };
-              try {
-                this.ws.send(JSON.stringify(ack));
-                this._logWs("first snapshot ACK sent", ack);
-              } catch (e) {
-                this._logWs("snapshot ACK send failed", { error: String(e && e.message ? e.message : e), ack });
+            const expectedMatchId = String(GameStateManager.pendingStartMatchId || GameStateManager.currentMatchId || "");
+            if (!matchId || (expectedMatchId && expectedMatchId !== matchId)) {
+              this._logWs("snapshot dropped invalid match scope", { expectedMatchId, receivedMatchId: matchId || null });
+              return;
+            }
+            this._logWs("snapshot received", { matchId, tick: msg.tick != null ? msg.tick : null });
+            const snapshotGamePhase = String(msg.gamePhase || "");
+            if (snapshotGamePhase && GameStateManager && typeof GameStateManager.setPhase === "function"
+              && GameStateManager.phase !== snapshotGamePhase) {
+              const localPhase = String(GameStateManager.phase || "");
+              const cutsceneLike = localPhase.includes("cutscene") || snapshotGamePhase.includes("cutscene");
+              if (cutsceneLike) {
+                GameStateManager.setPhase(snapshotGamePhase);
               }
             }
             if (matchId && GameStateManager && GameStateManager.pendingStartMatchId === matchId
@@ -643,32 +632,21 @@
               if (msg.tick != null) this.lastAppliedTick = msg.tick;
               GameStateManager.player = GameStateManager._resolveLocalPlayer(AuthoritativeSession.players);
             }
-          }
-          if (msg.type === Net.Msg.WELCOME && msg.slot != null) {
-            this.pendingWelcomeSlot = msg.slot | 0;
-            if (msg.slotCount != null) this.pendingWelcomeSlotCount = msg.slotCount | 0;
-            this._applyPendingWelcome();
             return;
           }
-          if (msg.type === Net.Msg.MATCH_CREATED || msg.type === Net.Msg.MATCH_JOINED
-            || msg.type === "room_join_result" || msg.type === "joinRoomResult" || msg.type === "roomJoinResult") {
+          if (msg.type === Net.Msg.MATCH_CREATED || msg.type === Net.Msg.MATCH_JOINED) {
             if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
               GameStateManager._onRoomJoinResult(msg);
             }
             return;
           }
-          if (msg.type === Net.Msg.MATCH_STARTED || msg.type === "game_start" || msg.type === "gameStart") {
+          if (msg.type === Net.Msg.MATCH_STARTED) {
             if (GameStateManager && typeof GameStateManager._onServerGameStart === "function") {
               GameStateManager._onServerGameStart(msg);
             }
             return;
           }
-          if (msg.type === Net.Msg.CUTSCENE_SKIPPED || msg.type === "cutsceneSkipped") {
-            if (GameStateManager && typeof GameStateManager._onServerCutsceneSkipped === "function") {
-              GameStateManager._onServerCutsceneSkipped(msg);
-            }
-            return;
-          }
+          this._logWs("contract violation: unexpected server event", { type: msg && msg.type ? msg.type : null });
         };
         this.ws.onerror = () => {
           this._logWs("error", { url: connectUrl });
@@ -676,6 +654,10 @@
         this.ws.onclose = (ev) => {
           const wasManual = !!this._wsManualClose;
           this.wsConnected = false;
+          if (this.wsReadyTimer) {
+            clearTimeout(this.wsReadyTimer);
+            this.wsReadyTimer = null;
+          }
           if (this.wsDisconnectUiTimer) clearTimeout(this.wsDisconnectUiTimer);
           this.wsDisconnectUiTimer = setTimeout(() => {
             this.wsConnectionState = "disconnected";
@@ -717,14 +699,8 @@
         return;
       }
       if (!this.ws || this.ws.readyState !== 1) return;
-      this.inputSeq++;
-      this.ws.send(JSON.stringify({
-        v: Net.PROTOCOL_VERSION,
-        type: Net.Msg.INPUT,
-        seq: this.inputSeq,
-        tick: AuthoritativeSession.serverTick,
-        payload: inputPayload
-      }));
+      // Strict protocol mode: no ad-hoc INPUT event allowed.
+      void inputPayload;
     },
     /** Discrete gameplay intents — server must validate and apply (same code path as host try*). */
     sendMissionAction(payload, slot) {
@@ -742,14 +718,9 @@
         return;
       }
       if (!this.ws || this.ws.readyState !== 1) return;
-      this.actionSeq++;
-      this.ws.send(JSON.stringify({
-        v: Net.PROTOCOL_VERSION,
-        type: Net.Msg.ACTION,
-        seq: this.actionSeq,
-        slot: slot | 0,
-        payload
-      }));
+      // Strict protocol mode: no ad-hoc ACTION event allowed.
+      void payload;
+      void slot;
     },
     onMissionStart() {
       if (typeof window !== "undefined" && window.NEURAL_HEIST_WS && !this.ws) {
@@ -7250,7 +7221,12 @@
     },
     _isMultiplayerTransportReady() {
       if (this.gameMode !== "online_mock") return false;
-      return !!(NetworkCoordinator.wsConnected && NetworkCoordinator.ws && NetworkCoordinator.ws.readyState === 1);
+      return !!(
+        NetworkCoordinator.wsConnectionState === "ready"
+        && NetworkCoordinator.wsConnected
+        && NetworkCoordinator.ws
+        && NetworkCoordinator.ws.readyState === 1
+      );
     },
     _hasValidMultiplayerSession() {
       if (this.gameMode !== "online_mock") return false;
@@ -7265,7 +7241,7 @@
       }
     },
     _sendWsRoomCreateRequest() {
-      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) {
+      if (!this._isMultiplayerTransportReady()) {
         this._setHint("Not connected to server.", "#ffb08a", 2.4);
         return;
       }
@@ -7284,7 +7260,7 @@
         this._setHint("Enter a room code first.", "#ffb08a", 2.4);
         return;
       }
-      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) {
+      if (!this._isMultiplayerTransportReady()) {
         this._setHint("Not connected to server.", "#ffb08a", 2.4);
         return;
       }
@@ -9191,8 +9167,8 @@
     },
     drawMultiplayerMenu() {
       const u = VisualJuice.uiT;
-      const connState = NetworkCoordinator.wsConnectionState || "idle";
-      const connected = connState === "connected" && this._isMultiplayerTransportReady();
+      const connState = NetworkCoordinator.wsConnectionState || "disconnected";
+      const connected = connState === "ready" && this._isMultiplayerTransportReady();
       const g = ctx.createRadialGradient(VIEW_W / 2, 200, 10, VIEW_W / 2, 360, 460);
       g.addColorStop(0, "rgba(0,70,95,0.28)");
       g.addColorStop(1, "rgba(0,0,0,0)");
