@@ -612,7 +612,7 @@
             this._applyPendingWelcome();
             return;
           }
-          if (msg.type === Net.Msg.ROOM_JOIN_RESULT) {
+          if (msg.type === Net.Msg.ROOM_JOIN_RESULT || msg.type === "joinRoomResult" || msg.type === "roomJoinResult") {
             if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
               GameStateManager._onRoomJoinResult(msg);
             }
@@ -6622,16 +6622,19 @@
         if (this._isMultiplayerTransportReady()) {
           const act = this._multiplayerPendingAction;
           this._multiplayerPendingAction = "";
-          this.enterLobby(this.missionId || 1);
           if (act === "host" && !this.localRoom) {
             if (NetworkCoordinator.mode === "ws_client") {
+              this._dbgLog("host requested: waiting for server room_create confirmation");
               this._sendWsRoomCreateRequest();
             } else {
+              this.enterLobby(this.missionId || 1);
               this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
               this.roomCode = this.localRoom.roomCode;
               this.localPlayerId = 0;
               this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
             }
+          } else {
+            this.enterLobby(this.missionId || 1);
           }
         }
       }
@@ -7065,6 +7068,7 @@
           this.tryTerminalLoginClick(mx, my);
           return;
         case "multiplayer_menu":
+          this._dbgLog("pointer dispatch: multiplayer_menu", { mx, my });
           this.tryMultiplayerMenuClick(mx, my);
           return;
         case "title":
@@ -7092,6 +7096,7 @@
           this.skipPostLevel5Cutscene();
           return;
         case "lobby":
+          this._dbgLog("pointer dispatch: lobby", { mx, my });
           this.tryLobbyClick(mx, my);
           return;
         default:
@@ -7235,6 +7240,7 @@
       this.roomCode = roomCode;
       if (msg.slot != null) this.localPlayerId = msg.slot | 0;
       this.lobbyReady = connectedCount >= 2;
+      if (this.phase !== "lobby") this.setPhase("lobby");
       if (msg.created) this._setHint("Room created: " + roomCode, "#8fdfff", 3.2);
       else this._setHint("Joined room " + roomCode, "#8fdfff", 3.2);
     },
@@ -7260,12 +7266,14 @@
       const cx0 = VIEW_W / 2 - 170;
       const cx1 = VIEW_W / 2 + 170;
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
+        this._dbgLog("button click: multiplayer back", { mx, my });
         SFX.play("ui_click");
         this._multiplayerPendingAction = "";
         this.setPhase(this._multiplayerMenuReturnPhase === "title" ? "title" : "terminal_login");
         return;
       }
       if (mx > cx0 && mx < cx1 && my > 224 && my < 276) {
+        this._dbgLog("button click: multiplayer host", { mx, my });
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_host");
@@ -7273,6 +7281,7 @@
         return;
       }
       if (mx > cx0 && mx < cx1 && my > 292 && my < 344) {
+        this._dbgLog("button click: multiplayer join", { mx, my });
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_join");
@@ -7338,6 +7347,7 @@
         return;
       }
       if (mx > VIEW_W / 2 - 260 && mx < VIEW_W / 2 - 80 && my > 468 && my < 516) {
+        this._dbgLog("button click: lobby create room", { mx, my, mode: NetworkCoordinator.mode });
         SFX.play("ui_click");
         if (NetworkCoordinator.mode === "ws_client") {
           this._sendWsRoomCreateRequest();
@@ -7351,6 +7361,7 @@
         return;
       }
       if (mx > VIEW_W / 2 - 60 && mx < VIEW_W / 2 + 120 && my > 468 && my < 516) {
+        this._dbgLog("button click: lobby join room", { mx, my, mode: NetworkCoordinator.mode });
         SFX.play("ui_click");
         const entered = (typeof window !== "undefined" && window.prompt) ? window.prompt("Enter 4-digit room code", this.roomCode || "") : "";
         if (NetworkCoordinator.mode === "ws_client") {
@@ -7368,12 +7379,14 @@
         return;
       }
       if (mx > VIEW_W / 2 + 140 && mx < VIEW_W / 2 + 320 && my > 468 && my < 516) {
+        this._dbgLog("button click: lobby start mission", { mx, my });
         SFX.play("ui_click");
         this.lobbyReady = true;
         this.startLobbyMatch();
         return;
       }
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
+        this._dbgLog("button click: lobby back", { mx, my });
         SFX.play("ui_click");
         this._leaveLocalRoom("lobby_back");
         this.setPhase("mission_select");

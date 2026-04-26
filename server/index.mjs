@@ -168,11 +168,13 @@ function main() {
   }
 
   function sendRoomJoinResult(ws, payload) {
-    ws.send(JSON.stringify({
+    const out = {
       v: Net.PROTOCOL_VERSION,
       type: Net.Msg.ROOM_JOIN_RESULT || "room_join_result",
       ...payload
-    }));
+    };
+    log("room join response", out);
+    ws.send(JSON.stringify(out));
   }
 
   function assignClientToRoom(ws, code, created) {
@@ -324,7 +326,7 @@ function main() {
           return;
         }
 
-        if (msg.type === (Net.Msg.ROOM_CREATE || "room_create")) {
+        if (msg.type === (Net.Msg.ROOM_CREATE || "room_create") || msg.type === "createRoom") {
           let code = randomRoomCode();
           while (rooms.has(code)) code = randomRoomCode();
           rooms.set(code, { roomCode: code, slots: new Array(activeSlotCount).fill(null) });
@@ -335,7 +337,7 @@ function main() {
           return;
         }
 
-        if (msg.type === (Net.Msg.ROOM_JOIN || "room_join")) {
+        if (msg.type === (Net.Msg.ROOM_JOIN || "room_join") || msg.type === "joinRoom") {
           const code = normalizeRoomCode(msg.roomCode);
           log("room join request", { requested: msg.roomCode, normalized: code });
           if (!code) {
