@@ -46,6 +46,8 @@
     return "wss://neural-heist.onrender.com/ws";
   })();
   const canvas = document.getElementById("c");
+  const canvasHasEvents = !!(canvas && typeof canvas.addEventListener === "function" && typeof canvas.removeEventListener === "function");
+  const canvasHasClassList = !!(canvas && canvas.classList && typeof canvas.classList.add === "function" && typeof canvas.classList.remove === "function");
   const ctx = canvas.getContext("2d");
   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
   const lerp = (a,b,t) => a + (b-a)*t;
@@ -147,12 +149,13 @@
       PING: "ping",
       PONG: "pong",
       ERROR: "error",
-      ROOM_CREATE: "room_create",
-      ROOM_JOIN: "room_join",
-      ROOM_JOIN_RESULT: "room_join_result",
-      START_MATCH: "start_match",
-      GAME_START: "game_start",
-      CUTSCENE_SKIP_REQUEST: "cutscene_skip_request",
+      CREATE_MATCH: "create_match",
+      JOIN_MATCH: "join_match",
+      REQUEST_START: "request_start",
+      REQUEST_CUTSCENE_SKIP: "request_cutscene_skip",
+      MATCH_CREATED: "match_created",
+      MATCH_JOINED: "match_joined",
+      MATCH_STARTED: "match_started",
       CUTSCENE_SKIPPED: "cutscene_skipped",
       SNAPSHOT_ACK: "snapshot_ack"
     }
@@ -608,7 +611,7 @@
             this.wsLastPongAt = Date.now();
             return;
           }
-          if (msg.type === Net.Msg.ERROR && msg.message && GameStateManager._setHint) {
+          if ((msg.type === Net.Msg.ERROR || msg.type === "match_error") && msg.message && GameStateManager._setHint) {
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
           }
           if (msg.type === Net.Msg.SNAPSHOT) {
@@ -647,13 +650,14 @@
             this._applyPendingWelcome();
             return;
           }
-          if (msg.type === Net.Msg.ROOM_JOIN_RESULT || msg.type === "joinRoomResult" || msg.type === "roomJoinResult") {
+          if (msg.type === Net.Msg.MATCH_CREATED || msg.type === Net.Msg.MATCH_JOINED
+            || msg.type === "room_join_result" || msg.type === "joinRoomResult" || msg.type === "roomJoinResult") {
             if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
               GameStateManager._onRoomJoinResult(msg);
             }
             return;
           }
-          if (msg.type === Net.Msg.GAME_START || msg.type === "gameStart") {
+          if (msg.type === Net.Msg.MATCH_STARTED || msg.type === "game_start" || msg.type === "gameStart") {
             if (GameStateManager && typeof GameStateManager._onServerGameStart === "function") {
               GameStateManager._onServerGameStart(msg);
             }
@@ -3212,7 +3216,7 @@
       this.onMistakeCb = onMistake;
       this.stageIndex = 0;
       this._applyStage(0);
-      canvas.classList.add("hack-cursor");
+      if (canvasHasClassList) canvas.classList.add("hack-cursor");
     }
     exit() {
       this._sessionGen++;
@@ -3230,8 +3234,8 @@
         clearTimeout(this._clickCooldownTimer);
         this._clickCooldownTimer = null;
       }
-      canvas.style.pointerEvents = "auto";
-      canvas.classList.remove("hack-cursor");
+      if (canvas && canvas.style) canvas.style.pointerEvents = "auto";
+      if (canvasHasClassList) canvas.classList.remove("hack-cursor");
     }
     _fireSuccessOnce() {
       if (this._completionFired) return;
@@ -3367,10 +3371,10 @@
     }
     _beginTransitionLock(ms) {
       this.isTransitioning = true;
-      canvas.style.pointerEvents = "none";
+      if (canvas && canvas.style) canvas.style.pointerEvents = "none";
       setTimeout(() => {
         this.isTransitioning = false;
-        canvas.style.pointerEvents = "auto";
+        if (canvas && canvas.style) canvas.style.pointerEvents = "auto";
       }, ms);
     }
     failCurrentRun() {
@@ -4896,9 +4900,11 @@
         const mx = (e.clientX-rect.left)*sx, my = (e.clientY-rect.top)*sy;
         GameStateManager.hack.setPointer(mx, my);
       };
-      canvas.addEventListener("pointerdown", this._gamePointerDown);
-      canvas.addEventListener("pointerup", this._pointerUp);
-      canvas.addEventListener("pointermove", this._pointerMove);
+      if (canvasHasEvents) {
+        canvas.addEventListener("pointerdown", this._gamePointerDown);
+        canvas.addEventListener("pointerup", this._pointerUp);
+        canvas.addEventListener("pointermove", this._pointerMove);
+      }
       document.getElementById("breachBtn").addEventListener("click", (e) => {
         e.preventDefault(); canvas.focus(); GameStateManager.requestInteract();
       });
@@ -4906,16 +4912,16 @@
     enterHackingMode() {
       if (this._hackingListenersActive) return;
       if (this._bound) {
-        if (this._gamePointerDown) canvas.removeEventListener("pointerdown", this._gamePointerDown);
-        if (this._hackPointerDown) canvas.addEventListener("pointerdown", this._hackPointerDown);
+        if (canvasHasEvents && this._gamePointerDown) canvas.removeEventListener("pointerdown", this._gamePointerDown);
+        if (canvasHasEvents && this._hackPointerDown) canvas.addEventListener("pointerdown", this._hackPointerDown);
       }
       this._hackingListenersActive = true;
     },
     exitHackingMode() {
       if (!this._hackingListenersActive) return;
       if (this._bound) {
-        if (this._hackPointerDown) canvas.removeEventListener("pointerdown", this._hackPointerDown);
-        if (this._gamePointerDown) canvas.addEventListener("pointerdown", this._gamePointerDown);
+        if (canvasHasEvents && this._hackPointerDown) canvas.removeEventListener("pointerdown", this._hackPointerDown);
+        if (canvasHasEvents && this._gamePointerDown) canvas.addEventListener("pointerdown", this._gamePointerDown);
       }
       this._hackingListenersActive = false;
     }
@@ -7263,7 +7269,7 @@
         this._setHint("Not connected to server.", "#ffb08a", 2.4);
         return;
       }
-      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.ROOM_CREATE };
+      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.CREATE_MATCH };
       this._dbgLog("sending room create request", payload);
       try {
         NetworkCoordinator.ws.send(JSON.stringify(payload));
@@ -7282,7 +7288,7 @@
         this._setHint("Not connected to server.", "#ffb08a", 2.4);
         return;
       }
-      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.ROOM_JOIN, roomCode };
+      const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.JOIN_MATCH, roomCode };
       this._dbgLog("sending room join request", payload);
       try {
         NetworkCoordinator.ws.send(JSON.stringify(payload));
@@ -7298,7 +7304,7 @@
       }
       const payload = {
         v: Net.PROTOCOL_VERSION,
-        type: Net.Msg.START_MATCH,
+        type: Net.Msg.REQUEST_START,
         roomCode: String(this.roomCode || "").trim().toUpperCase(),
         missionId: this.missionId | 0
       };
@@ -7373,7 +7379,7 @@
       if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) return false;
       const payload = {
         v: Net.PROTOCOL_VERSION,
-        type: Net.Msg.CUTSCENE_SKIP_REQUEST,
+        type: Net.Msg.REQUEST_CUTSCENE_SKIP,
         roomCode: String(this.roomCode || "").trim().toUpperCase(),
         phase: String(phaseName || "")
       };

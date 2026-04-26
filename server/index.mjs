@@ -196,14 +196,21 @@ function main() {
     }
   }
 
-  function sendRoomJoinResult(ws, payload) {
+  function sendMatchState(ws, payload) {
+    const evt = payload && payload.created ? (Net.Msg.MATCH_CREATED || "match_created") : (Net.Msg.MATCH_JOINED || "match_joined");
     const out = {
       v: Net.PROTOCOL_VERSION,
-      type: Net.Msg.ROOM_JOIN_RESULT || "room_join_result",
+      type: evt,
       ...payload
     };
-    log("room join response", out);
+    log("match state response", out);
     ws.send(JSON.stringify(out));
+  }
+
+  function sendMatchError(ws, message, extra = {}) {
+    const out = { v: Net.PROTOCOL_VERSION, type: "match_error", message, ...extra };
+    log("match error response", out);
+    try { ws.send(JSON.stringify(out)); } catch (e) {}
   }
 
   function broadcastRoomState(code, opts = {}) {
@@ -223,7 +230,7 @@ function main() {
     for (let i = 0; i < room.slots.length; i++) {
       const sock = room.slots[i];
       if (!sock || sock.readyState !== 1) continue;
-      sendRoomJoinResult(sock, { ...base, slot: i });
+      sendMatchState(sock, { ...base, slot: i });
     }
   }
 
@@ -247,7 +254,7 @@ function main() {
       room.phase = RoomPhase.ENDED;
       broadcastRoomMessage(code, {
         v: Net.PROTOCOL_VERSION,
-        type: Net.Msg.ERROR,
+        type: "match_error",
         message: "Match aborted: " + reason,
         roomCode: code,
         matchId: activeMatch.matchId
@@ -553,7 +560,7 @@ function main() {
           return;
         }
 
-        if (msg.type === (Net.Msg.ROOM_CREATE || "room_create") || msg.type === "createRoom") {
+        if (msg.type === (Net.Msg.CREATE_MATCH || "create_match") || msg.type === "createRoom" || msg.type === "room_create") {
           let code = randomRoomCode();
           while (rooms.has(code)) code = randomRoomCode();
           rooms.set(code, {
@@ -565,62 +572,62 @@ function main() {
           log("room created", { roomCode: code, slotCount: activeSlotCount });
           const result = assignClientToRoom(ws, code, true);
           log("room create assign", result);
-          if (!result.ok) sendRoomJoinResult(ws, result);
+          if (!result.ok) sendMatchError(ws, result.error || "Match create failed.");
           else broadcastRoomState(code, { created: true });
           return;
         }
 
-        if (msg.type === (Net.Msg.ROOM_JOIN || "room_join") || msg.type === "joinRoom") {
+        if (msg.type === (Net.Msg.JOIN_MATCH || "join_match") || msg.type === "joinRoom" || msg.type === "room_join") {
           const code = normalizeRoomCode(msg.roomCode);
           log("room join request", { requested: msg.roomCode, normalized: code });
           if (!code) {
-            sendRoomJoinResult(ws, { ok: false, error: "Invalid room code." });
+            sendMatchError(ws, "Invalid room code.");
             return;
           }
           const room = rooms.get(code);
           if (!room) {
             log("room not found", { roomCode: code });
-            sendRoomJoinResult(ws, { ok: false, error: "Room not found." });
+            sendMatchError(ws, "Room not found.");
             return;
           }
           log("room found", { roomCode: code, connectedCount: room.slots.filter(Boolean).length });
           const result = assignClientToRoom(ws, code, false);
           log("room player added", result);
-          if (!result.ok) sendRoomJoinResult(ws, result);
+          if (!result.ok) sendMatchError(ws, result.error || "Join failed.");
           else broadcastRoomState(code, { created: false });
           return;
         }
 
-        if (msg.type === (Net.Msg.START_MATCH || "start_match") || msg.type === "startMatch") {
+        if (msg.type === (Net.Msg.REQUEST_START || "request_start") || msg.type === "startMatch" || msg.type === "start_match") {
           const code = normalizeRoomCode(msg.roomCode || roomByClient.get(ws));
           log("game_start received", { roomCode: code, missionId: msg.missionId });
           if (!code) {
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Invalid room code." }));
+            sendMatchError(ws, "Invalid room code.");
             return;
           }
           const room = rooms.get(code);
           if (!room) {
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Room not found." }));
+            sendMatchError(ws, "Room not found.");
             return;
           }
           if (activeMatch && activeMatch.roomCode !== code && (activeMatch.phase === RoomPhase.STARTING || activeMatch.phase === RoomPhase.RUNNING)) {
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Another room match is already running." }));
+            sendMatchError(ws, "Another room match is already running.");
             return;
           }
           const hostSock = room.slots[0];
           if (hostSock !== ws) {
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Only host can start match." }));
+            sendMatchError(ws, "Only host can start match.");
             return;
           }
           const connectedCount = room.slots.filter(Boolean).length;
           if (connectedCount < 2) {
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Need at least 2 players." }));
+            sendMatchError(ws, "Need at least 2 players.");
             return;
           }
           if (activeMatch && activeMatch.roomCode === code && (activeMatch.phase === RoomPhase.STARTING || activeMatch.phase === RoomPhase.RUNNING)) {
             ws.send(JSON.stringify({
               v: Net.PROTOCOL_VERSION,
-              type: Net.Msg.GAME_START || "game_start",
+              type: Net.Msg.MATCH_STARTED || "match_started",
               roomCode: code,
               missionId: activeMissionId,
               connectedCount,
@@ -636,14 +643,14 @@ function main() {
           } catch (startErr) {
             const errText = String(startErr && startErr.stack ? startErr.stack : startErr);
             log("match initialization failed", { roomCode: code, error: errText });
-            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Match start failed: " + errText }));
+            sendMatchError(ws, "Match start failed: " + errText, { roomCode: code });
             return;
           }
           log("match initialized", { roomCode: code, matchId: started.matchId });
           log("world ready", { roomCode: code, matchId: started.matchId, worldExists: !!GameStateManager.world });
           const out = {
             v: Net.PROTOCOL_VERSION,
-            type: Net.Msg.GAME_START || "game_start",
+            type: Net.Msg.MATCH_STARTED || "match_started",
             roomCode: code,
             missionId,
             connectedCount: started.connectedCount,
@@ -654,7 +661,7 @@ function main() {
           return;
         }
 
-        if (msg.type === (Net.Msg.CUTSCENE_SKIP_REQUEST || "cutscene_skip_request") || msg.type === "requestSkipCutscene") {
+        if (msg.type === (Net.Msg.REQUEST_CUTSCENE_SKIP || "request_cutscene_skip") || msg.type === "requestSkipCutscene" || msg.type === "cutscene_skip_request") {
           const code = normalizeRoomCode(msg.roomCode || roomByClient.get(ws));
           const phase = String(msg.phase || "");
           log("skip request received", { roomCode: code, phase });
@@ -775,8 +782,8 @@ function main() {
     NetworkCoordinator._authoritativeRemoteInputs = arr;
     try {
       ensureDedicatedSnapshotTransport();
-      const isActiveMatch = !!(activeMatch && (activeMatch.phase === RoomPhase.STARTING || activeMatch.phase === RoomPhase.RUNNING));
-      if (isActiveMatch) {
+      const isRunningMatch = !!(activeMatch && activeMatch.phase === RoomPhase.RUNNING);
+      if (isRunningMatch) {
         try {
           RT.serverTick(dt);
         } catch (tickErr) {
