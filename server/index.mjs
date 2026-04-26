@@ -236,6 +236,7 @@ function main() {
       slotCount: sc,
       onSnapshot: broadcastSnapshot
     });
+    log("server game state initialized", { missionId: mid, slotCount: sc });
     roomBootstrapped = true;
   }
 
@@ -342,7 +343,7 @@ function main() {
             missionId: activeMissionId,
             slotCount: maxSlots
           }));
-          log("assigned slot", { slot });
+          log("player joined game state", { slot });
           return;
         }
 
@@ -417,7 +418,7 @@ function main() {
     });
     ws.on("close", (code, reasonRaw) => {
       const reason = reasonRaw ? String(reasonRaw) : "";
-      log("connection closed", { code, reason });
+      log("player disconnected reason", { code, reason });
       removeClientFromRoom(ws);
       clients.delete(ws);
       syncPresence();

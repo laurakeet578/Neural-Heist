@@ -7443,110 +7443,128 @@
     },
 
     startMission(mid) {
-      if (!this.hackingSession) this.hackingSession = new HackingSession(this.hack);
-      this.hackingSession.end();
-      this._clearTransientRuntime("startMission");
-      this.missionId = mid;
-      MissionManager.currentMissionIndex = this.missionId;
-      this.world = MissionLoader.load(mid);
-      if (!this.world) return;
-      const w = this.world;
-      const requestedSlots = (typeof window !== "undefined" && window.NEURAL_HEIST_SLOTS != null) ? (window.NEURAL_HEIST_SLOTS | 0) : MULTI_MIN_SLOTS;
-      const lobbySlots = this.localRoom ? (this.localRoom.connectedSlots || []).filter(Boolean).length : 0;
-      const slots = this.gameMode === "online_mock"
-        ? clamp(lobbySlots || requestedSlots, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS)
-        : 1;
-      if (this.gameMode !== "online_mock") this._leaveLocalRoom("start_non_online");
-      if (this.gameMode === "online_mock" && this.roomCode) {
-        NetworkCoordinator.initLocalChannel(this.roomCode, (this.localPlayerId | 0) === 0, this.localPlayerId | 0);
-      } else {
-        NetworkCoordinator.closeLocalChannel();
-      }
-      NetworkManager.mode = this.gameMode;
-      AuthoritativeSession.reset(w, slots, n => NetworkManager.assignRoles(n));
-      NetworkCoordinator._applyPendingWelcome();
-      if (this.gameMode === "online_mock" && this.localRoom) {
-        const conn = (this.localRoom.connectedSlots || []).slice(0, slots);
-        while (conn.length < slots) conn.push(false);
-        NetworkCoordinator.connectedSlots = conn;
-        w.npcs = [];
-      }
-      if (this.gameMode !== "online_mock") this.localPlayerId = 0;
-      this.player = this._resolveLocalPlayer(AuthoritativeSession.players);
-      this._assignNpcIdentities();
-      this.hack.configure(w.hack);
-      this.cam = { x: 0, y: 0 };
-      this._camVx = 0;
-      this._camVy = 0;
-      this.shake = 0;
-      this._worldStaticCanvas = null;
-      this._worldStaticMissionKey = "";
-      this._buildStaticWorldLayer();
-      this.mode = "play";
-      this.npcDialogueText = "";
-      this.npcDialogueUntil = 0;
-      this.npcDialogueSpeaker = "";
-      this.npcDialogueChoices = [];
-      this.npcDialogueAwaitingChoice = false;
-      this.npcDialogueNPC = null;
-      this.npcTask = null;
-      this.npcFavor = null;
-      this._favorChoiceSpecById = null;
-      this.activeRepair = null;
-      this.failTimer = 0;
-      this.exposureMaxTimer = 0;
-      w.primaryDone = false;
-      w.camerasDisabled = false;
-      w.alarm = 0;
-      w.missionElapsed = 0;
-      w.flags.package = false;
-      w.flags.sabotageCooldown = 0;
-      w.flags.lumenSapUntil = 0;
-      w.flags.terminalSabotageLocks = {};
-      w.flags.doorSabotageRevert = null;
-      w.flags.redAlertTimer = null;
-      w.primaryProgress = 0;
-      w.primaryRequired = w.def.primaryRequired != null ? w.def.primaryRequired : 1;
-      w.hackedTerminals = {};
-      w.flags.maxAlarm = 0;
-      w.flags.bonusDataDownloaded = false;
-      w.flags.accessCardFound = false;
-      w.flags.hackSpeedBonus = 0;
-      w.flags.uiBonusCount = 0;
-      w.flags.sideRewardsGranted = {};
-      w.flags.npcFavorDoneCount = 0;
-      w.flags.npcBonusGrantsThisMission = 0;
-      w.flags.npcBonusVisMulUntil = 0;
-      w.flags.npcBonusVisMul = 0;
-      w.flags.npcRelayPingUntil = 0;
-      w.flags.npcHackSnappierUntil = 0;
-      w.flags.npcHackSnappierMul = 0;
-      (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; n._npcBonusCdUntil = 0; });
-      (w.guards || []).forEach(g => { if (g) g.npcBonusBlindUntil = 0; });
-      DetectionSystem.reset(w);
-      MissionSystem.init(w);
-      if (w.doorsOpen) Object.keys(w.doorsOpen).forEach(k => { w.doorsOpen[k] = false; });
-      this.rebuildWalls();
-      AuthoritativeSession.players.forEach(p => {
-        p.suspicion = 0;
-        p.fakeTaskTimer = 0;
-        p.sabotageFxUntil = 0;
-        p.socialPulse = 0;
-        p.accusedFlash = 0;
-        p.reportPulse = 0;
-        p.investigateCd = 0;
-        p.reportCd = 0;
+      this._dbgLog("game start triggered", {
+        missionId: mid,
+        gameMode: this.gameMode,
+        wsMode: NetworkCoordinator.mode,
+        roomCode: this.roomCode || null
       });
-      w.flags.guardFocus = null;
-      if ((typeof window === "undefined" || !window.NEURAL_HEIST_WS) && !(this.gameMode === "online_mock" && this.roomCode)) {
-        NetworkCoordinator.mode = "embedded";
-        if (NetworkCoordinator.ws) {
-          try { NetworkCoordinator.ws.close(); } catch (e) {}
-          NetworkCoordinator.ws = null;
+      try {
+        if (!this.hackingSession) this.hackingSession = new HackingSession(this.hack);
+        this.hackingSession.end();
+        this._clearTransientRuntime("startMission");
+        this.missionId = mid;
+        MissionManager.currentMissionIndex = this.missionId;
+        this.world = MissionLoader.load(mid);
+        if (!this.world) return;
+        const w = this.world;
+        const requestedSlots = (typeof window !== "undefined" && window.NEURAL_HEIST_SLOTS != null) ? (window.NEURAL_HEIST_SLOTS | 0) : MULTI_MIN_SLOTS;
+        const lobbySlots = this.localRoom ? (this.localRoom.connectedSlots || []).filter(Boolean).length : 0;
+        const slots = this.gameMode === "online_mock"
+          ? clamp(lobbySlots || requestedSlots, MULTI_MIN_SLOTS, MULTI_MAX_SLOTS)
+          : 1;
+        if (this.gameMode !== "online_mock") this._leaveLocalRoom("start_non_online");
+        const usingDedicatedWs = this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client";
+        if (this.gameMode === "online_mock" && this.roomCode && !usingDedicatedWs) {
+          NetworkCoordinator.initLocalChannel(this.roomCode, (this.localPlayerId | 0) === 0, this.localPlayerId | 0);
+        } else {
+          NetworkCoordinator.closeLocalChannel();
         }
+        NetworkManager.mode = this.gameMode;
+        AuthoritativeSession.reset(w, slots, n => NetworkManager.assignRoles(n));
+        NetworkCoordinator._applyPendingWelcome();
+        if (this.gameMode === "online_mock" && this.localRoom) {
+          const conn = (this.localRoom.connectedSlots || []).slice(0, slots);
+          while (conn.length < slots) conn.push(false);
+          NetworkCoordinator.connectedSlots = conn;
+          w.npcs = [];
+        }
+        if (this.gameMode !== "online_mock") this.localPlayerId = 0;
+        this.player = this._resolveLocalPlayer(AuthoritativeSession.players);
+        this._dbgLog("player joined game state", {
+          localPlayerId: this.localPlayerId | 0,
+          slots,
+          wsMode: NetworkCoordinator.mode
+        });
+        this._assignNpcIdentities();
+        this.hack.configure(w.hack);
+        this.cam = { x: 0, y: 0 };
+        this._camVx = 0;
+        this._camVy = 0;
+        this.shake = 0;
+        this._worldStaticCanvas = null;
+        this._worldStaticMissionKey = "";
+        this._buildStaticWorldLayer();
+        this.mode = "play";
+        this.npcDialogueText = "";
+        this.npcDialogueUntil = 0;
+        this.npcDialogueSpeaker = "";
+        this.npcDialogueChoices = [];
+        this.npcDialogueAwaitingChoice = false;
+        this.npcDialogueNPC = null;
+        this.npcTask = null;
+        this.npcFavor = null;
+        this._favorChoiceSpecById = null;
+        this.activeRepair = null;
+        this.failTimer = 0;
+        this.exposureMaxTimer = 0;
+        w.primaryDone = false;
+        w.camerasDisabled = false;
+        w.alarm = 0;
+        w.missionElapsed = 0;
+        w.flags.package = false;
+        w.flags.sabotageCooldown = 0;
+        w.flags.lumenSapUntil = 0;
+        w.flags.terminalSabotageLocks = {};
+        w.flags.doorSabotageRevert = null;
+        w.flags.redAlertTimer = null;
+        w.primaryProgress = 0;
+        w.primaryRequired = w.def.primaryRequired != null ? w.def.primaryRequired : 1;
+        w.hackedTerminals = {};
+        w.flags.maxAlarm = 0;
+        w.flags.bonusDataDownloaded = false;
+        w.flags.accessCardFound = false;
+        w.flags.hackSpeedBonus = 0;
+        w.flags.uiBonusCount = 0;
+        w.flags.sideRewardsGranted = {};
+        w.flags.npcFavorDoneCount = 0;
+        w.flags.npcBonusGrantsThisMission = 0;
+        w.flags.npcBonusVisMulUntil = 0;
+        w.flags.npcBonusVisMul = 0;
+        w.flags.npcRelayPingUntil = 0;
+        w.flags.npcHackSnappierUntil = 0;
+        w.flags.npcHackSnappierMul = 0;
+        (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; n._npcBonusCdUntil = 0; });
+        (w.guards || []).forEach(g => { if (g) g.npcBonusBlindUntil = 0; });
+        DetectionSystem.reset(w);
+        MissionSystem.init(w);
+        if (w.doorsOpen) Object.keys(w.doorsOpen).forEach(k => { w.doorsOpen[k] = false; });
+        this.rebuildWalls();
+        AuthoritativeSession.players.forEach(p => {
+          p.suspicion = 0;
+          p.fakeTaskTimer = 0;
+          p.sabotageFxUntil = 0;
+          p.socialPulse = 0;
+          p.accusedFlash = 0;
+          p.reportPulse = 0;
+          p.investigateCd = 0;
+          p.reportCd = 0;
+        });
+        w.flags.guardFocus = null;
+        if ((typeof window === "undefined" || !window.NEURAL_HEIST_WS) && !(this.gameMode === "online_mock" && this.roomCode)) {
+          NetworkCoordinator.mode = "embedded";
+          if (NetworkCoordinator.ws) {
+            try { NetworkCoordinator.ws.close(); } catch (e) {}
+            NetworkCoordinator.ws = null;
+          }
+        }
+        NetworkCoordinator.onMissionStart();
+        AuthoritativeSession.broadcastSnapshot(w);
+      } catch (err) {
+        this._dbgLog("game start error", { error: String(err && err.stack ? err.stack : err) });
+        this._setHint("Game start failed. Check logs.", "#ff8a8a", 3.2);
+        return;
       }
-      NetworkCoordinator.onMissionStart();
-      AuthoritativeSession.broadcastSnapshot(w);
     },
 
     rebuildWalls() {
@@ -7560,6 +7578,7 @@
 
     startPlaying() {
       this.paused = false;
+      this._dbgLog("game start triggered", { phase: this.phase, missionId: this.missionId, mode: this.gameMode });
       if (this.gameMode === "online_mock") {
         if (!this._isMultiplayerTransportReady()) {
           this._setHint("Not connected. Connect to multiplayer server first.", "#ffb08a", 2.6);
