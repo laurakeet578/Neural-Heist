@@ -598,7 +598,25 @@
           try { msg = JSON.parse(ev.data); } catch (e) { return; }
           this._logWs("message received", { type: msg && msg.type, payload: msg });
           if (msg.type === Net.Msg.MATCH_ERROR && msg.message && GameStateManager._setHint) {
+            const errCode = String(msg.code || "");
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
+            if (errCode === "room_not_found" && GameStateManager) {
+              GameStateManager._dbgLog("room_not_found recovery", {
+                roomCode: String(GameStateManager.roomCode || "").toUpperCase()
+              });
+              GameStateManager.localRoom = null;
+              GameStateManager.roomCode = "";
+              GameStateManager.lobbyReady = false;
+              GameStateManager.startRequestSentAt = 0;
+              GameStateManager.startRequestRetryCount = 0;
+              GameStateManager.lobbyAutoStartAt = 0;
+              GameStateManager.lobbyAutoStartNextRetryAt = 0;
+              GameStateManager.lobbyAutoStartRetryCount = 0;
+              if (GameStateManager.phase !== "multiplayer_menu") {
+                GameStateManager.setPhase("multiplayer_menu");
+              }
+              GameStateManager._setHint("Room expired. Host a new room.", "#ffb08a", 3.2);
+            }
             return;
           }
           if (msg.type === Net.Msg.SNAPSHOT) {
@@ -6699,21 +6717,24 @@
       if (this.phase === "lobby" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
         const isHost = this.localPlayerId === 0;
         const roomActive = !!(this.localRoom && this.roomCode);
+        const transportReady = this._isMultiplayerTransportReady();
         const connectedSlots = roomActive && Array.isArray(this.localRoom.connectedSlots)
           ? this.localRoom.connectedSlots
           : [];
         const connectedCount = connectedSlots.filter(Boolean).length;
-        if (isHost && roomActive) {
+        if (isHost && roomActive && transportReady) {
           const now = Date.now();
           if (!this.lobbyAutoStartAt) {
             this.lobbyAutoStartAt = now + 1400;
             this.lobbyAutoStartNextRetryAt = this.lobbyAutoStartAt;
             this.lobbyAutoStartRetryCount = 0;
           }
-          // Auto-start trigger (works even when host is alone; server decides readiness).
-          if (now >= this.lobbyAutoStartAt && now >= this.lobbyAutoStartNextRetryAt && this.lobbyAutoStartRetryCount < 5) {
+          // Auto-start trigger: allow one probe when host is alone, then back off.
+          const soloProbeAllowed = connectedCount < 2 && this.lobbyAutoStartRetryCount < 1;
+          const teamStartAllowed = connectedCount >= 2 && this.lobbyAutoStartRetryCount < 5;
+          if (now >= this.lobbyAutoStartAt && now >= this.lobbyAutoStartNextRetryAt && (soloProbeAllowed || teamStartAllowed)) {
             this.lobbyAutoStartRetryCount++;
-            this.lobbyAutoStartNextRetryAt = now + 3500;
+            this.lobbyAutoStartNextRetryAt = connectedCount < 2 ? (now + 12000) : (now + 3500);
             this._dbgLog("lobby auto request_start", {
               roomCode: this.roomCode,
               connectedCount,
@@ -6721,8 +6742,8 @@
             });
             this._sendWsStartMatchRequest();
           }
-          // Timeout protection: force retry cadence after extended lobby idle.
-          if ((now - this.lobbyAutoStartAt) > 12000 && now >= this.lobbyAutoStartNextRetryAt) {
+          // Timeout protection: force retry cadence after extended lobby idle (only with 2+ players).
+          if (connectedCount >= 2 && (now - this.lobbyAutoStartAt) > 12000 && now >= this.lobbyAutoStartNextRetryAt) {
             this.lobbyAutoStartNextRetryAt = now + 2800;
             this._dbgLog("lobby timeout request_start", {
               roomCode: this.roomCode,
