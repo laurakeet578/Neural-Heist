@@ -121,6 +121,14 @@ function main() {
   let activeSlotCount = NH_SLOT_COUNT;
   /** @type {null | ((payload: object) => void)} */
   let broadcastSnapshot = null;
+  const RoomPhase = {
+    LOBBY: "lobby",
+    STARTING: "starting",
+    RUNNING: "running",
+    ENDED: "ended"
+  };
+  /** @type {null | { roomCode: string, matchId: string, phase: string, startTick: number, firstSnapshotSent: boolean, firstSnapshotTick: number, ackedSockets: Set<import('ws').WebSocket> }} */
+  let activeMatch = null;
 
   function log(tag, payload) {
     const at = new Date().toISOString();
@@ -150,6 +158,10 @@ function main() {
     return String(1000 + ((Math.random() * 9000) | 0));
   }
 
+  function randomMatchId() {
+    return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+  }
+
   function removeClientFromRoom(ws) {
     const code = roomByClient.get(ws);
     if (!code) return;
@@ -161,8 +173,12 @@ function main() {
     }
     const connected = room.slots.filter(Boolean).length;
     log("room player removed", { roomCode: code, connected });
+    if (activeMatch && activeMatch.roomCode === code) {
+      activeMatch.ackedSockets.delete(ws);
+    }
     if (connected > 0) broadcastRoomState(code, { created: false });
     if (connected <= 0) {
+      if (activeMatch && activeMatch.roomCode === code) activeMatch = null;
       rooms.delete(code);
       log("room deleted (empty)", { roomCode: code });
     }
@@ -186,6 +202,8 @@ function main() {
       ok: true,
       created: !!opts.created,
       roomCode: code,
+      phase: room.phase || RoomPhase.LOBBY,
+      matchId: room.matchId || null,
       slotCount: room.slots.length,
       connectedSlots,
       connectedCount: connectedSlots.filter(Boolean).length
@@ -206,6 +224,26 @@ function main() {
       if (!sock || sock.readyState !== 1) continue;
       try { sock.send(json); } catch (e) {}
     }
+  }
+
+  function failActiveMatch(reason) {
+    if (!activeMatch) return;
+    const code = activeMatch.roomCode;
+    const room = rooms.get(code);
+    log("match fail-fast", { roomCode: code, matchId: activeMatch.matchId, reason });
+    if (room) {
+      room.phase = RoomPhase.ENDED;
+      broadcastRoomMessage(code, {
+        v: Net.PROTOCOL_VERSION,
+        type: Net.Msg.ERROR,
+        message: "Match aborted: " + reason,
+        roomCode: code,
+        matchId: activeMatch.matchId
+      });
+      room.phase = RoomPhase.LOBBY;
+      room.matchId = null;
+    }
+    activeMatch = null;
   }
 
   function pushSnapshotNow(reason) {
@@ -254,20 +292,80 @@ function main() {
     activeMissionId = mid;
     activeSlotCount = sc;
     broadcastSnapshot = (payload) => {
-      let json;
-      try {
-        json = JSON.stringify(payload);
-      } catch (err) {
-        log("snapshot stringify error", { error: String(err && err.stack ? err.stack : err) });
+      const runningCode = activeMatch ? activeMatch.roomCode : null;
+      if (runningCode) {
+        const room = rooms.get(runningCode);
+        if (!room) {
+          failActiveMatch("running room not found during snapshot");
+          return;
+        }
+        room.phase = room.phase || RoomPhase.STARTING;
+      }
+      if (!GameStateManager.world) {
+        failActiveMatch("world missing before snapshot generation");
         return;
       }
-      for (const ws of clients.keys()) {
+      if (!Array.isArray(AuthoritativeSession.players) || AuthoritativeSession.players.length <= 0) {
+        failActiveMatch("players missing before snapshot generation");
+        return;
+      }
+      const outPayload = runningCode
+        ? { ...payload, roomCode: runningCode, matchId: activeMatch.matchId }
+        : payload;
+      log("snapshot generated", {
+        roomCode: runningCode,
+        matchId: activeMatch ? activeMatch.matchId : null,
+        tick: payload && payload.tick != null ? payload.tick : null
+      });
+      let json;
+      try {
+        json = JSON.stringify(outPayload);
+        log("snapshot serialized", {
+          roomCode: runningCode,
+          matchId: activeMatch ? activeMatch.matchId : null,
+          size: json.length
+        });
+      } catch (err) {
+        log("snapshot stringify error", { error: String(err && err.stack ? err.stack : err) });
+        failActiveMatch("snapshot serialization failed");
+        return;
+      }
+      let sent = 0;
+      const targets = [];
+      if (runningCode) {
+        const room = rooms.get(runningCode);
+        if (!room) {
+          failActiveMatch("running room missing during broadcast");
+          return;
+        }
+        for (const sock of room.slots) if (sock) targets.push(sock);
+      } else {
+        for (const ws of clients.keys()) targets.push(ws);
+      }
+      for (const ws of targets) {
         if (ws.readyState !== 1) continue;
         try {
           ws.send(json);
+          sent++;
         } catch (err) {
           log("snapshot send error", { error: String(err && err.stack ? err.stack : err) });
         }
+      }
+      log("snapshot broadcast sent", {
+        roomCode: runningCode,
+        matchId: activeMatch ? activeMatch.matchId : null,
+        recipients: sent
+      });
+      if (activeMatch && activeMatch.phase === RoomPhase.STARTING) {
+        if (sent <= 0) {
+          failActiveMatch("first snapshot had zero recipients");
+          return;
+        }
+        activeMatch.firstSnapshotSent = true;
+        activeMatch.firstSnapshotTick = AuthoritativeSession.serverTick | 0;
+        activeMatch.phase = RoomPhase.RUNNING;
+        const room = rooms.get(activeMatch.roomCode);
+        if (room) room.phase = RoomPhase.RUNNING;
       }
     };
     RT.bootstrapDedicatedRoom({
@@ -390,7 +488,12 @@ function main() {
         if (msg.type === (Net.Msg.ROOM_CREATE || "room_create") || msg.type === "createRoom") {
           let code = randomRoomCode();
           while (rooms.has(code)) code = randomRoomCode();
-          rooms.set(code, { roomCode: code, slots: new Array(activeSlotCount).fill(null) });
+          rooms.set(code, {
+            roomCode: code,
+            slots: new Array(activeSlotCount).fill(null),
+            phase: RoomPhase.LOBBY,
+            matchId: null
+          });
           log("room created", { roomCode: code, slotCount: activeSlotCount });
           const result = assignClientToRoom(ws, code, true);
           log("room create assign", result);
@@ -432,6 +535,10 @@ function main() {
             ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Room not found." }));
             return;
           }
+          if (activeMatch && activeMatch.roomCode !== code && (activeMatch.phase === RoomPhase.STARTING || activeMatch.phase === RoomPhase.RUNNING)) {
+            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Another room match is already running." }));
+            return;
+          }
           const hostSock = room.slots[0];
           if (hostSock !== ws) {
             ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Only host can start match." }));
@@ -442,14 +549,38 @@ function main() {
             ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Need at least 2 players." }));
             return;
           }
+          if (activeMatch && activeMatch.roomCode === code && (activeMatch.phase === RoomPhase.STARTING || activeMatch.phase === RoomPhase.RUNNING)) {
+            ws.send(JSON.stringify({
+              v: Net.PROTOCOL_VERSION,
+              type: Net.Msg.GAME_START || "game_start",
+              roomCode: code,
+              missionId: activeMissionId,
+              connectedCount,
+              matchId: activeMatch.matchId
+            }));
+            return;
+          }
           const missionId = clampMissionId(msg.missionId != null ? msg.missionId : activeMissionId);
           console.log("GAME START - SERVER ENTERED");
+          const matchId = randomMatchId();
+          room.phase = RoomPhase.STARTING;
+          room.matchId = matchId;
+          activeMatch = {
+            roomCode: code,
+            matchId,
+            phase: RoomPhase.STARTING,
+            startTick: AuthoritativeSession.serverTick | 0,
+            firstSnapshotSent: false,
+            firstSnapshotTick: -1,
+            ackedSockets: new Set()
+          };
           const out = {
             v: Net.PROTOCOL_VERSION,
             type: Net.Msg.GAME_START || "game_start",
             roomCode: code,
             missionId,
-            connectedCount
+            connectedCount,
+            matchId
           };
           log("room broadcast triggered", out);
           broadcastRoomMessage(code, out);
@@ -477,11 +608,26 @@ function main() {
             v: Net.PROTOCOL_VERSION,
             type: Net.Msg.CUTSCENE_SKIPPED || "cutscene_skipped",
             roomCode: code,
-            phase
+            phase,
+            matchId: activeMatch && activeMatch.roomCode === code ? activeMatch.matchId : null
           };
           log("server cutscene state change", out);
           broadcastRoomMessage(code, out);
           log("broadcast event sent", { type: out.type, roomCode: code, phase });
+          return;
+        }
+
+        if (msg.type === (Net.Msg.SNAPSHOT_ACK || "snapshot_ack")) {
+          if (!activeMatch) return;
+          if (String(msg.matchId || "") !== activeMatch.matchId) return;
+          const roomCode = roomByClient.get(ws);
+          if (roomCode !== activeMatch.roomCode) return;
+          activeMatch.ackedSockets.add(ws);
+          log("snapshot ack received", {
+            roomCode: activeMatch.roomCode,
+            matchId: activeMatch.matchId,
+            acked: activeMatch.ackedSockets.size
+          });
           return;
         }
 
@@ -533,6 +679,7 @@ function main() {
   const dt = 1 / NH_TICK_HZ;
   let warnedMissingWorld = false;
   let lastSnapshotLogAt = 0;
+  let lastRebootstrapAt = 0;
   nodeSetInterval(() => {
     for (const ws of clients.keys()) {
       if (ws.readyState !== 1) continue;
@@ -568,6 +715,12 @@ function main() {
       } catch (tickErr) {
         log("serverTick error", { error: String(tickErr && tickErr.stack ? tickErr.stack : tickErr) });
       }
+      if (activeMatch && activeMatch.phase === RoomPhase.STARTING) {
+        const ticksSinceStart = (AuthoritativeSession.serverTick | 0) - (activeMatch.startTick | 0);
+        if (!activeMatch.firstSnapshotSent && ticksSinceStart > 2) {
+          failActiveMatch("first snapshot not delivered within 2 ticks");
+        }
+      }
       // Safety net: always emit a snapshot each server tick while world is active.
       if (GameStateManager.world) {
         warnedMissingWorld = false;
@@ -581,13 +734,42 @@ function main() {
               roomBootstrapped,
               serverTick: AuthoritativeSession.serverTick | 0
             });
+            if (activeMatch && activeMatch.phase === RoomPhase.RUNNING) {
+              const room = rooms.get(activeMatch.roomCode);
+              const connected = room ? room.slots.filter(Boolean).length : 0;
+              if (activeMatch.ackedSockets.size < connected) {
+                log("critical desync warning: missing snapshot ACK", {
+                  roomCode: activeMatch.roomCode,
+                  matchId: activeMatch.matchId,
+                  acked: activeMatch.ackedSockets.size,
+                  connected
+                });
+              }
+            }
           }
         } catch (snapErr) {
           log("snapshot broadcast error", { error: String(snapErr && snapErr.stack ? snapErr.stack : snapErr) });
         }
-      } else if (!warnedMissingWorld) {
-        warnedMissingWorld = true;
-        log("world missing during tick", { roomBootstrapped, clients: clients.size });
+      } else {
+        if (!warnedMissingWorld) {
+          warnedMissingWorld = true;
+          log("world missing during tick", { roomBootstrapped, clients: clients.size });
+        }
+        const nowMs = Date.now();
+        if (roomBootstrapped && nowMs - lastRebootstrapAt > 5000) {
+          lastRebootstrapAt = nowMs;
+          try {
+            RT.bootstrapDedicatedRoom({
+              missionId: activeMissionId,
+              slotCount: activeSlotCount,
+              onSnapshot: broadcastSnapshot
+            });
+            log("world rebootstrap attempted", { missionId: activeMissionId, slotCount: activeSlotCount });
+            pushSnapshotNow("world_rebootstrap");
+          } catch (rebErr) {
+            log("world rebootstrap error", { error: String(rebErr && rebErr.stack ? rebErr.stack : rebErr) });
+          }
+        }
       }
     } finally {
       NetworkCoordinator._authoritativeRemoteInputs = null;

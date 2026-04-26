@@ -153,7 +153,8 @@
       START_MATCH: "start_match",
       GAME_START: "game_start",
       CUTSCENE_SKIP_REQUEST: "cutscene_skip_request",
-      CUTSCENE_SKIPPED: "cutscene_skipped"
+      CUTSCENE_SKIPPED: "cutscene_skipped",
+      SNAPSHOT_ACK: "snapshot_ack"
     }
   };
 
@@ -464,6 +465,7 @@
     wsDisconnectUiTimer: null,
     pendingWelcomeSlot: null,
     pendingWelcomeSlotCount: null,
+    wsAckedMatchId: "",
     /** false only when live WS client connected and receiving snapshots */
     isAuthoritativeHost() {
       return this.mode !== "ws_client" && this.mode !== "local_client";
@@ -564,6 +566,7 @@
           this.wsLastPongAt = Date.now();
           this.wsLastSnapshotAt = Date.now();
           this.wsEverReceivedSnapshot = false;
+          this.wsAckedMatchId = "";
           if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
@@ -611,6 +614,17 @@
           if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world) {
             this.wsLastSnapshotAt = Date.now();
             this.wsEverReceivedSnapshot = true;
+            const matchId = String(msg.matchId || "");
+            if (matchId && this.wsAckedMatchId !== matchId && this.ws && this.ws.readyState === 1) {
+              this.wsAckedMatchId = matchId;
+              const ack = { v: Net.PROTOCOL_VERSION, type: Net.Msg.SNAPSHOT_ACK, matchId };
+              try {
+                this.ws.send(JSON.stringify(ack));
+                this._logWs("first snapshot ACK sent", ack);
+              } catch (e) {
+                this._logWs("snapshot ACK send failed", { error: String(e && e.message ? e.message : e), ack });
+              }
+            }
             if (Array.isArray(msg.players) && msg.players.length) {
               this._ensureSessionPlayersForCount(msg.players.length);
             }
@@ -7342,6 +7356,9 @@
       if (!msg || msg.ok === false) return;
       const code = String(msg.roomCode || "").toUpperCase();
       if (code && this.roomCode && code !== String(this.roomCode).toUpperCase()) return;
+      const incomingMatchId = String(msg.matchId || "");
+      if (incomingMatchId && this.currentMatchId && this.currentMatchId === incomingMatchId && this.phase === "playing") return;
+      if (incomingMatchId) this.currentMatchId = incomingMatchId;
       if (this.phase === "playing" || this.phase === "intro_cutscene") return;
       if (msg.missionId != null) this.missionId = msg.missionId | 0;
       this._setHint("Match starting...", "#8fdfff", 2.4);
@@ -7384,6 +7401,8 @@
       if (!msg) return;
       const code = String(msg.roomCode || "").toUpperCase();
       if (code && this.roomCode && code !== String(this.roomCode).toUpperCase()) return;
+      const incomingMatchId = String(msg.matchId || "");
+      if (incomingMatchId && this.currentMatchId && incomingMatchId !== this.currentMatchId) return;
       this._applyCutsceneSkipByPhase(msg.phase);
     },
     _goToMultiplayerMissionSelect() {
@@ -7726,6 +7745,10 @@
         this._dbgLog("game start error", { error: String(err && err.stack ? err.stack : err) });
         console.error("GAME CRASH:", err);
         this._setHint("Game start failed. Check logs.", "#ff8a8a", 3.2);
+        if (typeof globalThis !== "undefined" && globalThis.__NEURAL_HEIST_HEADLESS_SERVER__) {
+          // In dedicated server mode, never swallow init failures; surface stack to server logs.
+          throw err;
+        }
         return;
       } finally {
         this._missionInitInProgress = false;
