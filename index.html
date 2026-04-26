@@ -151,7 +151,9 @@
       ROOM_JOIN: "room_join",
       ROOM_JOIN_RESULT: "room_join_result",
       START_MATCH: "start_match",
-      GAME_START: "game_start"
+      GAME_START: "game_start",
+      CUTSCENE_SKIP_REQUEST: "cutscene_skip_request",
+      CUTSCENE_SKIPPED: "cutscene_skipped"
     }
   };
 
@@ -623,6 +625,12 @@
           if (msg.type === Net.Msg.GAME_START || msg.type === "gameStart") {
             if (GameStateManager && typeof GameStateManager._onServerGameStart === "function") {
               GameStateManager._onServerGameStart(msg);
+            }
+            return;
+          }
+          if (msg.type === Net.Msg.CUTSCENE_SKIPPED || msg.type === "cutsceneSkipped") {
+            if (GameStateManager && typeof GameStateManager._onServerCutsceneSkipped === "function") {
+              GameStateManager._onServerCutsceneSkipped(msg);
             }
             return;
           }
@@ -7285,6 +7293,40 @@
       this._setHint("Match starting...", "#8fdfff", 2.4);
       this.startPlaying();
     },
+    _requestCutsceneSkip(phaseName) {
+      if (NetworkCoordinator.mode !== "ws_client") return false;
+      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) return false;
+      const payload = {
+        v: Net.PROTOCOL_VERSION,
+        type: Net.Msg.CUTSCENE_SKIP_REQUEST,
+        roomCode: String(this.roomCode || "").trim().toUpperCase(),
+        phase: String(phaseName || "")
+      };
+      this._dbgLog("skip request sent", payload);
+      try {
+        NetworkCoordinator.ws.send(JSON.stringify(payload));
+        return true;
+      } catch (e) {
+        this._dbgLog("skip request send failed", { error: String(e && e.message ? e.message : e), payload });
+        return false;
+      }
+    },
+    _applyCutsceneSkipByPhase(phaseName) {
+      const p = String(phaseName || "");
+      if (p === "intro_cutscene" && this.phase === p) this.finishIntroCutscene();
+      else if (p === "post_level1_cutscene" && this.phase === p) this.finishPostLevel1Cutscene();
+      else if (p === "post_level2_cutscene" && this.phase === p) this.finishPostLevel2Cutscene();
+      else if (p === "post_level3_cutscene" && this.phase === p) this.finishPostLevel3Cutscene();
+      else if (p === "post_level4_cutscene" && this.phase === p) this.finishPostLevel4Cutscene();
+      else if (p === "post_level5_cutscene" && this.phase === p) this.finishPostLevel5Cutscene();
+    },
+    _onServerCutsceneSkipped(msg) {
+      this._dbgLog("client cutscene state update", msg);
+      if (!msg) return;
+      const code = String(msg.roomCode || "").toUpperCase();
+      if (code && this.roomCode && code !== String(this.roomCode).toUpperCase()) return;
+      this._applyCutsceneSkipByPhase(msg.phase);
+    },
     _goToMultiplayerMissionSelect() {
       this.gameMode = "online_mock";
       this._assignDedicatedCloudUrl();
@@ -7867,6 +7909,7 @@
     },
     skipIntroCutscene() {
       if (this.phase !== "intro_cutscene") return;
+      if (this._requestCutsceneSkip("intro_cutscene")) return;
       this.finishIntroCutscene();
     },
     startPostLevel1Cutscene() {
@@ -7884,6 +7927,7 @@
     },
     skipPostLevel1Cutscene() {
       if (this.phase !== "post_level1_cutscene") return;
+      if (this._requestCutsceneSkip("post_level1_cutscene")) return;
       this.finishPostLevel1Cutscene();
     },
     startPostLevel2Cutscene() {
@@ -7901,6 +7945,7 @@
     },
     skipPostLevel2Cutscene() {
       if (this.phase !== "post_level2_cutscene") return;
+      if (this._requestCutsceneSkip("post_level2_cutscene")) return;
       this.finishPostLevel2Cutscene();
     },
     startPostLevel3Cutscene() {
@@ -7918,6 +7963,7 @@
     },
     skipPostLevel3Cutscene() {
       if (this.phase !== "post_level3_cutscene") return;
+      if (this._requestCutsceneSkip("post_level3_cutscene")) return;
       this.finishPostLevel3Cutscene();
     },
     startPostLevel4Cutscene() {
@@ -7935,6 +7981,7 @@
     },
     skipPostLevel4Cutscene() {
       if (this.phase !== "post_level4_cutscene") return;
+      if (this._requestCutsceneSkip("post_level4_cutscene")) return;
       this.finishPostLevel4Cutscene();
     },
     startPostLevel5Cutscene() {
@@ -7952,6 +7999,7 @@
     },
     skipPostLevel5Cutscene() {
       if (this.phase !== "post_level5_cutscene") return;
+      if (this._requestCutsceneSkip("post_level5_cutscene")) return;
       this.finishPostLevel5Cutscene();
     },
     startFinalCutscene() {

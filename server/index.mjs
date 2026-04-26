@@ -426,6 +426,34 @@ function main() {
           return;
         }
 
+        if (msg.type === (Net.Msg.CUTSCENE_SKIP_REQUEST || "cutscene_skip_request") || msg.type === "requestSkipCutscene") {
+          const code = normalizeRoomCode(msg.roomCode || roomByClient.get(ws));
+          const phase = String(msg.phase || "");
+          log("skip request received", { roomCode: code, phase });
+          if (!code) return;
+          const room = rooms.get(code);
+          if (!room) return;
+          const allowed = new Set([
+            "intro_cutscene",
+            "post_level1_cutscene",
+            "post_level2_cutscene",
+            "post_level3_cutscene",
+            "post_level4_cutscene",
+            "post_level5_cutscene"
+          ]);
+          if (!allowed.has(phase)) return;
+          const out = {
+            v: Net.PROTOCOL_VERSION,
+            type: Net.Msg.CUTSCENE_SKIPPED || "cutscene_skipped",
+            roomCode: code,
+            phase
+          };
+          log("server cutscene state change", out);
+          broadcastRoomMessage(code, out);
+          log("broadcast event sent", { type: out.type, roomCode: code, phase });
+          return;
+        }
+
         const meta = clients.get(ws);
         if (!meta || meta.slot == null) return;
         const slot = meta.slot;
