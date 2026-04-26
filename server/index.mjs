@@ -208,6 +208,23 @@ function main() {
     }
   }
 
+  function pushSnapshotNow(reason) {
+    if (!GameStateManager.world) {
+      log("pushSnapshotNow skipped (no world)", { reason });
+      return;
+    }
+    try {
+      AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+      log("snapshot pushed", {
+        reason,
+        clients: clients.size,
+        tick: AuthoritativeSession.serverTick | 0
+      });
+    } catch (err) {
+      log("pushSnapshotNow error", { reason, error: String(err && err.stack ? err.stack : err) });
+    }
+  }
+
   function assignClientToRoom(ws, code, created) {
     const room = rooms.get(code);
     if (!room) return { ok: false, error: "Room not found." };
@@ -355,6 +372,7 @@ function main() {
             slotCount: maxSlots
           }));
           log("player joined game state", { slot });
+          pushSnapshotNow("hello_welcome");
           return;
         }
 
@@ -424,6 +442,7 @@ function main() {
           };
           log("room broadcast triggered", out);
           broadcastRoomMessage(code, out);
+          pushSnapshotNow("game_start");
           return;
         }
 
@@ -563,6 +582,11 @@ function main() {
       NetworkCoordinator._authoritativeRemoteInputs = null;
     }
   }, Math.round(1000 / NH_TICK_HZ));
+
+  nodeSetInterval(() => {
+    if (!roomBootstrapped || clients.size <= 0) return;
+    pushSnapshotNow("periodic_fallback");
+  }, 1000);
 
   process.on("uncaughtException", (err) => {
     log("uncaughtException", { error: String(err && err.stack ? err.stack : err) });

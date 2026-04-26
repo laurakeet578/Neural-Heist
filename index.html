@@ -849,7 +849,12 @@
     transport: null,
     serverTick: 0,
     reset(world, slotCount, roleAssigner) {
-      this.transport = new MockTransport();
+      const isHeadlessServer = typeof globalThis !== "undefined" && !!globalThis.__NEURAL_HEIST_HEADLESS_SERVER__;
+      const keepDedicatedTransport = isHeadlessServer
+        && this.transport
+        && this.transport.__dedicatedWs === true
+        && typeof this.transport.emit === "function";
+      if (!keepDedicatedTransport) this.transport = new MockTransport();
       this.serverTick = 0;
       this.slotCount = clamp(slotCount || 1, 1, 4);
       this.players = [];
@@ -10332,12 +10337,13 @@
     GameStateManager.mode = "play";
     GameStateManager.currentState = STATES.CAMPAIGN;
     GameStateManager.paused = false;
-    GameStateManager.startMission(mid > 0 ? mid : 1);
     AuthoritativeSession.transport = {
+      __dedicatedWs: true,
       emit(ev, payload) {
         if (ev === Net.Msg.SNAPSHOT && typeof onSnapshot === "function") onSnapshot(payload);
       }
     };
+    GameStateManager.startMission(mid > 0 ? mid : 1);
     return true;
   }
 
