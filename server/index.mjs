@@ -254,9 +254,20 @@ function main() {
     activeMissionId = mid;
     activeSlotCount = sc;
     broadcastSnapshot = (payload) => {
-      const json = JSON.stringify(payload);
+      let json;
+      try {
+        json = JSON.stringify(payload);
+      } catch (err) {
+        log("snapshot stringify error", { error: String(err && err.stack ? err.stack : err) });
+        return;
+      }
       for (const ws of clients.keys()) {
-        if (ws.readyState === 1) ws.send(json);
+        if (ws.readyState !== 1) continue;
+        try {
+          ws.send(json);
+        } catch (err) {
+          log("snapshot send error", { error: String(err && err.stack ? err.stack : err) });
+        }
       }
     };
     RT.bootstrapDedicatedRoom({

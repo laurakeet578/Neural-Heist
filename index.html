@@ -885,9 +885,47 @@
       if (world) this.broadcastSnapshot(world);
     },
     broadcastSnapshot(world) {
-      const payload = NetProtocol.buildSnapshotV1(world, this.players, this.serverTick, NetworkCoordinator.connectedSlots);
-      this.transport.emit(Net.Msg.SNAPSHOT, payload);
-      NetworkCoordinator.broadcastLocalSnapshot(payload);
+      let payload = null;
+      try {
+        payload = NetProtocol.buildSnapshotV1(world, this.players, this.serverTick, NetworkCoordinator.connectedSlots);
+      } catch (err) {
+        if (typeof console !== "undefined" && console.error) {
+          console.error("SNAPSHOT BUILD ERROR:", err);
+        }
+        // Fallback payload keeps clients connected and allows recovery while logs expose root cause.
+        payload = {
+          v: Net.PROTOCOL_VERSION,
+          type: Net.Msg.SNAPSHOT,
+          tick: this.serverTick | 0,
+          missionElapsed: world && world.missionElapsed != null ? world.missionElapsed : 0,
+          connectedSlots: Array.isArray(NetworkCoordinator.connectedSlots) ? NetworkCoordinator.connectedSlots.slice() : [],
+          players: Array.isArray(this.players) ? this.players.map((p) => ({
+            id: p && p.id != null ? p.id : 0,
+            x: p && p.x != null ? p.x : 0,
+            y: p && p.y != null ? p.y : 0,
+            vx: p && p.vx != null ? p.vx : 0,
+            vy: p && p.vy != null ? p.vy : 0,
+            role: p && p.role ? p.role : "security_agent",
+            suspicion: p && p.suspicion != null ? p.suspicion : 0,
+            fakeTaskTimer: p && p.fakeTaskTimer != null ? p.fakeTaskTimer : 0,
+            facing: p && p.facing != null ? p.facing : 0
+          })) : []
+        };
+      }
+      try {
+        this.transport.emit(Net.Msg.SNAPSHOT, payload);
+      } catch (emitErr) {
+        if (typeof console !== "undefined" && console.error) {
+          console.error("SNAPSHOT EMIT ERROR:", emitErr);
+        }
+      }
+      try {
+        NetworkCoordinator.broadcastLocalSnapshot(payload);
+      } catch (bcErr) {
+        if (typeof console !== "undefined" && console.error) {
+          console.error("SNAPSHOT LOCAL BROADCAST ERROR:", bcErr);
+        }
+      }
     },
     allEntities() { return this.players; }
   };
