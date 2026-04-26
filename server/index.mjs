@@ -501,6 +501,8 @@ function main() {
   });
 
   const dt = 1 / NH_TICK_HZ;
+  let warnedMissingWorld = false;
+  let lastSnapshotLogAt = 0;
   nodeSetInterval(() => {
     for (const ws of clients.keys()) {
       if (ws.readyState !== 1) continue;
@@ -531,10 +533,31 @@ function main() {
     }
     NetworkCoordinator._authoritativeRemoteInputs = arr;
     try {
-      RT.serverTick(dt);
+      try {
+        RT.serverTick(dt);
+      } catch (tickErr) {
+        log("serverTick error", { error: String(tickErr && tickErr.stack ? tickErr.stack : tickErr) });
+      }
       // Safety net: always emit a snapshot each server tick while world is active.
       if (GameStateManager.world) {
-        AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+        warnedMissingWorld = false;
+        try {
+          AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+          const nowMs = Date.now();
+          if (nowMs - lastSnapshotLogAt > 10000) {
+            lastSnapshotLogAt = nowMs;
+            log("snapshot broadcast heartbeat", {
+              clients: clients.size,
+              roomBootstrapped,
+              serverTick: AuthoritativeSession.serverTick | 0
+            });
+          }
+        } catch (snapErr) {
+          log("snapshot broadcast error", { error: String(snapErr && snapErr.stack ? snapErr.stack : snapErr) });
+        }
+      } else if (!warnedMissingWorld) {
+        warnedMissingWorld = true;
+        log("world missing during tick", { roomBootstrapped, clients: clients.size });
       }
     } finally {
       NetworkCoordinator._authoritativeRemoteInputs = null;
