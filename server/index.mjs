@@ -414,6 +414,7 @@ function main() {
             return;
           }
           const missionId = clampMissionId(msg.missionId != null ? msg.missionId : activeMissionId);
+          console.log("GAME START - SERVER ENTERED");
           const out = {
             v: Net.PROTOCOL_VERSION,
             type: Net.Msg.GAME_START || "game_start",

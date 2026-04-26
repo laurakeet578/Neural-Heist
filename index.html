@@ -7291,7 +7291,12 @@
       if (this.phase === "playing" || this.phase === "intro_cutscene") return;
       if (msg.missionId != null) this.missionId = msg.missionId | 0;
       this._setHint("Match starting...", "#8fdfff", 2.4);
-      this.startPlaying();
+      try {
+        this.startPlaying();
+      } catch (e) {
+        console.error("GAME CRASH:", e);
+        this._dbgLog("crash point (if any)", { error: String(e && e.stack ? e.stack : e) });
+      }
     },
     _requestCutsceneSkip(phaseName) {
       if (NetworkCoordinator.mode !== "ws_client") return false;
@@ -7527,6 +7532,11 @@
     },
 
     startMission(mid) {
+      if (this._missionInitInProgress) {
+        this._dbgLog("duplicate start ignored", { missionId: mid, phase: this.phase, mode: this.mode });
+        return;
+      }
+      this._missionInitInProgress = true;
       this._dbgLog("game start triggered", {
         missionId: mid,
         gameMode: this.gameMode,
@@ -7534,6 +7544,7 @@
         roomCode: this.roomCode || null
       });
       try {
+        this._dbgLog("game initialization started", { missionId: mid, phase: this.phase, wsMode: NetworkCoordinator.mode });
         if (!this.hackingSession) this.hackingSession = new HackingSession(this.hack);
         this.hackingSession.end();
         this._clearTransientRuntime("startMission");
@@ -7565,6 +7576,10 @@
         }
         if (this.gameMode !== "online_mock") this.localPlayerId = 0;
         this.player = this._resolveLocalPlayer(AuthoritativeSession.players);
+        this._dbgLog("player state loaded", {
+          localPlayerId: this.localPlayerId | 0,
+          hasPlayer: !!this.player
+        });
         this._dbgLog("player joined game state", {
           localPlayerId: this.localPlayerId | 0,
           slots,
@@ -7643,11 +7658,15 @@
           }
         }
         NetworkCoordinator.onMissionStart();
+        this._dbgLog("game loop started", { authoritative: NetworkCoordinator.isAuthoritativeHost(), wsMode: NetworkCoordinator.mode });
         AuthoritativeSession.broadcastSnapshot(w);
       } catch (err) {
         this._dbgLog("game start error", { error: String(err && err.stack ? err.stack : err) });
+        console.error("GAME CRASH:", err);
         this._setHint("Game start failed. Check logs.", "#ff8a8a", 3.2);
         return;
+      } finally {
+        this._missionInitInProgress = false;
       }
     },
 
@@ -7904,6 +7923,7 @@
       }
     },
     finishIntroCutscene() {
+      this._dbgLog("cutscene ended", { phase: "intro_cutscene" });
       this.setPhase("playing");
       this.startMission(this.missionId);
     },
