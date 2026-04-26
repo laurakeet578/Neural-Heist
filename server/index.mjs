@@ -532,6 +532,10 @@ function main() {
     NetworkCoordinator._authoritativeRemoteInputs = arr;
     try {
       RT.serverTick(dt);
+      // Safety net: always emit a snapshot each server tick while world is active.
+      if (GameStateManager.world) {
+        AuthoritativeSession.broadcastSnapshot(GameStateManager.world);
+      }
     } finally {
       NetworkCoordinator._authoritativeRemoteInputs = null;
     }

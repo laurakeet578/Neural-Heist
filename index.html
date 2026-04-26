@@ -608,7 +608,7 @@
           if (msg.type === Net.Msg.ERROR && msg.message && GameStateManager._setHint) {
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
           }
-          if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world && AuthoritativeSession.players.length) {
+          if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world) {
             this.wsLastSnapshotAt = Date.now();
             this.wsEverReceivedSnapshot = true;
             if (Array.isArray(msg.players) && msg.players.length) {
