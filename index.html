@@ -7238,7 +7238,10 @@
         peerBySlot: new Array(slotCount).fill(null)
       };
       this.roomCode = roomCode;
-      if (msg.slot != null) this.localPlayerId = msg.slot | 0;
+      const wasSameRoom = !!(this.localRoom && String(this.localRoom.roomCode || "").toUpperCase() === roomCode);
+      if (msg.slot != null && (!wasSameRoom || this.localPlayerId == null || this.localPlayerId < 0)) {
+        this.localPlayerId = msg.slot | 0;
+      }
       this.lobbyReady = connectedCount >= 2;
       if (this.phase !== "lobby") this.setPhase("lobby");
       if (msg.created) this._setHint("Room created: " + roomCode, "#8fdfff", 3.2);

@@ -161,6 +161,7 @@ function main() {
     }
     const connected = room.slots.filter(Boolean).length;
     log("room player removed", { roomCode: code, connected });
+    if (connected > 0) broadcastRoomState(code, { created: false });
     if (connected <= 0) {
       rooms.delete(code);
       log("room deleted (empty)", { roomCode: code });
@@ -175,6 +176,25 @@ function main() {
     };
     log("room join response", out);
     ws.send(JSON.stringify(out));
+  }
+
+  function broadcastRoomState(code, opts = {}) {
+    const room = rooms.get(code);
+    if (!room) return;
+    const connectedSlots = room.slots.map(Boolean);
+    const base = {
+      ok: true,
+      created: !!opts.created,
+      roomCode: code,
+      slotCount: room.slots.length,
+      connectedSlots,
+      connectedCount: connectedSlots.filter(Boolean).length
+    };
+    for (let i = 0; i < room.slots.length; i++) {
+      const sock = room.slots[i];
+      if (!sock || sock.readyState !== 1) continue;
+      sendRoomJoinResult(sock, { ...base, slot: i });
+    }
   }
 
   function assignClientToRoom(ws, code, created) {
@@ -333,7 +353,8 @@ function main() {
           log("room created", { roomCode: code, slotCount: activeSlotCount });
           const result = assignClientToRoom(ws, code, true);
           log("room create assign", result);
-          sendRoomJoinResult(ws, result);
+          if (!result.ok) sendRoomJoinResult(ws, result);
+          else broadcastRoomState(code, { created: true });
           return;
         }
 
@@ -353,7 +374,8 @@ function main() {
           log("room found", { roomCode: code, connectedCount: room.slots.filter(Boolean).length });
           const result = assignClientToRoom(ws, code, false);
           log("room player added", result);
-          sendRoomJoinResult(ws, result);
+          if (!result.ok) sendRoomJoinResult(ws, result);
+          else broadcastRoomState(code, { created: false });
           return;
         }
 
