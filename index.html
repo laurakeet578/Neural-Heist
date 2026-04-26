@@ -149,7 +149,9 @@
       ERROR: "error",
       ROOM_CREATE: "room_create",
       ROOM_JOIN: "room_join",
-      ROOM_JOIN_RESULT: "room_join_result"
+      ROOM_JOIN_RESULT: "room_join_result",
+      START_MATCH: "start_match",
+      GAME_START: "game_start"
     }
   };
 
@@ -615,6 +617,12 @@
           if (msg.type === Net.Msg.ROOM_JOIN_RESULT || msg.type === "joinRoomResult" || msg.type === "roomJoinResult") {
             if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
               GameStateManager._onRoomJoinResult(msg);
+            }
+            return;
+          }
+          if (msg.type === Net.Msg.GAME_START || msg.type === "gameStart") {
+            if (GameStateManager && typeof GameStateManager._onServerGameStart === "function") {
+              GameStateManager._onServerGameStart(msg);
             }
             return;
           }
@@ -7215,6 +7223,26 @@
         this._setHint("Failed to send join request.", "#ffb08a", 2.8);
       }
     },
+    _sendWsStartMatchRequest() {
+      if (!NetworkCoordinator.ws || NetworkCoordinator.ws.readyState !== 1) {
+        this._setHint("Not connected to server.", "#ffb08a", 2.4);
+        return;
+      }
+      const payload = {
+        v: Net.PROTOCOL_VERSION,
+        type: Net.Msg.START_MATCH,
+        roomCode: String(this.roomCode || "").trim().toUpperCase(),
+        missionId: this.missionId | 0
+      };
+      this._dbgLog("host clicked start", payload);
+      try {
+        NetworkCoordinator.ws.send(JSON.stringify(payload));
+        this._setHint("Waiting for server start...", "#8fdfff", 2.2);
+      } catch (e) {
+        this._dbgLog("start match send failed", { error: String(e && e.message ? e.message : e), payload });
+        this._setHint("Failed to request match start.", "#ffb08a", 2.8);
+      }
+    },
     _onRoomJoinResult(msg) {
       this._dbgLog("room join result received", msg);
       if (!msg || msg.ok !== true) {
@@ -7246,6 +7274,16 @@
       if (this.phase !== "lobby") this.setPhase("lobby");
       if (msg.created) this._setHint("Room created: " + roomCode, "#8fdfff", 3.2);
       else this._setHint("Joined room " + roomCode, "#8fdfff", 3.2);
+    },
+    _onServerGameStart(msg) {
+      this._dbgLog("client received gameStart event", msg);
+      if (!msg || msg.ok === false) return;
+      const code = String(msg.roomCode || "").toUpperCase();
+      if (code && this.roomCode && code !== String(this.roomCode).toUpperCase()) return;
+      if (this.phase === "playing" || this.phase === "intro_cutscene") return;
+      if (msg.missionId != null) this.missionId = msg.missionId | 0;
+      this._setHint("Match starting...", "#8fdfff", 2.4);
+      this.startPlaying();
     },
     _goToMultiplayerMissionSelect() {
       this.gameMode = "online_mock";
@@ -7401,6 +7439,10 @@
       const connected = this.localRoom.connectedSlots || [];
       const filled = connected.filter(Boolean).length;
       if (filled < 2) return;
+      if (NetworkCoordinator.mode === "ws_client") {
+        this._sendWsStartMatchRequest();
+        return;
+      }
       this.setPhase("briefing");
     },
 
@@ -10325,5 +10367,6 @@
   }
 })();
 </script>
+  <script async src="https://vibej.am/2026/widget.js"></script>
 </body>
 </html>

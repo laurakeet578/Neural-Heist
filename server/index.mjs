@@ -197,6 +197,17 @@ function main() {
     }
   }
 
+  function broadcastRoomMessage(code, payload) {
+    const room = rooms.get(code);
+    if (!room) return;
+    const json = JSON.stringify(payload);
+    for (let i = 0; i < room.slots.length; i++) {
+      const sock = room.slots[i];
+      if (!sock || sock.readyState !== 1) continue;
+      try { sock.send(json); } catch (e) {}
+    }
+  }
+
   function assignClientToRoom(ws, code, created) {
     const room = rooms.get(code);
     if (!room) return { ok: false, error: "Room not found." };
@@ -377,6 +388,41 @@ function main() {
           log("room player added", result);
           if (!result.ok) sendRoomJoinResult(ws, result);
           else broadcastRoomState(code, { created: false });
+          return;
+        }
+
+        if (msg.type === (Net.Msg.START_MATCH || "start_match") || msg.type === "startMatch") {
+          const code = normalizeRoomCode(msg.roomCode || roomByClient.get(ws));
+          log("server received start request", { roomCode: code, missionId: msg.missionId });
+          if (!code) {
+            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Invalid room code." }));
+            return;
+          }
+          const room = rooms.get(code);
+          if (!room) {
+            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Room not found." }));
+            return;
+          }
+          const hostSock = room.slots[0];
+          if (hostSock !== ws) {
+            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Only host can start match." }));
+            return;
+          }
+          const connectedCount = room.slots.filter(Boolean).length;
+          if (connectedCount < 2) {
+            ws.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.ERROR, message: "Need at least 2 players." }));
+            return;
+          }
+          const missionId = clampMissionId(msg.missionId != null ? msg.missionId : activeMissionId);
+          const out = {
+            v: Net.PROTOCOL_VERSION,
+            type: Net.Msg.GAME_START || "game_start",
+            roomCode: code,
+            missionId,
+            connectedCount
+          };
+          log("room broadcast triggered", out);
+          broadcastRoomMessage(code, out);
           return;
         }
 
