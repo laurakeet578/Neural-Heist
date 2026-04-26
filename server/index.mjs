@@ -295,8 +295,14 @@ function main() {
   function updateCutsceneState(match, requestedPhase) {
     if (!match || match.phase !== RoomPhase.RUNNING) throw new Error("match_not_running");
     if (!match.state) match.state = { gamePhase: "playing", cutscenePhase: null };
+    // Match state is intentionally minimal on this decoupled server.
+    // Accept any allowed skip intent and advance to playable phase.
     if (match.state.cutscenePhase !== requestedPhase && match.state.gamePhase !== requestedPhase) {
-      throw new Error("phase_mismatch_for_skip");
+      log("cutscene_skip_phase_mismatch_tolerated", {
+        expectedCutscenePhase: match.state.cutscenePhase || null,
+        currentGamePhase: match.state.gamePhase || null,
+        requestedPhase
+      });
     }
     match.state.cutscenePhase = null;
     match.state.gamePhase = "playing";
@@ -473,7 +479,7 @@ function main() {
           } catch (skipErr) {
             const errText = String(skipErr && skipErr.stack ? skipErr.stack : skipErr);
             log("cutscene_skip_failure", { roomCode, phase, error: errText });
-            sendMatchError(ws, "Cutscene skip failed: " + errText, { roomCode, phase });
+            sendMatchError(ws, "Cutscene skip failed.", { roomCode, phase, code: "cutscene_skip_failure" });
           }
           return;
         }
