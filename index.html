@@ -457,6 +457,7 @@
     wsHeartbeatTimer: null,
     wsLastPongAt: 0,
     wsLastSnapshotAt: 0,
+    wsEverReceivedSnapshot: false,
     _wsManualClose: false,
     wsConnected: false,
     wsConnectionState: "idle",
@@ -562,6 +563,7 @@
           this.wsReconnectAttempt = 0;
           this.wsLastPongAt = Date.now();
           this.wsLastSnapshotAt = Date.now();
+          this.wsEverReceivedSnapshot = false;
           if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
@@ -573,9 +575,17 @@
             // Only enforce snapshot stall once a mission is actively running.
             const phase = GameStateManager ? GameStateManager.phase : "";
             const needsSnapshotFeed = phase === "playing";
-            if (needsSnapshotFeed && Date.now() - this.wsLastSnapshotAt > 14000) {
-              try { sock.close(); } catch (e) {}
-              return;
+            if (needsSnapshotFeed) {
+              const sinceSnap = Date.now() - this.wsLastSnapshotAt;
+              if (this.wsEverReceivedSnapshot && sinceSnap > 20000) {
+                this._logWs("snapshot stall watchdog close", { sinceSnapshotMs: sinceSnap, phase });
+                try { sock.close(); } catch (e) {}
+                return;
+              }
+              if (!this.wsEverReceivedSnapshot && sinceSnap > 30000) {
+                // During mission transitions, first snapshot can be delayed; warn but keep connection alive.
+                this._logWs("waiting for first snapshot", { sinceOpenMs: sinceSnap, phase });
+              }
             }
             try { sock.send(JSON.stringify({ v: Net.PROTOCOL_VERSION, type: Net.Msg.PING, t: Date.now() })); } catch (e) {}
           }, 10000);
@@ -600,6 +610,7 @@
           }
           if (msg.type === Net.Msg.SNAPSHOT && GameStateManager.world && AuthoritativeSession.players.length) {
             this.wsLastSnapshotAt = Date.now();
+            this.wsEverReceivedSnapshot = true;
             if (Array.isArray(msg.players) && msg.players.length) {
               this._ensureSessionPlayersForCount(msg.players.length);
             }
