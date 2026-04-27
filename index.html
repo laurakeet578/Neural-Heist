@@ -149,6 +149,12 @@
       MATCH_ERROR: "match_error"
     }
   };
+  const MultiplayerRuntimeState = {
+    CONNECTING: "connecting",
+    LOBBY: "lobby",
+    STARTING: "starting",
+    PLAYING: "playing"
+  };
 
   /** Per-terminal interaction lifecycle (synced via snapshot `terminalStates`). */
   const TerminalState = {
@@ -527,14 +533,13 @@
       if (matchId) session.matchId = matchId;
       if (playerId != null) session.playerId = playerId;
     },
-    _sendWsRejoinRequest() {
+    _sendWsRejoinRequest(forceSend) {
       const sock = this.ws;
       if (!sock || sock.readyState !== 1) return false;
       this._rememberReconnectSession();
       const session = this.reconnectSession || {};
-      const roomCode = String(session.roomCode || "").trim().toUpperCase();
-      const matchId = String(session.matchId || "").trim();
-      if (!roomCode && !matchId) return false;
+      const roomCode = String(session.roomCode || (GameStateManager ? GameStateManager.roomCode : "") || "").trim().toUpperCase();
+      const matchId = String(session.matchId || (GameStateManager ? GameStateManager.currentMatchId : "") || "").trim();
       const payload = {
         v: Net.PROTOCOL_VERSION,
         type: Net.Msg.JOIN_MATCH
@@ -542,9 +547,11 @@
       if (roomCode) payload.roomCode = roomCode;
       if (matchId) payload.matchId = matchId;
       if (session.playerId != null) payload.playerId = session.playerId | 0;
+      if (!roomCode && !matchId && !forceSend) return false;
       this._logWs("auto rejoin attempt", payload);
       try {
         sock.send(JSON.stringify(payload));
+        this._logWs("REJOIN SENT with matchId: " + (matchId || "unknown"), { roomCode: roomCode || "", playerId: session.playerId != null ? (session.playerId | 0) : null });
         return true;
       } catch (e) {
         this._logWs("auto rejoin send failed", { error: String(e && e.message ? e.message : e), payload });
@@ -556,7 +563,8 @@
       if (now - (this.wsLastRejoinAttemptAt || 0) < 2500) return;
       this.wsLastRejoinAttemptAt = now;
       this.wsRejoinAttemptCount = (this.wsRejoinAttemptCount | 0) + 1;
-      const sent = this._sendWsRejoinRequest();
+      this._logWs("REJOIN RETRY", { reason: reason || "unspecified", attempt: (this.wsRejoinAttemptCount | 0) + 1 });
+      const sent = this._sendWsRejoinRequest(false);
       this._logWs("snapshot recovery attempt", {
         reason: reason || "unspecified",
         attempt: this.wsRejoinAttemptCount,
@@ -679,6 +687,10 @@
           this.wsConnected = true;
           this.wsConnectionState = "connecting";
           this._logWs("connect success", { url: connectUrl });
+          this._logWs("reconnect triggered", { url: connectUrl });
+          if (GameStateManager && typeof GameStateManager._setMultiplayerRuntimeState === "function") {
+            GameStateManager._setMultiplayerRuntimeState(MultiplayerRuntimeState.CONNECTING, "ws_onopen", true);
+          }
           this._rememberReconnectSession();
           this.wsReconnectAttempt = 0;
           this._invalidateSnapshotState("socket_open", true);
@@ -697,7 +709,7 @@
               }
             }
           }
-          this._sendWsRejoinRequest();
+          this._sendWsRejoinRequest(true);
           if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
@@ -786,6 +798,10 @@
               return;
             }
             this._logWs("snapshot received", { matchId, tick: msg.tick != null ? msg.tick : null });
+            this._logWs("snapshot received strict", { matchId, tick: msg.tick != null ? msg.tick : null });
+            if (GameStateManager && typeof GameStateManager._setMultiplayerRuntimeState === "function") {
+              GameStateManager._setMultiplayerRuntimeState(MultiplayerRuntimeState.PLAYING, "snapshot_received");
+            }
             this._rememberReconnectSession({ matchId });
             if (GameStateManager) {
               GameStateManager.snapshotWaitStartedAt = 0;
@@ -829,6 +845,15 @@
             return;
           }
           if (msg.type === Net.Msg.MATCH_CREATED || msg.type === Net.Msg.MATCH_JOINED) {
+            if (msg.type === Net.Msg.MATCH_JOINED) {
+              this._logWs("match_joined received", {
+                roomCode: String(msg.roomCode || "").toUpperCase(),
+                matchId: String(msg.matchId || "")
+              });
+            }
+            if (GameStateManager && typeof GameStateManager._setMultiplayerRuntimeState === "function") {
+              GameStateManager._setMultiplayerRuntimeState(MultiplayerRuntimeState.LOBBY, "match_joined");
+            }
             this._rememberReconnectSession({
               roomCode: msg.roomCode,
               matchId: msg.matchId,
@@ -871,6 +896,9 @@
           this.mode = "embedded";
           this.ws = null;
           this._invalidateSnapshotState("socket_close", !wasManual);
+          if (!wasManual && GameStateManager && typeof GameStateManager._setMultiplayerRuntimeState === "function") {
+            GameStateManager._setMultiplayerRuntimeState(MultiplayerRuntimeState.CONNECTING, "ws_onclose");
+          }
           if (this.wsHeartbeatTimer) {
             clearInterval(this.wsHeartbeatTimer);
             this.wsHeartbeatTimer = null;
@@ -5108,6 +5136,7 @@
     player: null,
     localPlayerId: 0,
     gameMode: "campaign",
+    multiplayerRuntimeState: MultiplayerRuntimeState.CONNECTING,
     hack: new HackSystem(),
     task: new MiniTaskSystem(),
     hackingSession: null,
@@ -6883,6 +6912,14 @@
         && typeof NetworkCoordinator.pollSnapshotHealth === "function") {
         NetworkCoordinator.pollSnapshotHealth();
       }
+      if (this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
+        if (this.multiplayerRuntimeState === MultiplayerRuntimeState.PLAYING && this.phase === "starting_match" && NetworkCoordinator.wsSnapshotValid) {
+          this.setPhase("playing");
+        } else if (this.multiplayerRuntimeState !== MultiplayerRuntimeState.PLAYING && this.phase === "playing") {
+          // Keep gameplay gated behind runtime multiplayer state until a fresh snapshot confirms play state.
+          this.setPhase("starting_match");
+        }
+      }
       if (this.phase === "lobby" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
         // Match start is host-manual only from the Start button.
         // Keep lobby stable so more players can join before launch.
@@ -6923,6 +6960,7 @@
           this.pendingStartMatchId = "";
           this.snapshotWaitStartedAt = 0;
           this.snapshotWaitWarned = false;
+          this._setMultiplayerRuntimeState(MultiplayerRuntimeState.LOBBY, "starting_timeout");
           this.startRequestSentAt = 0;
           this.startRequestRetryCount = 0;
           this.setPhase("lobby");
@@ -7486,6 +7524,35 @@
         && NetworkCoordinator.ws.readyState === 1
       );
     },
+    _canTransitionMultiplayerRuntimeState(fromState, toState) {
+      if (fromState === toState) return true;
+      if (fromState === MultiplayerRuntimeState.CONNECTING) {
+        return toState === MultiplayerRuntimeState.LOBBY || toState === MultiplayerRuntimeState.STARTING;
+      }
+      if (fromState === MultiplayerRuntimeState.LOBBY) {
+        return toState === MultiplayerRuntimeState.CONNECTING || toState === MultiplayerRuntimeState.STARTING;
+      }
+      if (fromState === MultiplayerRuntimeState.STARTING) {
+        return toState === MultiplayerRuntimeState.CONNECTING || toState === MultiplayerRuntimeState.PLAYING || toState === MultiplayerRuntimeState.LOBBY;
+      }
+      if (fromState === MultiplayerRuntimeState.PLAYING) {
+        return toState === MultiplayerRuntimeState.CONNECTING || toState === MultiplayerRuntimeState.STARTING || toState === MultiplayerRuntimeState.LOBBY;
+      }
+      return false;
+    },
+    _setMultiplayerRuntimeState(nextState, reason, force) {
+      if (this.gameMode !== "online_mock") return;
+      const next = String(nextState || "");
+      if (!next) return;
+      const prev = String(this.multiplayerRuntimeState || MultiplayerRuntimeState.CONNECTING);
+      if (!force && !this._canTransitionMultiplayerRuntimeState(prev, next)) {
+        this._dbgLog("runtime_state transition rejected", { from: prev, to: next, reason: reason || "" });
+        return;
+      }
+      if (prev === next) return;
+      this.multiplayerRuntimeState = next;
+      this._dbgLog("runtime_state transition", { from: prev, to: next, reason: reason || "" });
+    },
     _hasValidMultiplayerSession() {
       if (this.gameMode !== "online_mock") return false;
       return !!(this.localRoom && this.roomCode && LocalRoomService.connectedCount(this.localRoom) >= 1);
@@ -7584,6 +7651,7 @@
         this.localPlayerId = msg.slot | 0;
       }
       this.lobbyReady = connectedCount >= 2;
+      this._setMultiplayerRuntimeState(MultiplayerRuntimeState.LOBBY, "room_join_result");
       const isHost = this.localPlayerId === 0;
       if (this.phase === "lobby" && isHost && this.hostStartIntentPending && connectedCount >= 2 && this._isMultiplayerTransportReady()) {
         this._dbgLog("host start intent auto-triggered on player join", { roomCode, connectedCount });
@@ -7614,6 +7682,7 @@
       this.pendingStartMatchId = "";
       this.snapshotWaitStartedAt = Date.now();
       this.snapshotWaitWarned = false;
+      this._setMultiplayerRuntimeState(MultiplayerRuntimeState.STARTING, "match_started");
       this.startRequestSentAt = 0;
       this.startRequestRetryCount = 0;
       this.hostStartIntentPending = false;
@@ -7647,6 +7716,7 @@
       this.lobbyAutoStartAt = 0;
       this.lobbyAutoStartNextRetryAt = 0;
       this.lobbyAutoStartRetryCount = 0;
+      this._setMultiplayerRuntimeState(MultiplayerRuntimeState.PLAYING, "first_snapshot_unlock");
       try {
         this.startPlaying();
       } catch (e) {
@@ -8075,6 +8145,7 @@
         return;
       }
       this.setPhase("playing");
+      this._setMultiplayerRuntimeState(MultiplayerRuntimeState.PLAYING, "startPlaying");
       this.startMission(this.missionId);
     },
     startIntroCutscene() {
@@ -8757,6 +8828,13 @@
       this.player = this._resolveLocalPlayer(AuthoritativeSession.players);
       const p = this.player;
       if (!w || !p) return;
+      if (this.gameMode === "online_mock" && this.multiplayerRuntimeState !== MultiplayerRuntimeState.PLAYING) {
+        // Keep rendering responsive while transport is recovering, but avoid sending gameplay input
+        // before the state machine confirms active play from fresh snapshots.
+        this._smoothCameraToward(p, w, dt);
+        this.shake *= 0.9;
+        return;
+      }
       NetworkCoordinator.sendInputFrame({ slot: this.localPlayerId, keys: this.keys });
       // Interpolate remote players toward latest server targets for smooth, low-latency visuals.
       const now = performance.now();

@@ -441,6 +441,7 @@ function main() {
           log("match_join", { roomCode, connectedCount: result.connectedCount });
           if (!result.ok) sendMatchError(ws, result.error || "Join failed.");
           else {
+            let snapshotSent = false;
             broadcastRoomPresence(roomCode, false);
             // Rejoin contract: once server acknowledges join, immediately provide a snapshot
             // when a match is already running so the client can resume from freeze state.
@@ -448,7 +449,13 @@ function main() {
               try {
                 const payload = buildAuthoritativeSnapshot(activeMatch);
                 sendMatchEvent(ws, "snapshot", payload);
+                snapshotSent = true;
                 log("rejoin_snapshot_sent", {
+                  roomCode,
+                  matchId: activeMatch.matchId,
+                  slot: result.slot
+                });
+                log("REJOIN ACCEPTED, SNAPSHOT SENT", {
                   roomCode,
                   matchId: activeMatch.matchId,
                   slot: result.slot
@@ -460,6 +467,17 @@ function main() {
                 });
               }
             }
+            setTimeout(() => {
+              const stillOpen = ws && ws.readyState === 1;
+              if (!stillOpen) return;
+              if (snapshotSent) return;
+              log("join_snapshot_timeout_error", {
+                message: "Snapshot not sent within join window",
+                roomCode,
+                requestedMatchId: matchId || null,
+                activeMatchId: activeMatch && activeMatch.roomCode === roomCode ? activeMatch.matchId : null
+              });
+            }, 1000);
           }
           return;
         }
