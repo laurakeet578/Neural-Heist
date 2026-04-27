@@ -600,6 +600,21 @@
           if (msg.type === Net.Msg.MATCH_ERROR && msg.message && GameStateManager._setHint) {
             const errCode = String(msg.code || "");
             GameStateManager._setHint(String(msg.message), "#ffaa88", 4.5);
+            if (errCode === "minimum_players_not_met" && GameStateManager) {
+              GameStateManager._dbgLog("start rejected: minimum players not met", {
+                roomCode: String(GameStateManager.roomCode || "").toUpperCase()
+              });
+              GameStateManager.pendingStartMatchId = "";
+              GameStateManager.snapshotWaitStartedAt = 0;
+              GameStateManager.snapshotWaitWarned = false;
+              GameStateManager.startRequestSentAt = 0;
+              GameStateManager.startRequestRetryCount = 0;
+              // Keep host start intent alive; auto-send once enough players join.
+              GameStateManager.hostStartIntentPending = true;
+              if (GameStateManager.phase === "starting_match") {
+                GameStateManager.setPhase("lobby");
+              }
+            }
             if (errCode === "room_not_found" && GameStateManager) {
               GameStateManager._dbgLog("room_not_found recovery", {
                 roomCode: String(GameStateManager.roomCode || "").toUpperCase()
@@ -609,6 +624,7 @@
               GameStateManager.lobbyReady = false;
               GameStateManager.startRequestSentAt = 0;
               GameStateManager.startRequestRetryCount = 0;
+              GameStateManager.hostStartIntentPending = false;
               GameStateManager.lobbyAutoStartAt = 0;
               GameStateManager.lobbyAutoStartNextRetryAt = 0;
               GameStateManager.lobbyAutoStartRetryCount = 0;
@@ -4966,6 +4982,7 @@
     snapshotWaitWarned: false,
     startRequestSentAt: 0,
     startRequestRetryCount: 0,
+    hostStartIntentPending: false,
     lobbyAutoStartAt: 0,
     lobbyAutoStartNextRetryAt: 0,
     lobbyAutoStartRetryCount: 0,
@@ -6715,47 +6732,11 @@
     },
     updateMeta(dt) {
       if (this.phase === "lobby" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
-        const isHost = this.localPlayerId === 0;
-        const roomActive = !!(this.localRoom && this.roomCode);
-        const transportReady = this._isMultiplayerTransportReady();
-        const connectedSlots = roomActive && Array.isArray(this.localRoom.connectedSlots)
-          ? this.localRoom.connectedSlots
-          : [];
-        const connectedCount = connectedSlots.filter(Boolean).length;
-        if (isHost && roomActive && transportReady) {
-          const now = Date.now();
-          if (!this.lobbyAutoStartAt) {
-            this.lobbyAutoStartAt = now + 1400;
-            this.lobbyAutoStartNextRetryAt = this.lobbyAutoStartAt;
-            this.lobbyAutoStartRetryCount = 0;
-          }
-          // Auto-start trigger: allow one probe when host is alone, then back off.
-          const soloProbeAllowed = connectedCount < 2 && this.lobbyAutoStartRetryCount < 1;
-          const teamStartAllowed = connectedCount >= 2 && this.lobbyAutoStartRetryCount < 5;
-          if (now >= this.lobbyAutoStartAt && now >= this.lobbyAutoStartNextRetryAt && (soloProbeAllowed || teamStartAllowed)) {
-            this.lobbyAutoStartRetryCount++;
-            this.lobbyAutoStartNextRetryAt = connectedCount < 2 ? (now + 12000) : (now + 3500);
-            this._dbgLog("lobby auto request_start", {
-              roomCode: this.roomCode,
-              connectedCount,
-              retry: this.lobbyAutoStartRetryCount
-            });
-            this._sendWsStartMatchRequest();
-          }
-          // Timeout protection: force retry cadence after extended lobby idle (only with 2+ players).
-          if (connectedCount >= 2 && (now - this.lobbyAutoStartAt) > 12000 && now >= this.lobbyAutoStartNextRetryAt) {
-            this.lobbyAutoStartNextRetryAt = now + 2800;
-            this._dbgLog("lobby timeout request_start", {
-              roomCode: this.roomCode,
-              connectedCount
-            });
-            this._sendWsStartMatchRequest();
-          }
-        } else {
-          this.lobbyAutoStartAt = 0;
-          this.lobbyAutoStartNextRetryAt = 0;
-          this.lobbyAutoStartRetryCount = 0;
-        }
+        // Match start is host-manual only from the Start button.
+        // Keep lobby stable so more players can join before launch.
+        this.lobbyAutoStartAt = 0;
+        this.lobbyAutoStartNextRetryAt = 0;
+        this.lobbyAutoStartRetryCount = 0;
       }
       if (this.phase === "starting_match") {
         const canRetryStart = this.gameMode === "online_mock"
@@ -7411,6 +7392,7 @@
       };
       this._dbgLog("host clicked start", payload);
       try {
+        this.hostStartIntentPending = true;
         NetworkCoordinator.ws.send(JSON.stringify(payload));
         this.startRequestSentAt = Date.now();
         this.startRequestRetryCount = 0;
@@ -7449,6 +7431,20 @@
         this.localPlayerId = msg.slot | 0;
       }
       this.lobbyReady = connectedCount >= 2;
+      const isHost = this.localPlayerId === 0;
+      if (this.phase === "lobby" && isHost && this.hostStartIntentPending && connectedCount >= 2 && this._isMultiplayerTransportReady()) {
+        this._dbgLog("host start intent auto-triggered on player join", { roomCode, connectedCount });
+        this._sendWsStartMatchRequest();
+      }
+      if (this.phase === "starting_match" && String(msg.phase || "").toUpperCase() === "LOBBY") {
+        this.pendingStartMatchId = "";
+        this.snapshotWaitStartedAt = 0;
+        this.snapshotWaitWarned = false;
+        this.startRequestSentAt = 0;
+        this.startRequestRetryCount = 0;
+        this.setPhase("lobby");
+        this._setHint("Players synced. Host can start match.", "#8fdfff", 2.2);
+      }
       if (this.phase !== "lobby") this.setPhase("lobby");
       if (msg.created) this._setHint("Room created: " + roomCode, "#8fdfff", 3.2);
       else this._setHint("Joined room " + roomCode, "#8fdfff", 3.2);
@@ -7467,6 +7463,7 @@
       this.snapshotWaitWarned = false;
       this.startRequestSentAt = 0;
       this.startRequestRetryCount = 0;
+      this.hostStartIntentPending = false;
       this.lobbyAutoStartAt = 0;
       this.lobbyAutoStartNextRetryAt = 0;
       this.lobbyAutoStartRetryCount = 0;
@@ -7493,6 +7490,7 @@
       this.snapshotWaitWarned = false;
       this.startRequestSentAt = 0;
       this.startRequestRetryCount = 0;
+      this.hostStartIntentPending = false;
       this.lobbyAutoStartAt = 0;
       this.lobbyAutoStartNextRetryAt = 0;
       this.lobbyAutoStartRetryCount = 0;
@@ -7630,6 +7628,7 @@
       this.lobbyReady = false;
       this.startRequestSentAt = 0;
       this.startRequestRetryCount = 0;
+      this.hostStartIntentPending = false;
       this.lobbyAutoStartAt = 0;
       this.lobbyAutoStartNextRetryAt = 0;
       this.lobbyAutoStartRetryCount = 0;
