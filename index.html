@@ -5189,6 +5189,7 @@
     /** Where "← Back" from multiplayer_menu returns (terminal_login vs title). */
     _multiplayerMenuReturnPhase: "terminal_login",
     _multiplayerPendingAction: "",
+    _multiplayerMenuOpenedAt: 0,
     isPaused: false,
     loadingTimer: 0,
     loadingNextMissionId: 1,
@@ -7810,10 +7811,13 @@
       this._assignDedicatedCloudUrl();
       NetworkCoordinator.tryConnectWebSocket(this.multiplayerDedicatedUrl);
       this._multiplayerPendingAction = "";
+      // Prevent the same click/tap sequence from immediately triggering host/join.
+      this._multiplayerMenuOpenedAt = Date.now();
       this._multiplayerMenuReturnPhase = fromReturn || "terminal_login";
       this.setPhase("multiplayer_menu");
     },
     tryMultiplayerMenuClick(mx, my) {
+      if ((Date.now() - (this._multiplayerMenuOpenedAt || 0)) < 220) return;
       const cx0 = VIEW_W / 2 - 170;
       const cx1 = VIEW_W / 2 + 170;
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
