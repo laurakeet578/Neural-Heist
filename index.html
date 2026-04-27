@@ -5102,6 +5102,10 @@
       };
       this._pointerUp = (e) => {
         e.preventDefault();
+        if (GameStateManager && GameStateManager.phase === "multiplayer_menu" && GameStateManager._multiplayerMenuAwaitPointerRelease) {
+          GameStateManager._multiplayerMenuAwaitPointerRelease = false;
+          if (GameStateManager._dbgLog) GameStateManager._dbgLog("multiplayer menu pointer release armed");
+        }
         if (GameStateManager && GameStateManager.phase === "playing" && GameStateManager.mode === "hack") {
           const hk = GameStateManager.hack;
           if (hk && hk.isTraceStage()) {
@@ -5190,6 +5194,7 @@
     _multiplayerMenuReturnPhase: "terminal_login",
     _multiplayerPendingAction: "",
     _multiplayerMenuOpenedAt: 0,
+    _multiplayerMenuAwaitPointerRelease: false,
     isPaused: false,
     loadingTimer: 0,
     loadingNextMissionId: 1,
@@ -6989,40 +6994,6 @@
           this._setHint("Snapshot delayed. Returned to lobby - retry start.", "#ffb08a", 3.0);
         }
       }
-      if (this.phase === "multiplayer_menu" && this._multiplayerPendingAction) {
-        if (this._isMultiplayerTransportReady()) {
-          const act = this._multiplayerPendingAction;
-          this._multiplayerPendingAction = "";
-          if (act === "host" && !this.localRoom) {
-            if (NetworkCoordinator.mode === "ws_client") {
-              this._dbgLog("host requested: waiting for server room_create confirmation");
-              this._sendWsRoomCreateRequest();
-            } else {
-              this.enterLobby(this.missionId || 1);
-              this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
-              this.roomCode = this.localRoom.roomCode;
-              this.localPlayerId = 0;
-              this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
-            }
-          } else if (act === "join") {
-            const entered = (typeof window !== "undefined" && window.prompt)
-              ? window.prompt("Enter 4-digit room code", this.roomCode || "")
-              : "";
-            if (NetworkCoordinator.mode === "ws_client") {
-              this._sendWsRoomJoinRequest(entered || this.roomCode);
-            } else {
-              const joined = LocalRoomService.joinRoom(entered || this.roomCode, NetworkCoordinator.peerId);
-              if (joined) {
-                this.localRoom = joined.room;
-                this.roomCode = joined.room.roomCode;
-                this.localPlayerId = joined.slot;
-                this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
-                this.enterLobby(this.missionId || 1);
-              }
-            }
-          }
-        }
-      }
       if (this.phase === "intro_cutscene") {
         const sequence = this._introCutsceneSequence();
         this.introCutsceneTimer += dt;
@@ -7593,9 +7564,14 @@
       if (this.gameMode !== "online_mock") return false;
       return !!(this.localRoom && this.roomCode && LocalRoomService.connectedCount(this.localRoom) >= 1);
     },
-    _requestMultiplayerConnection(mode) {
+    _requestMultiplayerConnection() {
+      if (this.phase !== "multiplayer_menu") {
+        this._dbgLog("multiplayer connection request blocked outside multiplayer_menu", {
+          phase: this.phase
+        });
+        return;
+      }
       this._assignDedicatedCloudUrl();
-      this._multiplayerPendingAction = mode || "";
       if (!this._isMultiplayerTransportReady()) {
         NetworkCoordinator.tryConnectWebSocket(this.multiplayerDedicatedUrl);
         this._setHint("Connecting to multiplayer server…", "#8fdfff", 2.2);
@@ -7806,12 +7782,11 @@
     },
     openMultiplayerMenu(fromReturn) {
       SFX.play("ui_click");
-      this._ensureMultiplayerDedicatedUrlFromWindow();
-      this.gameMode = "online_mock";
-      this._assignDedicatedCloudUrl();
-      NetworkCoordinator.tryConnectWebSocket(this.multiplayerDedicatedUrl);
+      // Entry rule: multiplayer click only opens the selection menu.
+      // Network/session side effects happen only after explicit Host/Join choice.
       this._multiplayerPendingAction = "";
       this._multiplayerMenuOpenedAt = Date.now();
+      this._multiplayerMenuAwaitPointerRelease = true;
       this._dbgLog("entered multiplayer menu", {
         from: fromReturn || "terminal_login",
         phase: this.phase
@@ -7820,6 +7795,10 @@
       this.setPhase("multiplayer_menu");
     },
     tryMultiplayerMenuClick(mx, my) {
+      if (this._multiplayerMenuAwaitPointerRelease) {
+        this._dbgLog("multiplayer menu click ignored (await pointer release)", { mx, my });
+        return;
+      }
       const cx0 = VIEW_W / 2 - 170;
       const cx1 = VIEW_W / 2 + 170;
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
@@ -7835,7 +7814,20 @@
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_host");
-        this._requestMultiplayerConnection("host");
+        if (!this._isMultiplayerTransportReady()) {
+          this._requestMultiplayerConnection();
+          this._setHint("Connecting... click Host again when ready.", "#8fdfff", 2.2);
+          return;
+        }
+        if (NetworkCoordinator.mode === "ws_client") {
+          this._sendWsRoomCreateRequest();
+        } else {
+          this.enterLobby(this.missionId || 1);
+          this.localRoom = LocalRoomService.hostRoom(this.missionId || 1);
+          this.roomCode = this.localRoom.roomCode;
+          this.localPlayerId = 0;
+          this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
+        }
         return;
       }
       if (mx > cx0 && mx < cx1 && my > 292 && my < 344) {
@@ -7844,7 +7836,26 @@
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_join");
-        this._requestMultiplayerConnection("join");
+        if (!this._isMultiplayerTransportReady()) {
+          this._requestMultiplayerConnection();
+          this._setHint("Connecting... click Join again when ready.", "#8fdfff", 2.2);
+          return;
+        }
+        const entered = (typeof window !== "undefined" && window.prompt)
+          ? window.prompt("Enter 4-digit room code", this.roomCode || "")
+          : "";
+        if (NetworkCoordinator.mode === "ws_client") {
+          this._sendWsRoomJoinRequest(entered || this.roomCode);
+        } else {
+          const joined = LocalRoomService.joinRoom(entered || this.roomCode, NetworkCoordinator.peerId);
+          if (joined) {
+            this.localRoom = joined.room;
+            this.roomCode = joined.room.roomCode;
+            this.localPlayerId = joined.slot;
+            this.lobbyReady = LocalRoomService.connectedCount(this.localRoom) >= 2;
+            this.enterLobby(this.missionId || 1);
+          }
+        }
         return;
       }
     },
