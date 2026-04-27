@@ -451,6 +451,10 @@
     wsLastPongAt: 0,
     wsLastSnapshotAt: 0,
     wsEverReceivedSnapshot: false,
+    wsSnapshotValid: false,
+    wsSnapshotRecoveryStartedAt: 0,
+    wsLastRejoinAttemptAt: 0,
+    wsRejoinAttemptCount: 0,
     _wsManualClose: false,
     wsConnected: false,
     wsConnectionState: "disconnected",
@@ -459,6 +463,11 @@
     pendingWelcomeSlot: null,
     pendingWelcomeSlotCount: null,
     wsAckedMatchId: "",
+    reconnectSession: {
+      roomCode: "",
+      matchId: "",
+      playerId: null
+    },
     /** false only when live WS client connected and receiving snapshots */
     isAuthoritativeHost() {
       return this.mode !== "ws_client" && this.mode !== "local_client";
@@ -507,6 +516,118 @@
       if (this.pendingWelcomeSlot != null) GameStateManager.localPlayerId = this.pendingWelcomeSlot | 0;
       if (this.pendingWelcomeSlotCount != null) this._ensureSessionPlayersForCount(this.pendingWelcomeSlotCount | 0);
     },
+    _rememberReconnectSession(override) {
+      const session = this.reconnectSession || (this.reconnectSession = { roomCode: "", matchId: "", playerId: null });
+      const src = override || {};
+      const roomCode = String(src.roomCode != null ? src.roomCode : (GameStateManager ? GameStateManager.roomCode : "")).trim().toUpperCase();
+      const matchId = String(src.matchId != null ? src.matchId : (GameStateManager ? GameStateManager.currentMatchId : "")).trim();
+      const playerRaw = src.playerId != null ? src.playerId : (GameStateManager ? GameStateManager.localPlayerId : null);
+      const playerId = (playerRaw == null || playerRaw < 0) ? null : (playerRaw | 0);
+      if (roomCode) session.roomCode = roomCode;
+      if (matchId) session.matchId = matchId;
+      if (playerId != null) session.playerId = playerId;
+    },
+    _sendWsRejoinRequest() {
+      const sock = this.ws;
+      if (!sock || sock.readyState !== 1) return false;
+      this._rememberReconnectSession();
+      const session = this.reconnectSession || {};
+      const roomCode = String(session.roomCode || "").trim().toUpperCase();
+      const matchId = String(session.matchId || "").trim();
+      if (!roomCode && !matchId) return false;
+      const payload = {
+        v: Net.PROTOCOL_VERSION,
+        type: Net.Msg.JOIN_MATCH
+      };
+      if (roomCode) payload.roomCode = roomCode;
+      if (matchId) payload.matchId = matchId;
+      if (session.playerId != null) payload.playerId = session.playerId | 0;
+      this._logWs("auto rejoin attempt", payload);
+      try {
+        sock.send(JSON.stringify(payload));
+        return true;
+      } catch (e) {
+        this._logWs("auto rejoin send failed", { error: String(e && e.message ? e.message : e), payload });
+      }
+      return false;
+    },
+    _attemptSnapshotRecovery(reason, nowTs) {
+      const now = nowTs || Date.now();
+      if (now - (this.wsLastRejoinAttemptAt || 0) < 2500) return;
+      this.wsLastRejoinAttemptAt = now;
+      this.wsRejoinAttemptCount = (this.wsRejoinAttemptCount | 0) + 1;
+      const sent = this._sendWsRejoinRequest();
+      this._logWs("snapshot recovery attempt", {
+        reason: reason || "unspecified",
+        attempt: this.wsRejoinAttemptCount,
+        rejoinSent: !!sent
+      });
+      if (GameStateManager && GameStateManager._setHint) {
+        GameStateManager._setHint("Reconnecting to match state...", "#ffd9a8", 1.5);
+      }
+      if (!sent || this.wsRejoinAttemptCount >= 3) {
+        const sock = this.ws;
+        if (sock && sock.readyState === 1) {
+          this._logWs("snapshot recovery forcing reconnect", {
+            reason: reason || "unspecified",
+            attempt: this.wsRejoinAttemptCount
+          });
+          try { sock.close(); } catch (e) {}
+        }
+      }
+    },
+    pollSnapshotHealth() {
+      const sock = this.ws;
+      if (!sock || sock.readyState !== 1) return;
+      const phase = GameStateManager ? String(GameStateManager.phase || "") : "";
+      const needsSnapshotFeed = phase === "playing" || phase === "starting_match";
+      if (!needsSnapshotFeed) return;
+      const now = Date.now();
+      if (!this.wsSnapshotValid) {
+        if (!this.wsSnapshotRecoveryStartedAt) this.wsSnapshotRecoveryStartedAt = now;
+        const waitMs = now - this.wsSnapshotRecoveryStartedAt;
+        if (waitMs > 5000 && GameStateManager && GameStateManager._setHint) {
+          GameStateManager._setHint("Loading match state... waiting for snapshot.", "#8fdfff", 1.2);
+        }
+        if (waitMs > 7000) this._attemptSnapshotRecovery("first snapshot timeout", now);
+        return;
+      }
+      const sinceLastSnapshot = now - (this.wsLastSnapshotAt || now);
+      if (sinceLastSnapshot > 6000 && GameStateManager && GameStateManager._setHint) {
+        GameStateManager._setHint("Snapshot stream delayed... recovering.", "#ffd9a8", 1.2);
+      }
+      if (sinceLastSnapshot > 9000) this._attemptSnapshotRecovery("snapshot stream timeout", now);
+    },
+    _invalidateSnapshotState(reason, expectFreshSnapshot) {
+      this.wsLastSnapshotAt = 0;
+      this.wsEverReceivedSnapshot = false;
+      this.wsSnapshotValid = false;
+      this.wsSnapshotRecoveryStartedAt = expectFreshSnapshot ? Date.now() : 0;
+      this.wsLastRejoinAttemptAt = 0;
+      this.wsRejoinAttemptCount = 0;
+      this.lastAppliedTick = -1;
+      this.wsAckedMatchId = "";
+      if (GameStateManager) {
+        GameStateManager.snapshotWaitWarned = false;
+        if (expectFreshSnapshot) {
+          const resumeMatchId = String(
+            GameStateManager.currentMatchId
+            || (this.reconnectSession && this.reconnectSession.matchId)
+            || ""
+          ).trim();
+          if (resumeMatchId) GameStateManager.pendingStartMatchId = resumeMatchId;
+          GameStateManager.snapshotWaitStartedAt = Date.now();
+          if (GameStateManager.phase !== "starting_match") GameStateManager.setPhase("starting_match");
+          if (GameStateManager._setHint) {
+            GameStateManager._setHint("Waiting for fresh server snapshot...", "#8fdfff", 2.0);
+          }
+        } else {
+          GameStateManager.snapshotWaitStartedAt = 0;
+          GameStateManager.pendingStartMatchId = "";
+        }
+      }
+      this._logWs("snapshot invalidated", { reason: reason || "unspecified", expectFreshSnapshot: !!expectFreshSnapshot });
+    },
     closeCloudWebSocket() {
       this._wsManualClose = true;
       this._clearWsTimers();
@@ -515,6 +636,7 @@
       this.wsConnectionState = "disconnected";
       this.pendingWelcomeSlot = null;
       this.pendingWelcomeSlotCount = null;
+      this._invalidateSnapshotState("manual_close", false);
       if (this.ws) {
         try { this.ws.close(); } catch (e) {}
         this.ws = null;
@@ -557,10 +679,25 @@
           this.wsConnected = true;
           this.wsConnectionState = "connecting";
           this._logWs("connect success", { url: connectUrl });
+          this._rememberReconnectSession();
           this.wsReconnectAttempt = 0;
+          this._invalidateSnapshotState("socket_open", true);
           this.wsLastSnapshotAt = Date.now();
-          this.wsEverReceivedSnapshot = false;
-          this.wsAckedMatchId = "";
+          if (GameStateManager) {
+            const phase = String(GameStateManager.phase || "");
+            const hadRunningMatch = !!(GameStateManager.currentMatchId || (this.reconnectSession && this.reconnectSession.matchId));
+            if (hadRunningMatch && phase === "playing") {
+              const resumeMatchId = String(GameStateManager.currentMatchId || (this.reconnectSession && this.reconnectSession.matchId) || "").trim();
+              if (resumeMatchId) GameStateManager.pendingStartMatchId = resumeMatchId;
+              GameStateManager.snapshotWaitStartedAt = Date.now();
+              GameStateManager.snapshotWaitWarned = false;
+              GameStateManager.setPhase("starting_match");
+              if (GameStateManager._setHint) {
+                GameStateManager._setHint("Reconnected. Rejoining match...", "#8fdfff", 2.0);
+              }
+            }
+          }
+          this._sendWsRejoinRequest();
           if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
           this.wsHeartbeatTimer = setInterval(() => {
             const sock = this.ws;
@@ -638,6 +775,10 @@
           if (msg.type === Net.Msg.SNAPSHOT) {
             this.wsLastSnapshotAt = Date.now();
             this.wsEverReceivedSnapshot = true;
+            this.wsSnapshotValid = true;
+            this.wsSnapshotRecoveryStartedAt = 0;
+            this.wsLastRejoinAttemptAt = 0;
+            this.wsRejoinAttemptCount = 0;
             const matchId = String(msg.matchId || "");
             const expectedMatchId = String(GameStateManager.pendingStartMatchId || GameStateManager.currentMatchId || "");
             if (!matchId || (expectedMatchId && expectedMatchId !== matchId)) {
@@ -645,6 +786,7 @@
               return;
             }
             this._logWs("snapshot received", { matchId, tick: msg.tick != null ? msg.tick : null });
+            this._rememberReconnectSession({ matchId });
             if (GameStateManager) {
               GameStateManager.snapshotWaitStartedAt = 0;
               GameStateManager.snapshotWaitWarned = false;
@@ -687,6 +829,11 @@
             return;
           }
           if (msg.type === Net.Msg.MATCH_CREATED || msg.type === Net.Msg.MATCH_JOINED) {
+            this._rememberReconnectSession({
+              roomCode: msg.roomCode,
+              matchId: msg.matchId,
+              playerId: msg.slot
+            });
             if (GameStateManager && typeof GameStateManager._onRoomJoinResult === "function") {
               GameStateManager._onRoomJoinResult(msg);
             }
@@ -723,6 +870,7 @@
           });
           this.mode = "embedded";
           this.ws = null;
+          this._invalidateSnapshotState("socket_close", !wasManual);
           if (this.wsHeartbeatTimer) {
             clearInterval(this.wsHeartbeatTimer);
             this.wsHeartbeatTimer = null;
@@ -6731,6 +6879,10 @@
       resetClock();
     },
     updateMeta(dt) {
+      if (this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client"
+        && typeof NetworkCoordinator.pollSnapshotHealth === "function") {
+        NetworkCoordinator.pollSnapshotHealth();
+      }
       if (this.phase === "lobby" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
         // Match start is host-manual only from the Start button.
         // Keep lobby stable so more players can join before launch.
@@ -7373,6 +7525,7 @@
       const payload = { v: Net.PROTOCOL_VERSION, type: Net.Msg.JOIN_MATCH, roomCode };
       this._dbgLog("sending room join request", payload);
       try {
+        NetworkCoordinator._rememberReconnectSession({ roomCode, playerId: this.localPlayerId });
         NetworkCoordinator.ws.send(JSON.stringify(payload));
       } catch (e) {
         this._dbgLog("room join send failed", { error: String(e && e.message ? e.message : e), payload });

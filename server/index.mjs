@@ -202,6 +202,16 @@ function main() {
     };
   }
 
+  function roomCodeFromMatchId(matchId) {
+    const wanted = String(matchId || "").trim();
+    if (!wanted) return "";
+    if (activeMatch && activeMatch.matchId === wanted) return activeMatch.roomCode;
+    for (const room of rooms.values()) {
+      if (room && room.matchId === wanted) return room.roomCode;
+    }
+    return "";
+  }
+
   function buildAuthoritativeSnapshot(match) {
     const room = rooms.get(match.roomCode);
     if (!room) throw new Error("room_missing_for_snapshot");
@@ -415,7 +425,9 @@ function main() {
         }
 
         if (type === "join_match") {
-          const roomCode = normalizeRoomCode(msg.roomCode);
+          let roomCode = normalizeRoomCode(msg.roomCode);
+          const matchId = String(msg.matchId || "").trim();
+          if (!roomCode && matchId) roomCode = roomCodeFromMatchId(matchId);
           if (!roomCode) {
             sendMatchError(ws, "Invalid room code.");
             return;
@@ -428,7 +440,27 @@ function main() {
           const result = assignClientToRoom(ws, roomCode);
           log("match_join", { roomCode, connectedCount: result.connectedCount });
           if (!result.ok) sendMatchError(ws, result.error || "Join failed.");
-          else broadcastRoomPresence(roomCode, false);
+          else {
+            broadcastRoomPresence(roomCode, false);
+            // Rejoin contract: once server acknowledges join, immediately provide a snapshot
+            // when a match is already running so the client can resume from freeze state.
+            if (activeMatch && activeMatch.roomCode === roomCode && activeMatch.phase === RoomPhase.RUNNING) {
+              try {
+                const payload = buildAuthoritativeSnapshot(activeMatch);
+                sendMatchEvent(ws, "snapshot", payload);
+                log("rejoin_snapshot_sent", {
+                  roomCode,
+                  matchId: activeMatch.matchId,
+                  slot: result.slot
+                });
+              } catch (snapErr) {
+                log("rejoin_snapshot_failed", {
+                  roomCode,
+                  error: String(snapErr && snapErr.stack ? snapErr.stack : snapErr)
+                });
+              }
+            }
+          }
           return;
         }
 
