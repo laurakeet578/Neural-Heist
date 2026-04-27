@@ -7813,6 +7813,10 @@
       this._multiplayerPendingAction = "";
       // Prevent the same click/tap sequence from immediately triggering host/join.
       this._multiplayerMenuOpenedAt = Date.now();
+      this._dbgLog("entered multiplayer menu", {
+        from: fromReturn || "terminal_login",
+        phase: this.phase
+      });
       this._multiplayerMenuReturnPhase = fromReturn || "terminal_login";
       this.setPhase("multiplayer_menu");
     },
@@ -7829,6 +7833,7 @@
       }
       if (mx > cx0 && mx < cx1 && my > 224 && my < 276) {
         this._dbgLog("button click: multiplayer host", { mx, my });
+        this._dbgLog("selected host", { mx, my });
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_host");
@@ -7837,6 +7842,7 @@
       }
       if (mx > cx0 && mx < cx1 && my > 292 && my < 344) {
         this._dbgLog("button click: multiplayer join", { mx, my });
+        this._dbgLog("selected join", { mx, my });
         SFX.play("ui_click");
         this.gameMode = "online_mock";
         this._leaveLocalRoom("multiplayer_menu_join");
