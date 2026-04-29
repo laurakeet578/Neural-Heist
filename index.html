@@ -271,7 +271,8 @@
           role: p.role,
           suspicion: p.suspicion,
           fakeTaskTimer: p.fakeTaskTimer,
-          facing: p.facing
+          facing: p.facing,
+          inventory: typeof InventorySystem !== "undefined" ? InventorySystem.compressForSnap(p) : {}
         })),
         guards,
         cameras: cams
@@ -378,6 +379,7 @@
         p.fakeTaskTimer = s.fakeTaskTimer;
         if (s.role != null) p.role = s.role;
         if (s.facing != null) p.facing = s.facing;
+        if (typeof InventorySystem !== "undefined") InventorySystem.applySnapshotMerge(p, s.inventory || {});
       }
       const G = snap.guards || [];
       for (let gi = 0; gi < G.length; gi++) {
@@ -1883,7 +1885,9 @@
       const bucket = (this.replies[personality] && this.replies[personality][cat]) || this.replies.strict.neutral;
       const rng = mulberry32((hashString32((npc && npc.cpuName) || "cpu") ^ hashString32(cat + "|" + String((choice && choice.text) || ""))) >>> 0);
       const text = this._pick(bucket, rng) || "Move along.";
-      const suspiciousDelta = this.suspicionDelta(personality, cat);
+      let suspiciousDelta = this.suspicionDelta(personality, cat);
+      if (typeof NpcRoleSystem !== "undefined" && npc && NpcRoleSystem.roleOrCompute(npc) === "hostile")
+        suspiciousDelta = Math.max(suspiciousDelta, 1.08);
       return { text, suspiciousDelta };
     },
     rngForSession(npc) {
@@ -1906,9 +1910,7 @@
       const beh = npc.behavior || "ignore";
       if (kind === "informant") return "helpful";
       if (beh === "report") return "hostile";
-      if (kind === "suspicious") {
-        return beh === "watch" ? "neutral" : "hostile";
-      }
+      if (kind === "suspicious") return "hostile";
       if (kind === "worker") {
         if (beh === "watch") {
           if (p === "friendly" || p === "glitchy") return "helpful";
@@ -1970,11 +1972,98 @@
     tryGrantHelpfulOpen(npc, gsm) {
       if (!npc || !gsm || npc.npcGameplayRole !== "helpful") return;
       const now = performance.now();
-      if ((npc._helpfulHintCd || 0) > now) return;
+      const cdUntil = npc._helpfulHintCd || 0;
+      if (cdUntil > now) {
+        if ((npc._helpfulMicroGrantUntil || 0) > now) return;
+        npc._helpfulMicroGrantUntil = now + 7600;
+        const hintMicro = NpcRoleSystem.buildTacticalHint(gsm.world, gsm.player);
+        if (gsm.player) gsm.player.suspicion = clamp((gsm.player.suspicion || 0) - 0.78, 0, 100);
+        gsm._setHint("Contact ping — " + (hintMicro || "clearance eased a notch; stay smooth."), "#9ef5ff", 3.05);
+        return;
+      }
       const hint = NpcRoleSystem.buildTacticalHint(gsm.world, gsm.player);
-      if (hint) gsm._setHint("Tip — " + hint, "#9defff", 4.4);
+      if (gsm.player && typeof InventorySystem !== "undefined") {
+        InventorySystem.add(gsm.player, "access_key", 1);
+      }
+      if (hint)
+        gsm._setHint(
+          "Tip — " +
+            hint +
+            " Access laminate added — check inventory (Tab).",
+          "#9defff",
+          4.85
+        );
+      else
+        gsm._setHint("Access laminate cached in inventory (Tab).", "#9defff", 4.2);
       if (gsm.player) gsm.player.suspicion = clamp((gsm.player.suspicion || 0) - 3.4, 0, 100);
       npc._helpfulHintCd = now + 50000;
+    },
+
+    enforceRoleInteractionOutcome(gsm, npc, snapshotSuspicionBefore, choiceCategory) {
+      if (!gsm || !gsm.world || !gsm.player || !npc || snapshotSuspicionBefore == null) return;
+      const role = npc.npcGameplayRole || this.computeRole(npc);
+      const w = gsm.world;
+      const p = gsm.player;
+      const nameTag = npc.cpuName || "Contact";
+
+      const susAfter = clamp(p.suspicion || 0, 0, 100);
+      if (role === "helpful") {
+        const eased = snapshotSuspicionBefore - susAfter;
+        if (eased < 1.35)
+          p.suspicion = clamp((p.suspicion || 0) - (1.35 - eased), 0, 100);
+
+        let intel = NpcRoleSystem.buildTacticalHint(w, p);
+        let extra = "";
+
+        const seed = ((hashString32(String((npc.cpuName || "n") + "|chip|" + ((w.def && w.def.id) | 0))) ^ snapshotSuspicionBefore | 0) >>> 0) ^ (choiceCategory ? hashString32(choiceCategory + "|cat") >>> 0 : 0);
+        const rk = mulberry32(seed);
+        const r = rk();
+
+        const hackBk = w.flags.hackSpeedBonus || 0;
+        if (hackBk < 0.36 && r < 0.42) {
+          w.flags.hackSpeedBonus = clamp(hackBk + 0.065, 0, 0.36);
+          extra = "Spoof shard — breach timing tightens briefly.";
+        } else if (r < 0.68) {
+          const nowish = performance.now();
+          const wfRelays = w.terminals ? w.terminals.filter(t => t.kind === "primary" && !(w.hackedTerminals || {})[t.id]) : [];
+          w.flags.npcRelayPingUntil = nowish + 13000 + (wfRelays.length > 3 ? 0 : 5200);
+
+          extra = "Uplink scribble routed — relays sketched briefly.";
+        } else {
+          const nowish = performance.now();
+          const guards = w.guards || [];
+          const g = guards.length ? NpcRoleSystem._pickGuardForNpcReport(npc, p, guards) : null;
+          if (g) g.npcBonusBlindUntil = Math.max(g.npcBonusBlindUntil || 0, nowish + 4800);
+
+          extra = "Borrowed glare cap — one patrol optics smeared (~5s).";
+        }
+
+        if (!intel) intel = "Local mesh slack — glide slow corridors, mimic queued work.";
+        const full = ("Ally read — " + intel + (extra ? (" " + extra) : ""));
+        gsm._setHint(full, "#9ae8ff", 4.85);
+      } else if (role === "hostile") {
+        const gained = susAfter - snapshotSuspicionBefore;
+        if (gained < 1.1)
+          p.suspicion = clamp((p.suspicion || 0) + (1.1 - gained), 0, 100);
+        gsm._setHint(nameTag + ": \"You do not smell like maintenance. Eyes stay up.\"", "#ffb8a8", 2.95);
+        const guards = w.guards || [];
+        if (guards.length) {
+          const seed = (hashString32(nameTag + "|wng|" + snapshotSuspicionBefore) >>> 0) ^ 0x686f7374;
+          const rk = mulberry32(seed >>> 0);
+          if (rk() < 0.34) {
+            const tgt = guards[(rk() * guards.length) | 0];
+            tgt.detect = clamp((tgt.detect || 0) + rk() * 10 + 6, 0, 88);
+          }
+        }
+        w.alarm = clamp((w.alarm || 0) + 0.55, 0, 100);
+      } else {
+        /* neutral — minor ambience, no escalation */
+        let cat = choiceCategory || "";
+        gsm._setHint("Corridor talk — polite pressure, baseline only." + (cat ? (" (" + cat + ")") : ""), "#aabdd8", 2.05);
+        const seed = hashString32((npc.cpuName || "n") + "|neu|" + snapshotSuspicionBefore) >>> 0;
+        const jitter = (((seed & 0xff) / 127.5) - 1) * 0.14;
+        p.suspicion = clamp((p.suspicion || 0) + jitter, 0, 100);
+      }
     },
     _reportWarnMs: 2480,
     _reportCooldownMs: 15800,
@@ -2110,6 +2199,183 @@
     }
   };
 
+  /**
+   * Tracked NPC jobs: accepted from dialogue ([JOB] offer line), progress in play mode, loot on completion.
+   */
+  const NpcTaskSystem = {
+    _maxConcurrent: 2,
+    proposeForIssuer(npc, gsm, intelWeight) {
+      const w = gsm.world, p = gsm.player;
+      if (!w || !p || !npc) return null;
+      const iw = !!intelWeight;
+      const wid = (w.def && w.def.id) | 0;
+      const seed = (hashString32(String((npc.cpuName || "n") + "|tsk|" + wid)) >>> 0) ^ (iw ? 0xbee5 : 0);
+      const rng = mulberry32(seed);
+      const hacked = w.hackedTerminals || {};
+      const terms = [];
+      for (let i = 0; i < (w.terminals || []).length; i++) {
+        const t = w.terminals[i];
+        if (t && t.kind === "primary" && !hacked[t.id] && !TerminalState.isCompleted(t)) terms.push(t);
+      }
+      const roll = rng();
+      const rollAdj = iw ? Math.min(0.92, roll + 0.14) : roll;
+      if (terms.length && rollAdj < 0.54) {
+        let pick = terms[0], bd = 1e9;
+        for (let j = 0; j < terms.length; j++) {
+          const t = terms[j];
+          const cx = t.x + (t.w || 0) * 0.5, cy = t.y + (t.h || 0) * 0.5;
+          const d = Math.hypot(p.x - cx, p.y - cy);
+          if (d < bd) { bd = d; pick = t; }
+        }
+        const lab = pick.label ? String(pick.label) : "relay";
+        return {
+          type: "terminal_pulse",
+          offerText: "Contracted ping — linger two lazy passes beside " + lab + " so my shell can spoof maintenance noise.",
+          terminalId: pick.id,
+          terminalLabel: lab,
+          targetSec: 12 + ((rng() * 4) | 0)
+        };
+      }
+      if (roll < 0.84) {
+        const dx = (78 + rng() * 94) * (rng() > 0.52 ? 1 : -1);
+        const dy = (48 + rng() * 74) * (rng() > 0.42 ? -1 : 1);
+        return {
+          type: "junction_visit",
+          offerText: "Delivery tag — hold the flagged junction blind spot north of here for two beats, slow feet, then peel off.",
+          tx: clamp(npc.x + dx, 40, (w.worldW || 2000) - 40),
+          ty: clamp(npc.y + dy, 40, (w.worldH || 1200) - 40),
+          needNear: 80,
+          holdSec: 1.34,
+        };
+      }
+      return {
+        type: "low_profile",
+        offerText: "Keep your profile under fifty-two percent suspicion for fifteen seconds — I will scrub chatter after.",
+        susCap: 52,
+        targetSec: 15
+      };
+    },
+    startTaskFromSpec(gsm, npc, spec) {
+      if (!spec || !gsm || !npc) return false;
+      gsm.npcActiveTasks = gsm.npcActiveTasks || [];
+      let open = 0;
+      for (let i = 0; i < gsm.npcActiveTasks.length; i++) {
+        if (!gsm.npcActiveTasks[i].done) open++;
+      }
+      if (open >= this._maxConcurrent) {
+        gsm._showNPCDialogue(npc.cpuName || "NPC", "You are juggling enough jobs. Finish one before I pile on.", 2900);
+        SFX.play("npc_talk");
+        return false;
+      }
+      const name = npc.cpuName || "";
+      for (let j = 0; j < gsm.npcActiveTasks.length; j++) {
+        const t = gsm.npcActiveTasks[j];
+        if (!t.done && name && t.issuerCpu === name) {
+          gsm._showNPCDialogue(npc.cpuName || "NPC", "You already have my paperwork open — knock that out first.", 2600);
+          SFX.play("npc_talk");
+          return false;
+        }
+      }
+      const uid = "nt_" + (((performance.now() | 0) % 16777213) >>> 0) + "_" + ((hashString32(spec.type + (npc.cpuName || ""))) & 65535).toString(16);
+      const task = {
+        id: uid,
+        type: spec.type,
+        label: "?",
+        progressSec: 0,
+        targetSec: spec.type === "junction_visit" ? Math.max(spec.holdSec || 1.3, 0.35) : (spec.targetSec != null ? spec.targetSec : 14),
+        done: false,
+        issuerCpu: name,
+        issuerIndex: (gsm.world.npcs || []).indexOf(npc),
+        terminalId: spec.terminalId || "",
+        terminalLabel: spec.terminalLabel || "",
+        tx: spec.tx,
+        ty: spec.ty,
+        needNear: spec.needNear || 78,
+        dwellNeed: spec.holdSec != null ? spec.holdSec : 1.3,
+        dwellProgress: 0,
+        susCap: spec.susCap != null ? spec.susCap : 52
+      };
+      if (task.type === "terminal_pulse") task.label = "Check relay " + (task.terminalLabel || task.terminalId || "");
+      else if (task.type === "junction_visit") task.label = "Mark junction waypoint";
+      else task.label = "Low profile drift";
+      gsm.npcActiveTasks.push(task);
+      gsm._setHint("JOB ACTIVE — " + task.label + " · progress on HUD footer.", "#9ef5c8", 3.85);
+      SFX.play("npc_talk");
+      return true;
+    },
+    grantRewardFor(gsm, task) {
+      if (!task || task._rewarded || !gsm.world || !gsm.player) return;
+      task._rewarded = true;
+      task.done = true;
+      const w = gsm.world, p = gsm.player;
+      w.flags.npcTaskRewardsDone = (w.flags.npcTaskRewardsDone || 0) + 1;
+      p.suspicion = Math.max(0, (p.suspicion || 0) - 10);
+      w.flags.hackSpeedBonus = Math.max(w.flags.hackSpeedBonus || 0, 0.12);
+      w.alarm = Math.max(0, (w.alarm || 0) - 7);
+      w.flags.uiBonusCount = (w.flags.uiBonusCount || 0) + 1;
+      const hint = typeof NpcRoleSystem !== "undefined" ? NpcRoleSystem.buildTacticalHint(w, p) : "";
+      gsm._setHint(
+        "Job paid out — signal jammer + intel chip in inventory (Tab)." +
+          (hint ? (" " + hint) : "") +
+          " Spoof cache + trace scrub.",
+        "#b8ffd8",
+        4.45
+      );
+      if (typeof InventorySystem !== "undefined") {
+        InventorySystem.add(p, "signal_jammer", 1);
+        InventorySystem.add(p, "intel_chip", 1);
+        if (task.type === "low_profile") InventorySystem.add(p, "temporary_cloak", 1);
+      }
+      SFX.play("hack_ok");
+    },
+    tick(dt, gsm) {
+      const arr = gsm.npcActiveTasks;
+      if (!arr || !arr.length || !gsm.player || gsm.phase !== "playing" || gsm.mode !== "play") return;
+      const p = gsm.player;
+      const w = gsm.world;
+      if (!w) return;
+      const spd = p.getSpeed01();
+      for (let i = 0; i < arr.length; i++) {
+        const t = arr[i];
+        if (t.done || t._rewarded) continue;
+        if (t.type === "low_profile") {
+          if ((p.suspicion || 0) <= (t.susCap != null ? t.susCap : 52))
+            t.progressSec = Math.min(t.targetSec, t.progressSec + dt);
+          else
+            t.progressSec = Math.max(0, t.progressSec - dt * 0.48);
+          if (t.progressSec >= t.targetSec - 1e-3) NpcTaskSystem.grantRewardFor(gsm, t);
+        } else if (t.type === "terminal_pulse") {
+          const hacked = w.hackedTerminals || {};
+          const term = (w.terminals || []).find(tt => tt && tt.id === t.terminalId);
+          if (!(t._rewarded || t.done) && (!term || hacked[t.terminalId] || (term.kind === "primary" && TerminalState.isCompleted(term)))) {
+            NpcTaskSystem.grantRewardFor(gsm, t);
+            continue;
+          }
+          const cx = term.x + (term.w || 0) * 0.5, cy = term.y + (term.h || 0) * 0.5;
+          const d = Math.hypot(p.x - cx, p.y - cy);
+          if (d < 98 && spd < 0.55) {
+            const rate = spd < 0.22 ? dt * 1.05 : spd < 0.38 ? dt * 0.95 : dt * 0.65;
+            t.progressSec = Math.min(t.targetSec, t.progressSec + rate);
+          } else {
+            t.progressSec = Math.max(0, t.progressSec - dt * 0.28);
+          }
+          if (t.progressSec >= t.targetSec - 1e-3) NpcTaskSystem.grantRewardFor(gsm, t);
+        } else if (t.type === "junction_visit") {
+          const nx = t.tx || 0, ny = t.ty || 0;
+          const need = Math.max(24, t.needNear | 0);
+          const dn = t.dwellNeed != null ? t.dwellNeed : 1.3;
+          const dist = Math.hypot(p.x - nx, p.y - ny);
+          if (dist < need && spd < 0.46)
+            t.dwellProgress = (t.dwellProgress || 0) + dt;
+          else
+            t.dwellProgress = Math.max(0, (t.dwellProgress || 0) - dt * 0.9);
+          t.progressSec = Math.min(dn, Math.max(0, t.dwellProgress || 0));
+          if (((t.dwellProgress || 0) >= dn - 1e-3) && !t.done && !(t._rewarded)) NpcTaskSystem.grantRewardFor(gsm, t);
+        }
+      }
+    }
+  };
+
   /** Small temporary perks from positive NPC chat — capped per mission, not stack-breaking. */
   const NpcBonusSystem = {
     _maxGrantsPerMission: 4,
@@ -2136,7 +2402,8 @@
       if (k === 0) {
         wf.npcBonusVisMulUntil = now + 9000;
         wf.npcBonusVisMul = clamp(wf.npcBonusVisMul || 0.87, 0.82, 0.92);
-        gsm._setHint("Contact: soft sensor gloss on you (~9s).", "#a8f0ff", 2.75);
+        if (gsm.player && typeof InventorySystem !== "undefined") InventorySystem.add(gsm.player, "temporary_cloak", 1);
+        gsm._setHint("Contact: soft sensor gloss (~9s); cloak charge in inventory (Tab).", "#a8f0ff", 3.05);
       } else if (k === 1) {
         wf.npcRelayPingUntil = now + 14000;
         const hint = NpcRoleSystem.buildTacticalHint(world, gsm.player);
@@ -2162,6 +2429,91 @@
         wf.npcHackSnappierUntil = now + 22000;
         wf.npcHackSnappierMul = 0.93;
         gsm._setHint("Contact: breach windows slightly snappier (~20s).", "#d4ffc8", 2.65);
+      }
+    }
+  };
+
+  /** Level inventory: item id → quantity; cleared on mission player reset. */
+  const InventoryCatalog = {
+    access_key: { name: "Access key" },
+    signal_jammer: { name: "Signal jammer" },
+    temporary_cloak: { name: "Temporary cloak" },
+    intel_chip: { name: "Intel chip" }
+  };
+
+  const InventorySystem = {
+    ids() {
+      return Object.keys(InventoryCatalog);
+    },
+    emptyBag() {
+      const o = {};
+      const ids = this.ids();
+      for (let i = 0; i < ids.length; i++) o[ids[i]] = 0;
+      return o;
+    },
+    ensure(player) {
+      if (!player) return {};
+      if (!player.inventory || typeof player.inventory !== "object") player.inventory = this.emptyBag();
+      const ids = this.ids();
+      for (let i = 0; i < ids.length; i++) {
+        const k = ids[i];
+        if (typeof player.inventory[k] !== "number" || player.inventory[k] < 0) player.inventory[k] = 0;
+      }
+      return player.inventory;
+    },
+    reset(player) {
+      if (!player) return;
+      player.inventory = this.emptyBag();
+    },
+    count(player, id) {
+      if (!InventoryCatalog[id]) return 0;
+      return Math.max(0, (this.ensure(player)[id] | 0));
+    },
+    add(player, id, qty) {
+      if (!player || !InventoryCatalog[id]) return;
+      const bag = this.ensure(player);
+      bag[id] = Math.max(0, ((bag[id] | 0) + (qty | 0)) | 0);
+    },
+    tryConsume(player, id, qty) {
+      const q = qty | 0;
+      if (q <= 0) return true;
+      if (!player || !InventoryCatalog[id]) return false;
+      const bag = this.ensure(player);
+      if ((bag[id] | 0) < q) return false;
+      bag[id] = ((bag[id] | 0) - q);
+      return true;
+    },
+    listNonEmpty(player) {
+      const rows = [];
+      const bag = player ? this.ensure(player) : null;
+      const ids = this.ids();
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const n = bag ? (bag[id] | 0) : 0;
+        if (n <= 0) continue;
+        const lab = InventoryCatalog[id] && InventoryCatalog[id].name ? InventoryCatalog[id].name : id;
+        rows.push({ id: id, name: lab, qty: n });
+      }
+      return rows;
+    },
+    compressForSnap(player) {
+      const bag = this.ensure(player), out = {}, ids = this.ids();
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const n = bag[id] | 0;
+        if (n > 0) out[id] = n;
+      }
+      return Object.keys(out).length ? out : {};
+    },
+    applySnapshotMerge(player, invObj) {
+      if (!player || invObj == null || typeof invObj !== "object") return;
+      this.ensure(player);
+      const bag = player.inventory;
+      const ids = this.ids();
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const v = invObj[id];
+        if (typeof v === "number" && v >= 0 && v <= 999) bag[id] = v | 0;
       }
     }
   };
@@ -2735,6 +3087,7 @@
       this.reportCd = 0;
       this.moveAngle = null;
       this.turnRate = 0;
+      this.inventory = InventorySystem.emptyBag();
     }
     update(dt, input, walls) {
       let ax=0, ay=0;
@@ -4003,20 +4356,173 @@
       this.state = {};
       this.onDone = null;
       this.onFail = null;
+      this._minCircuitRings = 3;
+      this._fromFailsafe = false;
+      this._fallbackConsumed = false;
+    }
+    _generateCircuitRingsState() {
+      const n = this._minCircuitRings;
+      const target = [0, 0, 0];
+      const pieces = [];
+      for (let i = 0; i < n; i++) pieces.push((Math.random() * 4) | 0);
+      let guard = 0;
+      while (pieces[0] === 0 && pieces[1] === 0 && pieces[2] === 0 && guard < 12) {
+        pieces[(Math.random() * n) | 0] = 1 + ((Math.random() * 3) | 0);
+        guard++;
+      }
+      return {
+        pieces,
+        target,
+        idx: 0,
+        ttl: 18,
+        ringCount: n,
+        inputEnabled: false
+      };
+    }
+    _validateCircuitAlignState(s) {
+      const n = this._minCircuitRings;
+      if (!s || !Array.isArray(s.pieces) || !Array.isArray(s.target)) return false;
+      if (s.pieces.length < n || s.target.length < n) return false;
+      if ((s.ringCount | 0) < n) return false;
+      for (let i = 0; i < n; i++) {
+        const p = s.pieces[i];
+        const t = s.target[i];
+        if (typeof p !== "number" || typeof t !== "number") return false;
+        const pi = p | 0, ti = t | 0;
+        if (pi !== p || ti !== t) return false;
+        if (pi < 0 || pi > 3 || ti < 0 || ti > 3) return false;
+      }
+      return true;
+    }
+    _validateRepairHoldState(s) {
+      return !!(
+        s &&
+        typeof s.need === "number" &&
+        s.need > 0 &&
+        typeof s.progress === "number" &&
+        s.progress >= 0 &&
+        typeof s.ttl === "number"
+      );
+    }
+    _validateTimedInputState(s) {
+      return !!(
+        s &&
+        Array.isArray(s.seq) &&
+        s.seq.length > 0 &&
+        typeof s.idx === "number" &&
+        s.idx >= 0 &&
+        typeof s.ttl === "number"
+      );
+    }
+    /** Switches current task to a guaranteed-completable timed key sequence (same Done/Fail callbacks). */
+    _activateFallbackTimedInput(reason) {
+      if (typeof console !== "undefined" && console.warn) {
+        console.warn("[NeuralHeist][MiniTask] failsafe fallback → timed_input" + (reason ? " (" + reason + ")" : ""));
+      }
+      this.type = "timed_input";
+      this.state = { seq: ["KeyW", "KeyD", "KeyS", "KeyA"], idx: 0, ttl: 10 };
+      if (!this._validateTimedInputState(this.state)) {
+        this.state = { seq: ["KeyW"], idx: 0, ttl: 12 };
+      }
+      this._fromFailsafe = true;
+    }
+    /** One automatic reset wave for circuit_align before fallback (same session, same callbacks). */
+    _tryInitCircuitAlignWithRetry() {
+      const maxAttempts = 16;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const built = this._generateCircuitRingsState();
+        if (this._validateCircuitAlignState(built)) {
+          built.inputEnabled = true;
+          this.state = built;
+          if (this._validateCircuitAlignState(this.state) && (this.state.ringCount | 0) >= this._minCircuitRings)
+            return true;
+        }
+      }
+      return false;
+    }
+    /** Returns false if task is unrecoverable and caller should bail to gameplay (extremely rare). */
+    sanitizeRuntimeOrFallback() {
+      if (this.type === "repair_hold") {
+        if (this._validateRepairHoldState(this.state)) return true;
+        if (!this._fallbackConsumed) {
+          this._fallbackConsumed = true;
+          this._activateFallbackTimedInput("repair_runtime");
+          return true;
+        }
+        return false;
+      }
+      if (this.type === "circuit_align") {
+        if (this._validateCircuitAlignState(this.state) && this.state.inputEnabled) return true;
+        if (!this._fallbackConsumed) {
+          this._fallbackConsumed = true;
+          this._activateFallbackTimedInput("circuit_runtime");
+          return true;
+        }
+        return false;
+      }
+      if (this.type === "timed_input") {
+        if (this._validateTimedInputState(this.state)) return true;
+        if (!this._fallbackConsumed) {
+          this._fallbackConsumed = true;
+          this.state = { seq: ["KeyW"], idx: 0, ttl: 12 };
+          this._fromFailsafe = true;
+          return this._validateTimedInputState(this.state);
+        }
+        return false;
+      }
+      if (!this._fallbackConsumed) {
+        this._fallbackConsumed = true;
+        this._activateFallbackTimedInput("unknown_runtime");
+        return true;
+      }
+      return false;
     }
     start(spec, onDone, onFail) {
-      this.active = true;
+      this.active = false;
       this.type = (spec && spec.type) || "";
       this.onDone = onDone || null;
       this.onFail = onFail || null;
+      this._fromFailsafe = false;
+      this._fallbackConsumed = false;
       if (this.type === "repair_hold") {
         this.state = { progress: 0, need: 2.8, ttl: 9.5 };
+        if (!this._validateRepairHoldState(this.state)) {
+          if (typeof console !== "undefined" && console.warn) console.warn("[NeuralHeist][MiniTask] repair init invalid → fallback");
+          this._activateFallbackTimedInput("repair_init");
+          this.active = true;
+          return;
+        }
+        this.active = true;
       } else if (this.type === "circuit_align") {
-        this.state = { pieces: [1, 2, 3], target: [0, 0, 0], idx: 0, ttl: 18 };
+        let ok = this._tryInitCircuitAlignWithRetry();
+        if (!ok && typeof console !== "undefined" && console.warn) console.warn("[NeuralHeist][CircuitAlign] init reset — retry wave");
+        if (!ok) ok = this._tryInitCircuitAlignWithRetry();
+        if (!ok) {
+          if (typeof console !== "undefined" && console.log) console.log("[NeuralHeist][CircuitAlign] using timed_input failsafe after circuit init failure");
+          this._activateFallbackTimedInput("circuit_init");
+          this.active = true;
+          return;
+        }
+        if (typeof console !== "undefined" && console.log) {
+          console.log(
+            "[NeuralHeist][CircuitAlign] rings created:",
+            this.state.ringCount,
+            "initOk: true",
+            "pieces:",
+            this.state.pieces ? this.state.pieces.slice() : []
+          );
+        }
+        this.active = true;
       } else if (this.type === "timed_input") {
         this.state = { seq: ["KeyW", "KeyD", "KeyS", "KeyA"], idx: 0, ttl: 7.5 };
+        if (!this._validateTimedInputState(this.state)) {
+          this._activateFallbackTimedInput("timed_init");
+        }
+        this.active = true;
       } else {
-        this.state = { ttl: 6 };
+        if (typeof console !== "undefined" && console.warn) console.warn("[NeuralHeist][MiniTask] unknown type → timed_input failsafe:", this.type);
+        this._activateFallbackTimedInput("unknown_type");
+        this.active = true;
       }
     }
     stop(success) {
@@ -4026,18 +4532,30 @@
       this.state = {};
       this.onDone = null;
       this.onFail = null;
+      this._fromFailsafe = false;
+      this._fallbackConsumed = false;
       if (success) { if (done) done(); }
       else { if (fail) fail(); }
     }
     handleKey(code) {
       if (!this.active) return false;
       if (this.type === "circuit_align") {
-        if (code === "KeyW" || code === "ArrowUp") { this.state.idx = (this.state.idx + 2) % 3; return true; }
-        if (code === "KeyS" || code === "ArrowDown") { this.state.idx = (this.state.idx + 1) % 3; return true; }
-        if (code === "KeyA" || code === "ArrowLeft") { this.state.pieces[this.state.idx] = (this.state.pieces[this.state.idx] + 3) % 4; return true; }
-        if (code === "KeyD" || code === "ArrowRight") { this.state.pieces[this.state.idx] = (this.state.pieces[this.state.idx] + 1) % 4; return true; }
+        if (!this.state || !this.state.inputEnabled || !this._validateCircuitAlignState(this.state)) return false;
+        const n = this._minCircuitRings;
+        if (!this.state.pieces || this.state.pieces.length < n) return false;
+        if (code === "KeyW" || code === "ArrowUp") { this.state.idx = ((this.state.idx + 2) % n + n) % n; return true; }
+        if (code === "KeyS" || code === "ArrowDown") { this.state.idx = ((this.state.idx + 1) % n + n) % n; return true; }
+        if (code === "KeyA" || code === "ArrowLeft") {
+          this.state.pieces[this.state.idx] = ((this.state.pieces[this.state.idx] | 0) + 3) % 4;
+          return true;
+        }
+        if (code === "KeyD" || code === "ArrowRight") {
+          this.state.pieces[this.state.idx] = ((this.state.pieces[this.state.idx] | 0) + 1) % 4;
+          return true;
+        }
         if (code === "Enter" || code === "Space") {
-          const ok = this.state.pieces[0] === this.state.target[0] && this.state.pieces[1] === this.state.target[1] && this.state.pieces[2] === this.state.target[2];
+          let ok = true;
+          for (let i = 0; i < n; i++) ok = ok && (this.state.pieces[i] === this.state.target[i]);
           this.stop(ok);
           return true;
         }
@@ -4056,6 +4574,11 @@
     }
     update(dt, gsm) {
       if (!this.active) return;
+      if (!this.sanitizeRuntimeOrFallback()) {
+        if (typeof console !== "undefined" && console.error) console.error("[NeuralHeist][MiniTask] unrecoverable task state");
+        this.stop(false);
+        return;
+      }
       this.state.ttl = (this.state.ttl || 0) - dt;
       if (this.state.ttl <= 0) { this.stop(false); return; }
       if (this.type === "repair_hold") {
@@ -4084,11 +4607,54 @@
         ctx.font = "12px monospace";
         ctx.fillText("Progress " + pct + "%  |  Time " + this.state.ttl.toFixed(1) + "s", VIEW_W / 2, 196);
       } else if (this.type === "circuit_align") {
-        ctx.fillText("CIRCUIT ALIGNMENT — MATCH ALL RINGS TO 0", VIEW_W / 2, 168);
+        const okState = this._validateCircuitAlignState(this.state);
+        if (!okState || !this.state.pieces || this.state.pieces.length < this._minCircuitRings) {
+          ctx.font = "14px monospace";
+          ctx.fillText("Circuit aligning… standby.", VIEW_W / 2, 200);
+          ctx.restore();
+          return;
+        }
+        const cx = VIEW_W / 2;
+        const cy = 218;
+        ctx.strokeStyle = "rgba(120,210,230,0.4)";
+        ctx.lineWidth = 1.25;
+        ctx.setLineDash([5, 4]);
+        for (let ri = 0; ri < this._minCircuitRings; ri++) {
+          const r = 74 - ri * 20;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, -Math.PI / 5, Math.PI / 5);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+        for (let ri = 0; ri < this._minCircuitRings; ri++) {
+          const r = 74 - ri * 20;
+          const sel = (this.state.idx | 0) === ri;
+          const ang = ((this.state.pieces[ri] | 0) * Math.PI) / 2;
+          ctx.strokeStyle = sel ? "rgba(0,255,238,0.98)" : "rgba(0,255,208,0.88)";
+          ctx.lineWidth = sel ? 4.2 : 2.8;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, ang - Math.PI / 6, ang + Math.PI / 6);
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#bff";
+        ctx.font = "bold 15px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("CIRCUIT ALIGNMENT — MATCH ALL RINGS TO 0", VIEW_W / 2, 152);
         ctx.font = "12px monospace";
-        ctx.fillText("W/S select ring  A/D rotate  Enter submit  |  " + this.state.pieces.join(" · "), VIEW_W / 2, 196);
+        ctx.fillText(
+          "W/S select ring  ·  A/D rotate  ·  Enter submit  |  " +
+            this.state.pieces.slice(0, this._minCircuitRings).join(" · ") +
+            "  |  " +
+            (this.state.ttl != null ? this.state.ttl.toFixed(1) + "s" : "—"),
+          VIEW_W / 2,
+          278
+        );
       } else if (this.type === "timed_input") {
-        ctx.fillText("TIMED INPUT — ENTER THE KEY SEQUENCE", VIEW_W / 2, 168);
+        ctx.fillText(
+          "TIMED INPUT — ENTER THE KEY SEQUENCE" + (this._fromFailsafe ? " (recovery route)" : ""),
+          VIEW_W / 2,
+          168
+        );
         ctx.font = "12px monospace";
         ctx.fillText(this.state.seq.join("  ") + "   [" + this.state.idx + "/" + this.state.seq.length + "]  |  " + this.state.ttl.toFixed(1) + "s", VIEW_W / 2, 196);
       }
@@ -4268,6 +4834,8 @@
       let nearObjective = false;
       for (let i = 0; i < terminals.length; i++) {
         const t = terminals[i];
+        TerminalState.ensure(t);
+        if (t.state === TerminalState.COMPLETED) continue;
         const cx = t.x + t.w * 0.5, cy = t.y + t.h * 0.5;
         if (Math.hypot(player.x - cx, player.y - cy) < 140) { nearObjective = true; break; }
       }
@@ -4928,6 +5496,65 @@
       const uy = clamp(worldH * 0.12, 90, worldH - 130);
       terminals.push({ id: sid + "-card-pickup", x: ax, y: ay, w: 70, h: 40, kind: "access_card_pickup", label: "ACCESS CARD" });
       terminals.push({ id: sid + "-card-use", x: ux, y: uy, w: 76, h: 42, kind: "access_card_use", label: "CARD READER" });
+
+      const baseLayout = typeof def.terminals === "function" ? def.terminals() : [];
+      const relays = baseLayout.filter(t => t && t.kind === "primary");
+      const seedPick = (((def.id || 0) * 1103515245) ^ (worldW | 0) ^ (worldH | 0)) >>> 0;
+      const rngPick = mulberry32(seedPick || 1);
+      const itemCycle = ["intel_chip", "temporary_cloak", "signal_jammer", "access_key"];
+      const pickupLabel = itemId => {
+        const nm =
+          typeof InventoryCatalog !== "undefined" && InventoryCatalog[itemId] && InventoryCatalog[itemId].name
+            ? InventoryCatalog[itemId].name
+            : String(itemId || "").replace(/_/g, " ");
+        return "\u25C6 " + nm;
+      };
+
+      if (relays.length) {
+        const rr = relays[(Math.max(1, def.id | 0) - 1) % relays.length];
+        const iNear = itemCycle[((def.id | 0) * 2) % itemCycle.length];
+        terminals.push({
+          id: sid + "-pickup-relay",
+          x: clamp(rr.x + rr.w + 14 + (rngPick() - 0.5) * 22, 44, worldW - 58),
+          y: clamp(rr.y + rngPick() * Math.max(14, rr.h * 0.45), 44, worldH - 52),
+          w: 46,
+          h: 34,
+          kind: "item_pickup",
+          itemId: iNear,
+          label: pickupLabel(iNear)
+        });
+      }
+      const spawn = def.spawn || { x: worldW * 0.15, y: worldH * 0.85 };
+      const iHide = itemCycle[((def.id | 0) * 3 + 1) % itemCycle.length];
+      const hiddenX =
+        spawn.x > worldW * 0.52
+          ? clamp(64 + rngPick() * (worldW * 0.3), 52, worldW - 92)
+          : clamp(worldW * 0.6 + rngPick() * (worldW * 0.34), 52, worldW - 92);
+      const hiddenY = clamp(96 + rngPick() * (worldH * 0.38), 56, worldH - 96);
+      terminals.push({
+        id: sid + "-pickup-hide",
+        x: hiddenX,
+        y: hiddenY,
+        w: 46,
+        h: 34,
+        kind: "item_pickup",
+        itemId: iHide,
+        label: pickupLabel(iHide)
+      });
+      if (def.extraction && def.extraction.w != null) {
+        const ex = def.extraction;
+        const iRisk = itemCycle[((def.id | 0) * 5 + 2) % itemCycle.length];
+        terminals.push({
+          id: sid + "-pickup-risk",
+          x: clamp(ex.x - 65 - rngPick() * 52, 46, worldW - 70),
+          y: clamp(ex.y - 105 - rngPick() * (ex.h + 80), 50, worldH - 86),
+          w: 46,
+          h: 34,
+          kind: "item_pickup",
+          itemId: iRisk,
+          label: pickupLabel(iRisk)
+        });
+      }
       return { objectives, terminals };
     }
   };
@@ -5022,6 +5649,10 @@
         if (e.code==="Digit1") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(1); }
         if (e.code==="Digit2") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(2); }
         if (e.code==="Digit3") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(3); }
+        if (e.code==="KeyTab") { e.preventDefault(); if (GameStateManager.phase==="playing" && GameStateManager.mode==="play") GameStateManager.inventoryPanelOpen = !GameStateManager.inventoryPanelOpen; }
+        if (e.code==="Digit4") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(4); }
+        if (e.code==="Digit5") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(5); }
+        if (e.code==="Digit6") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(6); }
         if (e.code==="KeyF") { e.preventDefault(); GameStateManager.tryFakeTask(); }
         if (e.code==="KeyG") { e.preventDefault(); GameStateManager.trySabotage(); }
         if (e.code==="KeyZ") { e.preventDefault(); GameStateManager.tryInvestigate(); }
@@ -5065,7 +5696,14 @@
           GameStateManager.skipPostLevel5Cutscene();
           return;
         }
-        if (e.code==="Escape") { e.preventDefault(); if (GameStateManager.phase==="playing") GameStateManager.paused = !GameStateManager.paused; }
+        if (e.code==="Escape") {
+          e.preventDefault();
+          if (GameStateManager.inventoryPanelOpen) {
+            GameStateManager.inventoryPanelOpen = false;
+            return;
+          }
+          if (GameStateManager.phase==="playing") GameStateManager.paused = !GameStateManager.paused;
+        }
         if (e.code==="Space" && GameStateManager.phase==="briefing") { e.preventDefault(); GameStateManager.startPlaying(); }
       }, true);
       document.addEventListener("keyup", (e) => {
@@ -5173,6 +5811,7 @@
     exposureMaxTimer: 0,
     rewardAlpha: 0,
     paused: false,
+    inventoryPanelOpen: false,
     keys: Object.create(null),
     _lastDt: 0.016,
     roomCode: "",
@@ -5258,9 +5897,10 @@
     _cutsceneHudRawLine: "",
     _cutsceneCueSfxKey: "",
     npcDialogueNPC: null,
-    npcTask: null,
+    npcActiveTasks: [],
     npcFavor: null,
     _favorChoiceSpecById: null,
+    _npcTaskChoiceSpecById: null,
     _pendingHackSpec: null,
     _worldStaticCanvas: null,
     _worldStaticMissionKey: "",
@@ -5561,6 +6201,7 @@
         w.cameras.forEach(c => { c.active = false; });
       } else if (t.kind === "bonus_data") {
         w.flags.bonusDataDownloaded = true;
+        if (this.player && typeof InventorySystem !== "undefined") InventorySystem.add(this.player, "intel_chip", 2);
       } else if (t.kind === "lore_log") {
         const lore = STORY_BEATS[(w.def && w.def.id) || 0] || [];
         const idx = w.flags.loreIndex || 0;
@@ -6019,10 +6660,17 @@
         n.personality = id.personality;
         n.dialogueProfile = id;
         n.npcGameplayRole = NpcRoleSystem.computeRole(n);
+        n._npcTaskIssuer = false;
       }
+      const wrk = [];
+      for (let j = 0; j < w.npcs.length; j++) {
+        if (w.npcs[j].npcKind === "worker") wrk.push(j);
+      }
+      for (let k = 0; k < Math.min(2, wrk.length); k++) w.npcs[wrk[k]]._npcTaskIssuer = true;
     },
     _openNpcChoiceDialogue(npc) {
       npc._npcDialogueGen = ((npc._npcDialogueGen | 0) + 1) >>> 0;
+      this._npcTaskChoiceSpecById = {};
       const fallbackSpeaker = (npc.npcKind === "informant") ? "Informant CPU" : (npc.npcKind === "suspicious" ? "Security CPU" : "Worker CPU");
       const profile = npc.dialogueProfile || this._buildNpcIdentity(npc, 0, 0);
       this.npcDialogueSpeaker = npc.cpuName || profile.cpuName || fallbackSpeaker;
@@ -6033,6 +6681,32 @@
       this.npcDialogueNPC = npc;
       if (npc.npcGameplayRole === "helpful") NpcRoleSystem.tryGrantHelpfulOpen(npc, this);
       this._maybeInjectFavorChoice(npc);
+      this._injectGuaranteedNpcTaskOffer(npc);
+    },
+    _injectGuaranteedNpcTaskOffer(npc) {
+      this._npcTaskChoiceSpecById = this._npcTaskChoiceSpecById || {};
+      const w = this.world;
+      if (!w || !npc || !npc._npcTaskIssuer || npc.npcKind !== "worker") return;
+      if (this.phase !== "playing" || this.mode !== "play") return;
+      const ch = this.npcDialogueChoices;
+      if (!ch || !ch.length) return;
+      let open = 0;
+      const arr = this.npcActiveTasks || [];
+      for (let i = 0; i < arr.length; i++) {
+        if (!arr[i].done) open++;
+      }
+      if (open >= NpcTaskSystem._maxConcurrent) return;
+      const name = npc.cpuName || "";
+      for (let j = 0; j < arr.length; j++) {
+        if (!arr[j].done && name && arr[j].issuerCpu === name) return;
+      }
+      const spec = NpcTaskSystem.proposeForIssuer(npc, this, false);
+      if (!spec) return;
+      let maxId = 0;
+      for (let k = 0; k < ch.length; k++) maxId = Math.max(maxId, ch[k].id | 0);
+      const nid = maxId + 1;
+      ch.push({ id: nid, text: "[JOB] " + spec.offerText, category: "friendly", meta: "npc_task_accept" });
+      this._npcTaskChoiceSpecById[nid] = spec;
     },
     _maybeInjectFavorChoice(npc) {
       this._favorChoiceSpecById = {};
@@ -6049,7 +6723,14 @@
       if (rng() > 0.4) return;
       const ch = this.npcDialogueChoices;
       if (!ch || !ch.length) return;
-      const slot = (rng() * ch.length) | 0;
+      const poolIdx = [];
+      for (let si = 0; si < ch.length; si++) {
+        const m = ch[si].meta;
+        if (m === "worker_intel" || m === "npc_task_accept") continue;
+        poolIdx.push(si);
+      }
+      if (!poolIdx.length) return;
+      const slot = poolIdx[(rng() * poolIdx.length) | 0];
       const origId = ch[slot].id;
       ch[slot] = { id: origId, text: spec.offerText, category: "friendly", meta: "npc_favor" };
       this._favorChoiceSpecById = this._favorChoiceSpecById || {};
@@ -6160,6 +6841,16 @@
         this.npcDialogueNPC = null;
         return;
       }
+      if (choiceObj && choiceObj.meta === "npc_task_accept") {
+        const spec = this._npcTaskChoiceSpecById && this._npcTaskChoiceSpecById[choiceId];
+        if (spec) NpcTaskSystem.startTaskFromSpec(this, npc, spec);
+        if (this._npcTaskChoiceSpecById && choiceId != null) delete this._npcTaskChoiceSpecById[choiceId];
+        this.npcDialogueAwaitingChoice = false;
+        this.npcDialogueChoices = [];
+        this.npcDialogueNPC = null;
+        return;
+      }
+      const suspicionBeforeNpcChoiceResolution = this.player ? (this.player.suspicion || 0) : 0;
       const out = this._resolveNpcChoice(npc, choiceId);
       this._showNPCDialogue(out.speaker, out.text, 3200);
       SFX.play("npc_talk");
@@ -6182,31 +6873,11 @@
         npc._hostileDialogPrimedUntil = performance.now() + 11000;
       }
       if (choiceObj && choiceObj.meta === "worker_intel" && npc.npcKind === "worker") {
-        this._assignWorkerTask();
+        const intelSpec = NpcTaskSystem.proposeForIssuer(npc, this, true);
+        if (intelSpec) NpcTaskSystem.startTaskFromSpec(this, npc, intelSpec);
       }
-    },
-    _assignWorkerTask() {
-      if (this.npcTask && !this.npcTask.done) return false;
-      this.npcTask = {
-        id: "worker-low-profile",
-        type: "low_profile",
-        label: "Stay under 50 suspicion for 20s",
-        progressSec: 0,
-        targetSec: 20,
-        done: false,
-        reward: "stealth_buffer"
-      };
-      return true;
-    },
-    _grantNpcTaskReward(task) {
-      const w = this.world;
-      if (!w || !task || task._rewarded) return;
-      task._rewarded = true;
-      w.flags.hackSpeedBonus = Math.max(w.flags.hackSpeedBonus || 0, 0.1);
-      w.alarm = Math.max(0, (w.alarm || 0) - 6);
-      if (this.player) this.player.suspicion = Math.max(0, (this.player.suspicion || 0) - 10);
-      w.flags.uiBonusCount = (w.flags.uiBonusCount || 0) + 1;
-      this._showNPCDialogue("Worker", "Nice. Trace pressure dropped, and your breach rig runs faster.", 3200);
+      const catForRole = choiceObj && choiceObj.category;
+      NpcRoleSystem.enforceRoleInteractionOutcome(this, npc, suspicionBeforeNpcChoiceResolution, catForRole || "");
     },
     _npcDialogueFor(npc) {
       const w = this.world, p = this.player;
@@ -6227,12 +6898,10 @@
         if (sp > 38) return { speaker: "Suspicious Tech", text: "Security is tracking behavior spikes. Stay calm.", suspiciousDelta: 2.5 };
         return { speaker: "Suspicious Tech", text: "Badge checks are tightening around relay rooms.", suspiciousDelta: 1.0 };
       }
-      // Worker
-      if (!this.npcTask || this.npcTask.done) {
-        const assigned = this._assignWorkerTask();
-        if (assigned) return { speaker: "Worker", text: "Side job: keep suspicion under 50 for 20 seconds. I can scrub your trace after.", suspiciousDelta: 0 };
-      }
-      return { speaker: "Worker", text: "Keep your head down. Stay below 50 suspicion to finish the side task.", suspiciousDelta: 0 };
+      const jobs = ((this.npcActiveTasks || []).filter(t => t && !t.done)).length;
+      if (!jobs)
+        return { speaker: "Worker", text: "Side ops come from the [JOB] cues on certain crew — ask when you are close.", suspiciousDelta: 0 };
+      return { speaker: "Worker", text: "You are already carrying my last side thread — finish that first.", suspiciousDelta: 0 };
     },
     tryTalkToNPC() {
       if (this.phase !== "playing" || this.mode !== "play" || this.paused || !this.world || !this.player) return;
@@ -6250,16 +6919,7 @@
       SFX.play("npc_talk");
     },
     _updateNpcTask(dt) {
-      const t = this.npcTask, p = this.player;
-      if (!t || t.done || !p || this.phase !== "playing" || this.mode !== "play") return;
-      if (t.type === "low_profile") {
-        if ((p.suspicion || 0) <= 50) t.progressSec = Math.min(t.targetSec, t.progressSec + dt);
-        else t.progressSec = Math.max(0, t.progressSec - dt * 0.5);
-        if (t.progressSec >= t.targetSec) {
-          t.done = true;
-          this._grantNpcTaskReward(t);
-        }
-      }
+      NpcTaskSystem.tick(dt, this);
     },
 
     initInput() {
@@ -7330,13 +7990,14 @@
       if (this.phase !== "playing") return;
       const inTransition = this.mode === "transition_in";
       const hackActive = this.mode === "hack" && !!(this.hackingSession && this.hackingSession.hacking && this.hack && this.hack.active);
-      const taskActive = this.mode === "task" && !!(this.task && this.task.active);
+      let taskActive = this.mode === "task" && !!(this.task && this.task.active);
       const playerControlActive = this.mode === "play" && this.currentState === STATES.CAMPAIGN && !this.paused;
       if (inTransition) return;
       if (this.mode === "task" && !taskActive) {
         this.mode = "play";
         this.pendingTerminal = null;
       }
+      taskActive = this.mode === "task" && !!(this.task && this.task.active);
       // Runtime contract: in gameplay phase we should either control player or actively hack.
       if (!hackActive && !playerControlActive && !taskActive) {
         this.recoverToGameplay("invalid_runtime_state");
@@ -7799,6 +8460,14 @@
         this._dbgLog("multiplayer menu click ignored (await pointer release)", { mx, my });
         return;
       }
+      // Belt-and-suspenders: ignore any clicks within 400ms of menu entry
+      // so a fast double-click on the title's "Multiplayer" button can't
+      // bleed through to the JOIN button (Y ranges overlap ~36px).
+      const sinceOpened = Date.now() - (this._multiplayerMenuOpenedAt || 0);
+      if (sinceOpened < 400) {
+        this._dbgLog("multiplayer menu click ignored (entry grace window)", { mx, my, sinceOpened });
+        return;
+      }
       const cx0 = VIEW_W / 2 - 170;
       const cx1 = VIEW_W / 2 + 170;
       if (mx > 80 && mx < 240 && my > VIEW_H - 80 && my < VIEW_H - 40) {
@@ -8096,10 +8765,12 @@
         this.npcDialogueChoices = [];
         this.npcDialogueAwaitingChoice = false;
         this.npcDialogueNPC = null;
-        this.npcTask = null;
+        this.npcActiveTasks = [];
         this.npcFavor = null;
         this._favorChoiceSpecById = null;
+        this._npcTaskChoiceSpecById = null;
         this.activeRepair = null;
+        this.inventoryPanelOpen = false;
         this.failTimer = 0;
         this.exposureMaxTimer = 0;
         w.primaryDone = false;
@@ -8118,6 +8789,7 @@
         w.flags.maxAlarm = 0;
         w.flags.bonusDataDownloaded = false;
         w.flags.accessCardFound = false;
+        w.flags.inventoryJammerGranted = false;
         w.flags.hackSpeedBonus = 0;
         w.flags.uiBonusCount = 0;
         w.flags.sideRewardsGranted = {};
@@ -8128,7 +8800,7 @@
         w.flags.npcRelayPingUntil = 0;
         w.flags.npcHackSnappierUntil = 0;
         w.flags.npcHackSnappierMul = 0;
-        (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; n._npcBonusCdUntil = 0; });
+        (w.npcs || []).forEach(n => { n.watchLevel = 0; n.reportCd = 0; n._npcBonusCdUntil = 0; n._helpfulHintCd = 0; n._helpfulMicroGrantUntil = 0; });
         (w.guards || []).forEach(g => { if (g) g.npcBonusBlindUntil = 0; });
         DetectionSystem.reset(w);
         MissionSystem.init(w);
@@ -8143,6 +8815,7 @@
           p.reportPulse = 0;
           p.investigateCd = 0;
           p.reportCd = 0;
+          if (typeof InventorySystem !== "undefined") InventorySystem.reset(p);
         });
         w.flags.guardFocus = null;
         if ((typeof window === "undefined" || !window.NEURAL_HEIST_WS) && !(this.gameMode === "online_mock" && this.roomCode)) {
@@ -8593,7 +9266,13 @@
       const durM = p.role === "saboteur" ? 1.12 : 1;
       if (hit.kind === "terminal") {
         w.flags.terminalSabotageLocks[hit.terminal.id] = now + 6400 * durM;
-        this._setHint("Console jammed — power cycling.", "#ffd38a", 2.1);
+        let msg = "Console jammed — power cycling.";
+        if (!w.flags.inventoryJammerGranted && typeof InventorySystem !== "undefined") {
+          w.flags.inventoryJammerGranted = true;
+          InventorySystem.add(p, "signal_jammer", 1);
+          msg += " Embedded jammer token cached (inventory).";
+        }
+        this._setHint(msg, "#ffd38a", 2.25);
       } else if (hit.kind === "door") {
         const id = hit.doorId;
         if (w.flags.doorSabotageRevert && w.flags.doorSabotageRevert.id === id) {
@@ -8704,7 +9383,25 @@
           this._startTaskForTerminal(probe.terminal);
           return true;
         }
+        if (probe.terminal.kind === "item_pickup") {
+          const pk = probe.terminal;
+          const itemId = pk.itemId || "";
+          const pl = this.player;
+          if (!itemId || typeof InventoryCatalog === "undefined" || !InventoryCatalog[itemId]) {
+            this._setHint("Unknown cache — corrupted tag.", "#ffae90", 1.85);
+            SFX.play("interact_fail");
+            return true;
+          }
+          if (pl && typeof InventorySystem !== "undefined") InventorySystem.add(pl, itemId, 1);
+          TerminalState.set(pk, TerminalState.COMPLETED);
+          const inm = InventoryCatalog[itemId].name || itemId;
+          this._setHint("Picked up: " + inm, "#b8ffe8", 2.85);
+          SFX.play("ui_click");
+          return true;
+        }
         if (probe.terminal.kind === "access_card_pickup") {
+          const pl = this.player;
+          if (pl && typeof InventorySystem !== "undefined") InventorySystem.add(pl, "access_key", 1);
           this.world.flags.accessCardFound = true;
           this.world.terminals = (this.world.terminals || []).filter(tt => tt.id !== probe.terminal.id);
           this._setHint("Access card acquired.", "#9effcf", 2.0);
@@ -8712,12 +9409,20 @@
           return true;
         }
         if (probe.terminal.kind === "access_card_use") {
-          if (!this.world.flags.accessCardFound) {
+          const pl = this.player;
+          let ok = !!(pl && InventorySystem.count(pl, "access_key") > 0);
+          if (!ok && this.world.flags.accessCardFound) ok = true;
+          if (!ok) {
             this._setHint("Access card required.", "#ffb08a", 2.0);
             SFX.play("interact_fail");
             return true;
           }
-          this.world.flags.accessCardFound = false;
+          if (pl) {
+            if (InventorySystem.count(pl, "access_key") > 0) InventorySystem.tryConsume(pl, "access_key", 1);
+            this.world.flags.accessCardFound = InventorySystem.count(pl, "access_key") > 0;
+          } else {
+            this.world.flags.accessCardFound = false;
+          }
           this.world.terminals = (this.world.terminals || []).filter(tt => tt.id !== probe.terminal.id);
           this._setHint("Access card accepted. Route unlocked.", "#9effcf", 2.2);
           SFX.play("hack_ok");
@@ -9054,14 +9759,16 @@
       w.terminals.forEach(t => {
         TerminalState.ensure(t);
         const done = TerminalState.isCompleted(t);
+        if (t.kind === "item_pickup" && done) return;
         const inProg = TerminalState.isInProgress(t);
         const tx = t.x + t.w * 0.5, ty = t.y + t.h * 0.5;
         const dx = p ? (p.x - tx) : 0;
         const dy = p ? (p.y - ty) : 0;
         const inRange = !!(p && this.mode === "play" && (dx * dx + dy * dy) <= maxD2);
-        const gc = done ? "#5cff9c" : inProg ? "#ffcc66" : (inRange ? "#6dffef" : "#00ffcc");
+        const baseGlow = t.kind === "item_pickup" ? (done ? "#5cff9c" : inRange ? "#ffd88a" : "#ffc266") : null;
+        const gc = done ? "#5cff9c" : inProg ? "#ffcc66" : (baseGlow != null ? baseGlow : (inRange ? "#6dffef" : "#00ffcc"));
         Renderer.withGlow(ctx, gc, done ? 8 : (inProg ? 12 : 18), () => {
-          ctx.fillStyle = done ? "rgba(8,22,14,0.92)" : inProg ? "rgba(28,22,8,0.9)" : "#0e1218";
+          ctx.fillStyle = done ? "rgba(8,22,14,0.92)" : inProg ? "rgba(28,22,8,0.9)" : t.kind === "item_pickup" ? "rgba(26,20,8,0.88)" : "#0e1218";
           ctx.fillRect(t.x, t.y, t.w, t.h);
         });
         ctx.strokeStyle = done ? "rgba(92,255,156,0.98)" : inProg ? "rgba(255,200,100,0.95)" : (inRange ? "rgba(130,255,240,0.98)" : "rgba(0,255,220,0.65)");
@@ -9076,7 +9783,8 @@
         if (inRange && !done && !inProg) {
           ctx.fillStyle = "rgba(180,255,244,0.95)";
           ctx.font = "9px monospace";
-          const lab = t.kind === "repair_panel" ? "HOLD [E] REPAIR" : "IN RANGE [E]";
+          const lab =
+            t.kind === "repair_panel" ? "HOLD [E] REPAIR" : t.kind === "item_pickup" ? "PICK UP [E]" : "IN RANGE [E]";
           ctx.fillText(lab, t.x + 6, t.y + t.h - 6);
         }
         if (inProg && !done) {
@@ -9449,7 +10157,7 @@
         ly += 13;
       });
       ctx.fillStyle="#678"; ctx.font="8px monospace";
-      ctx.fillText("WASD · Shift · E hack · Q talk · F faux work (near crew/console) · G sabotage (near door/console/cam) · Esc", 24, hudH - 8);
+      ctx.fillText("WASD · Shift · E hack · Q talk (1-6 dialogue) · F faux work (near crew/console) · G sabotage · Tab inventory · Esc", 24, hudH - 8);
       if (coop) {
         const other = AuthoritativeSession.players.find(pl => pl !== p);
         if (other) {
@@ -9464,11 +10172,26 @@
           ctx.strokeRect(24, hudH - 17, 100, 5);
         }
       }
-      if (this.npcTask && !this.npcTask.done) {
-        ctx.fillStyle = "#9fd";
-        ctx.font = "9px monospace";
-        const pct = Math.round((this.npcTask.progressSec / this.npcTask.targetSec) * 100);
-        ctx.fillText("NPC TASK: " + this.npcTask.label + " (" + pct + "%)", 24, hudH - 36);
+      {
+        const act = (this.npcActiveTasks || []).filter(t => t && !t.done);
+        if (act.length) {
+        let yTask = hudH - 36;
+        for (let ti = 0; ti < act.length && ti < 4; ti++) {
+          const tk = act[ti];
+          const tgt = (tk.targetSec != null && tk.targetSec > 0) ? tk.targetSec : 15;
+          let pct = 0;
+          if (tk.type === "junction_visit") {
+            const dn = tk.dwellNeed != null ? tk.dwellNeed : 1.3;
+            pct = Math.round(clamp(((tk.dwellProgress || 0) / dn) * 100, 0, 100));
+          } else {
+            pct = Math.round(clamp((tk.progressSec / tgt) * 100, 0, 100));
+          }
+          ctx.fillStyle = ti === 0 ? "#9fd" : "#7ec9b3";
+          ctx.font = "9px monospace";
+          ctx.fillText("NPC TASK: " + tk.label + " (" + pct + "%)", 24, yTask);
+          yTask -= 12;
+        }
+        }
       }
       if (this.npcFavor && !this.npcFavor.done) {
         const f = this.npcFavor;
@@ -9477,7 +10200,9 @@
         const pct = Math.min(100, Math.round(((f.hold || 0) / need) * 100));
         ctx.fillStyle = "#d4c4ff";
         ctx.font = "9px monospace";
-        ctx.fillText("FAVOR (opt): " + lab + " " + pct + "% · " + Math.max(0, Math.ceil(f.ttl || 0)) + "s", 24, hudH - (this.npcTask && !this.npcTask.done ? 52 : 36));
+        const actTasks = (this.npcActiveTasks || []).filter(t => t && !t.done);
+        const favorY = actTasks.length ? hudH - 36 - actTasks.length * 12 - 14 : hudH - 36;
+        ctx.fillText("FAVOR (opt): " + lab + " " + pct + "% · " + Math.max(0, Math.ceil(f.ttl || 0)) + "s", 24, favorY);
       }
       const npcDialogActive = this.mode === "play" && this.phase === "playing" && this.npcDialogueText && performance.now() < this.npcDialogueUntil;
       if (!npcDialogActive && this.npcDialogueAwaitingChoice) {
@@ -9556,6 +10281,52 @@
               ly2 += 12;
             }
             yText += h + 4;
+          }
+        }
+      }
+      if (this.inventoryPanelOpen && this.mode === "play" && this.phase === "playing" && typeof InventorySystem !== "undefined") {
+        const rows = InventorySystem.listNonEmpty(p);
+        const px = VIEW_W / 2 - 200;
+        const py = 128;
+        const pw = 400;
+        const rowH = 17;
+        const maxRows = 10;
+        const ph = 48 + Math.min(Math.max(rows.length, 1), maxRows) * rowH;
+        ctx.fillStyle = "rgba(4, 18, 32, 0.94)";
+        ctx.fillRect(px, py, pw, ph);
+        ctx.strokeStyle = "rgba(0, 255, 200, 0.5)";
+        ctx.strokeRect(px, py, pw, ph);
+        ctx.fillStyle = "#7ef0dd";
+        ctx.font = "bold 12px monospace";
+        ctx.textAlign = "left";
+        ctx.fillText("INVENTORY", px + 12, py + 24);
+        ctx.fillStyle = "#6a8a9a";
+        ctx.font = "9px monospace";
+        ctx.textAlign = "right";
+        ctx.fillText("Tab to close", px + pw - 12, py + 24);
+        ctx.textAlign = "left";
+        let ry = py + 44;
+        if (!rows.length) {
+          ctx.fillStyle = "#678899";
+          ctx.font = "10px monospace";
+          ctx.fillText("No items yet.", px + 12, ry);
+        } else {
+          const nShow = Math.min(rows.length, maxRows);
+          for (let i = 0; i < nShow; i++) {
+            const r = rows[i];
+            ctx.fillStyle = "#d4f2ff";
+            ctx.font = "10px monospace";
+            ctx.fillText(r.name, px + 12, ry);
+            ctx.fillStyle = "#9ec8d8";
+            ctx.textAlign = "right";
+            ctx.fillText("×" + r.qty, px + pw - 12, ry);
+            ctx.textAlign = "left";
+            ry += rowH;
+          }
+          if (rows.length > maxRows) {
+            ctx.fillStyle = "#678";
+            ctx.font = "9px monospace";
+            ctx.fillText("… +" + (rows.length - maxRows) + " more types", px + 12, ry - 4);
           }
         }
       }
@@ -10755,6 +11526,7 @@
     HackEngine,
     NpcRoleSystem,
     NpcFavorSystem,
+    NpcTaskSystem,
     NpcBonusSystem,
     ServerAuthorityFactory,
     ServerAuthority,
