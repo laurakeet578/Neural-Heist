@@ -5834,7 +5834,7 @@
         if (e.code==="Digit1") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(1); }
         if (e.code==="Digit2") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(2); }
         if (e.code==="Digit3") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(3); }
-        if (e.code==="KeyTab") {
+        if (e.code==="KeyI") {
           e.preventDefault();
           if (GameStateManager._inventoryHudReady()) GameStateManager.inventoryPanelOpen = !GameStateManager.inventoryPanelOpen;
         }
@@ -10662,7 +10662,7 @@
         ly += 13;
       });
       ctx.fillStyle="#678"; ctx.font="8px monospace";
-      ctx.fillText("WASD · Shift · E hack · Q talk (1-6 dialogue) · F faux work (near crew/console) · G sabotage · Tab inventory · Esc", 24, hudH - 8);
+      ctx.fillText("WASD · Shift · E hack · Q talk (1-6 dialogue) · F faux work (near crew/console) · G sabotage · I inventory · Esc", 24, hudH - 8);
       if (coop) {
         const other = AuthoritativeSession.players.find(pl => pl !== p);
         if (other) {
@@ -10808,7 +10808,7 @@
         ctx.fillStyle = "#6a8a9a";
         ctx.font = "9px monospace";
         ctx.textAlign = "right";
-        ctx.fillText("Tab to close", px + pw - 12, py + 24);
+        ctx.fillText("I to close", px + pw - 12, py + 24);
         ctx.textAlign = "left";
         let ry = py + 44;
         if (!rows.length) {
