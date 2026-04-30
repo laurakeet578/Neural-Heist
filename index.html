@@ -5732,8 +5732,9 @@
       const doorsOpen = {};
       wallsRaw.forEach(W => { if (W.door && W.id) doorsOpen[W.id] = false; });
       const spawn = { x: def.spawn.x, y: def.spawn.y };
-      const guards = def.guards();
-      const npcs = def.npcs ? def.npcs() : [];
+      // Hardening: never allow missing NPC arrays due to def typos/edge cases.
+      const guards = Array.isArray(def.guards && def.guards()) ? def.guards() : [];
+      const npcs = Array.isArray(def.npcs && def.npcs()) ? def.npcs() : [];
       const objectives = (def.objectives || [{ type: "primary" }]).map(o => Object.assign({}, o, { done: false }));
       const sidePack = SideObjectiveFactory.build(def, w, h);
       if (sidePack && sidePack.objectives) {
@@ -5752,7 +5753,7 @@
         cover: def.cover.slice(),
         guards,
         npcs,
-        cameras: def.cameras(),
+        cameras: Array.isArray(def.cameras && def.cameras()) ? def.cameras() : [],
         terminals,
         hack: HackEngine.deepBreach(),
         extraction: def.extraction,
@@ -5771,6 +5772,18 @@
       world.flags.loreIndex = 0;
       world.flags.loreFragments = [];
       for (let ti = 0; ti < world.terminals.length; ti++) TerminalState.ensure(world.terminals[ti]);
+      // Ensure guards/cameras exist and are well-formed before the first tick/render.
+      if (!Array.isArray(world.guards)) world.guards = [];
+      if (!Array.isArray(world.cameras)) world.cameras = [];
+      for (let gi = 0; gi < world.guards.length; gi++) {
+        const g = world.guards[gi];
+        if (!g) continue;
+        if (!g.aiState) g.aiState = "patrol";
+        if (!Number.isFinite(g.x) || !Number.isFinite(g.y)) {
+          const wp = g.waypoints && g.waypoints.length ? g.waypoints[0] : spawn;
+          g.x = wp.x; g.y = wp.y;
+        }
+      }
       world.walls = MissionLoader.solidWalls(world);
       DetectionSystem.init(world);
       MissionSystem.init(world);
@@ -6180,8 +6193,17 @@
       if (!gameplayPhase) return this._setStabilityState(StabilityState.IN_LOBBY, rsn || "not_gameplay_phase");
       if (!snapshotApplied) return this._setStabilityState(StabilityState.SNAPSHOT_PENDING, rsn || "awaiting_snapshot");
       if (!worldReady) return this._setStabilityState(StabilityState.SNAPSHOT_SYNCED, rsn || "snapshot_applied_world_pending");
-      if (!(missionReady && aiReady && cameraReady && uiReady && inputReady)) {
-        return this._setStabilityState(StabilityState.SIM_INITIALIZING, rsn || "systems_initializing");
+
+      // Single-player campaign must never deadlock on UI/input/network readiness.
+      // Once the mission world + player anchor exist, allow gameplay systems to activate.
+      if (!online) {
+        if (!(missionReady && aiReady && cameraReady)) {
+          return this._setStabilityState(StabilityState.SIM_INITIALIZING, rsn || "campaign_initializing");
+        }
+      } else {
+        if (!(missionReady && aiReady && cameraReady && uiReady && inputReady)) {
+          return this._setStabilityState(StabilityState.SIM_INITIALIZING, rsn || "systems_initializing");
+        }
       }
       if (this.phase !== "playing") {
         this._normalizeStateForPhase("playing");
@@ -6240,6 +6262,16 @@
     },
     _normalizeStateForPhase(nextPhase) {
       if (nextPhase !== "playing") {
+        // Prevent stuck terminals when leaving gameplay: clear any in-progress states.
+        const w = this.world;
+        if (w && Array.isArray(w.terminals)) {
+          for (let i = 0; i < w.terminals.length; i++) {
+            const t = w.terminals[i];
+            if (!t) continue;
+            TerminalState.ensure(t);
+            if (t.state === TerminalState.IN_PROGRESS) TerminalState.set(t, TerminalState.INACTIVE);
+          }
+        }
         if (this.hackingSession) this.hackingSession.hacking = false;
         this.hack.releaseInteraction();
         this.hack._resetStageProgress();
@@ -6276,6 +6308,21 @@
       const k = 1 - Math.exp(-28 * dt);
       this.cam.x = lerp(this.cam.x, tx, k);
       this.cam.y = lerp(this.cam.y, ty, k);
+      this._camVx = 0;
+      this._camVy = 0;
+    },
+    _snapCameraToPlayer(player, world) {
+      if (!player || !world) return;
+      const maxTx = world.worldW - VIEW_W;
+      const maxTy = world.worldH - VIEW_H;
+      const tx = maxTx >= 0
+        ? clamp(player.x - VIEW_W / 2, 0, maxTx)
+        : (world.worldW - VIEW_W) / 2;
+      const ty = maxTy >= 0
+        ? clamp(player.y - VIEW_H / 2, 0, maxTy)
+        : (world.worldH - VIEW_H) / 2;
+      this.cam.x = tx;
+      this.cam.y = ty;
       this._camVx = 0;
       this._camVy = 0;
     },
@@ -7890,7 +7937,9 @@
         this.lobbyAutoStartNextRetryAt = 0;
         this.lobbyAutoStartRetryCount = 0;
       }
-      if (this.phase === "starting_match") {
+      // Multiplayer-only wait/retry loop. Single-player uses starting_match as a brief bootstrap phase
+      // and must never show snapshot delays or bounce to lobby.
+      if (this.phase === "starting_match" && this.gameMode === "online_mock" && NetworkCoordinator.mode === "ws_client") {
         const canRetryStart = this.gameMode === "online_mock"
           && NetworkCoordinator.mode === "ws_client"
           && this.localPlayerId === 0
@@ -8439,10 +8488,6 @@
     },
     tryTerminalLoginClick(mx, my) {
       if (mx > VIEW_W / 2 - 170 && mx < VIEW_W / 2 + 170) {
-        if (my > 260 && my < 312) {
-          this.openMultiplayerMenu("terminal_login");
-          return;
-        }
         if (my > 332 && my < 384) {
           SFX.play("ui_click");
           this.gameMode = "campaign";
@@ -8513,12 +8558,13 @@
 
     /** True once inventory UI (HUD panel + Tab) may mount: match session, mission world, multiplayer handshake when online_mock. */
     _inventoryHudReady() {
-      if (!this._stabilityCanActivate("inventory")) return false;
       if (this.mode !== "play") return false;
       if (!this.world || !this.player) return false;
       if (!(this.phase === "playing" || this.phase === "starting_match")) return false;
       if (typeof AuthoritativeSession === "undefined" || !AuthoritativeSession.players || AuthoritativeSession.players.length === 0) return false;
+      // Single-player: inventory is purely local UI; do not gate on StabilityLayer timing.
       if (this.gameMode !== "online_mock") return true;
+      if (!this._stabilityCanActivate("inventory")) return false;
       return this.stabilityState === StabilityState.PLAYABLE;
     },
 
@@ -8933,10 +8979,6 @@
           this.setPhase("mission_select");
           return;
         }
-        if (my>308 && my<360) {
-          this.openMultiplayerMenu("title");
-          return;
-        }
         if (my>376 && my<428) { SFX.play("ui_click"); this.unlocked = loadUnlock(); this.setPhase("mission_select"); }
       }
     },
@@ -9154,6 +9196,8 @@
         this._camVx = 0;
         this._camVy = 0;
         this.shake = 0;
+        // Avoid a “camera glide” on the first playable frame.
+        this._snapCameraToPlayer(this.player, w);
         this._worldStaticCanvas = null;
         this._worldStaticMissionKey = "";
         this._buildStaticWorldLayer();
@@ -9169,7 +9213,9 @@
         this._favorChoiceSpecById = null;
         this._npcTaskChoiceSpecById = null;
         this.activeRepair = null;
-        this.inventoryPanelOpen = false;
+        // Single-player polish: show inventory immediately on mission start so it never feels “missing”.
+        // Player can close it with Tab; multiplayer flow remains unchanged.
+        this.inventoryPanelOpen = this.gameMode !== "online_mock";
         this.failTimer = 0;
         this.exposureMaxTimer = 0;
         w.primaryDone = false;
@@ -9837,6 +9883,7 @@
           }
           if (pl && typeof InventorySystem !== "undefined") InventorySystem.add(pl, itemId, 1);
           TerminalState.set(pk, TerminalState.COMPLETED);
+          MissionSystem.sync(this.world, pl);
           const inm = InventoryCatalog[itemId].name || itemId;
           this._setHint("Picked up: " + inm, "#b8ffe8", 2.85);
           SFX.play("ui_click");
@@ -9847,6 +9894,7 @@
           if (pl && typeof InventorySystem !== "undefined") InventorySystem.add(pl, "access_key", 1);
           this.world.flags.accessCardFound = true;
           this.world.terminals = (this.world.terminals || []).filter(tt => tt.id !== probe.terminal.id);
+          MissionSystem.sync(this.world, pl);
           this._setHint("Access card acquired.", "#9effcf", 2.0);
           SFX.play("ui_click");
           return true;
@@ -9867,6 +9915,7 @@
             this.world.flags.accessCardFound = false;
           }
           this.world.terminals = (this.world.terminals || []).filter(tt => tt.id !== probe.terminal.id);
+          MissionSystem.sync(this.world, pl);
           this._setHint("Access card accepted. Route unlocked.", "#9effcf", 2.2);
           SFX.play("hack_ok");
           return true;
@@ -10514,7 +10563,9 @@
       const w = this.world;
       const p = this.player;
       if (!w || !p) return;
-      if (this.inventoryPanelOpen && !this._inventoryHudReady()) this.inventoryPanelOpen = false;
+      // HUD should be immediate in gameplay bootstrap; never wait for StabilityLayer in campaign.
+      // Do not auto-close inventory during single-player bootstrap; keep it open until ready to render.
+      if (this.inventoryPanelOpen && !this._inventoryHudReady() && this.gameMode === "online_mock") this.inventoryPanelOpen = false;
       ctx.save();
       ctx.setTransform(1,0,0,1,0,0);
       const exp = w.exposure != null ? w.exposure : 0;
@@ -10802,11 +10853,7 @@
       const br = 0.42 + Math.sin(u * 1.8) * 0.12;
       ctx.fillStyle="rgba(0,45,58,0.92)"; ctx.strokeStyle="rgba(0,255,220,"+br+")";
       ctx.fillRect(VIEW_W/2-160,240,320,52); ctx.strokeRect(VIEW_W/2-160,240,320,52);
-      ctx.fillStyle="#0ff"; ctx.font="17px monospace"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 274);
-      ctx.fillStyle="rgba(0,50,62,0.92)"; ctx.strokeStyle="rgba(255,160,120,"+(0.35+Math.sin(u*2.1)*0.1)+")";
-      ctx.fillRect(VIEW_W/2-160,308,320,52); ctx.strokeRect(VIEW_W/2-160,308,320,52);
-      ctx.fillStyle="#fa8"; ctx.font="16px monospace"; ctx.fillText("MULTIPLAYER", VIEW_W/2, 338);
-      ctx.fillStyle="#678"; ctx.font="10px monospace"; ctx.fillText("Online co-op via the Neural Heist game server", VIEW_W/2, 356);
+      ctx.fillStyle="#0ff"; ctx.font="17px monospace"; ctx.fillText("Start/Continue Campaign", VIEW_W/2, 274);
       ctx.fillStyle="rgba(0,38,48,0.92)"; ctx.strokeStyle="rgba(0,170,200,0.38)";
       ctx.fillRect(VIEW_W/2-160,376,320,52); ctx.strokeRect(VIEW_W/2-160,376,320,52);
       ctx.fillStyle="#0aa"; ctx.fillText("CONTINUE (saved unlock)", VIEW_W/2, 410);
@@ -10823,14 +10870,11 @@
       ctx.fillText("TERMINAL LOGIN", VIEW_W/2, 170);
       ctx.shadowBlur = 0;
       ctx.fillStyle="#89a"; ctx.font="12px monospace";
-      ctx.fillText("Choose multiplayer or play the campaign on this device.", VIEW_W/2, 205);
+      ctx.fillText("Begin or continue your campaign run.", VIEW_W/2, 205);
       const pA = 0.38 + Math.sin(u * 1.7) * 0.12;
-      ctx.fillStyle="rgba(0,50,64,0.92)"; ctx.strokeStyle="rgba(0,255,220,"+pA+")";
-      ctx.fillRect(VIEW_W/2-170,260,340,52); ctx.strokeRect(VIEW_W/2-170,260,340,52);
-      ctx.fillStyle="#0ff"; ctx.font="bold 17px monospace"; ctx.fillText("MULTIPLAYER", VIEW_W/2, 292);
       ctx.fillStyle="rgba(0,40,58,0.92)"; ctx.strokeStyle="rgba(140,180,255,0.42)";
       ctx.fillRect(VIEW_W/2-170,332,340,52); ctx.strokeRect(VIEW_W/2-170,332,340,52);
-      ctx.fillStyle="#9cf"; ctx.font="bold 16px monospace"; ctx.fillText("OFFLINE CAMPAIGN", VIEW_W/2, 364);
+      ctx.fillStyle="#9cf"; ctx.font="bold 16px monospace"; ctx.fillText("Start/Continue Campaign", VIEW_W/2, 364);
     },
     drawMultiplayerMenu() {
       const u = VisualJuice.uiT;
