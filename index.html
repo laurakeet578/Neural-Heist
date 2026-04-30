@@ -5802,24 +5802,25 @@
     install(gsm) {
       if (this._bound) return;
       this._bound = true;
+      const isGameplayContext = () => {
+        const ph = GameStateManager ? String(GameStateManager.phase || "") : "";
+        // UI shell must always be interactive; StabilityLayer only gates in-mission gameplay systems.
+        return ph === "playing" || ph === "starting_match";
+      };
       document.addEventListener("keydown", (e) => {
         SFX.ensure();
         if (e.repeat) return;
-        if (!NeuralHeistStabilityLayer.canActivate("input")) {
-          if (e.code === "Space" && GameStateManager.phase === "briefing") {
-            e.preventDefault();
-            GameStateManager.startPlaying();
-          }
-          return;
-        }
+        // Menu/UI shell navigation is never Stability-gated.
+        if (e.code === "Space" && GameStateManager.phase === "briefing") { e.preventDefault(); GameStateManager.startPlaying(); }
+        if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("input")) return;
         if (GameStateManager && GameStateManager.handleTaskKey && GameStateManager.handleTaskKey(e.code)) { e.preventDefault(); return; }
         if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space","KeyW","KeyA","KeyS","KeyD","KeyI","KeyJ","KeyK","KeyL","KeyT","KeyF","KeyG","KeyH","KeyB","KeyV","KeyM","KeyN"].includes(e.code)) e.preventDefault();
         gsm.keys[this.keyId(e)] = true;
-        if (e.code==="KeyE") { e.preventDefault(); GameStateManager.requestInteract(); }
-        if (e.code==="KeyQ") { e.preventDefault(); GameStateManager.tryTalkToNPC(); }
-        if (e.code==="Digit1") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(1); }
-        if (e.code==="Digit2") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(2); }
-        if (e.code==="Digit3") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(3); }
+        if (e.code==="KeyE") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.requestInteract(); }
+        if (e.code==="KeyQ") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.tryTalkToNPC(); }
+        if (e.code==="Digit1") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(1); }
+        if (e.code==="Digit2") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(2); }
+        if (e.code==="Digit3") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("ui_shell")) return; e.preventDefault(); GameStateManager.selectNpcDialogueChoice(3); }
         if (e.code==="KeyTab") {
           e.preventDefault();
           if (GameStateManager._inventoryHudReady()) GameStateManager.inventoryPanelOpen = !GameStateManager.inventoryPanelOpen;
@@ -5827,10 +5828,10 @@
         if (e.code==="Digit4") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(4); }
         if (e.code==="Digit5") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(5); }
         if (e.code==="Digit6") { e.preventDefault(); GameStateManager.selectNpcDialogueChoice(6); }
-        if (e.code==="KeyF") { e.preventDefault(); GameStateManager.tryFakeTask(); }
-        if (e.code==="KeyG") { e.preventDefault(); GameStateManager.trySabotage(); }
-        if (e.code==="KeyZ") { e.preventDefault(); GameStateManager.tryInvestigate(); }
-        if (e.code==="KeyX") { e.preventDefault(); GameStateManager.tryReportSuspicion(); }
+        if (e.code==="KeyF") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.tryFakeTask(); }
+        if (e.code==="KeyG") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.trySabotage(); }
+        if (e.code==="KeyZ") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.tryInvestigate(); }
+        if (e.code==="KeyX") { if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("interaction")) return; e.preventDefault(); GameStateManager.tryReportSuspicion(); }
         if (e.code==="KeyR" && (GameStateManager.phase==="mission_win" || GameStateManager.phase==="mission_fail" || GameStateManager.phase==="final_cutscene")) {
           e.preventDefault();
           GameStateManager.advanceFromOverlay();
@@ -5876,9 +5877,8 @@
             GameStateManager.inventoryPanelOpen = false;
             return;
           }
-          if (GameStateManager.phase==="playing") GameStateManager.paused = !GameStateManager.paused;
+          if (GameStateManager.phase==="playing" && NeuralHeistStabilityLayer.canActivate("input")) GameStateManager.paused = !GameStateManager.paused;
         }
-        if (e.code==="Space" && GameStateManager.phase==="briefing") { e.preventDefault(); GameStateManager.startPlaying(); }
       }, true);
       document.addEventListener("keyup", (e) => {
         if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space","KeyW","KeyA","KeyS","KeyD","KeyI","KeyJ","KeyK","KeyL","KeyT","KeyF","KeyG","KeyH","KeyB","KeyV","KeyM","KeyN"].includes(e.code)) e.preventDefault();
@@ -5890,7 +5890,6 @@
       });
       this._gamePointerDown = (e) => {
         SFX.ensure();
-        if (!NeuralHeistStabilityLayer.canActivate("input")) return;
         const now = performance.now();
         if (now - this._lastPointerTs < 20) return;
         this._lastPointerTs = now;
@@ -5899,10 +5898,11 @@
         canvas.focus();
         const rect = canvas.getBoundingClientRect(), sx = VIEW_W/rect.width, sy = VIEW_H/rect.height;
         const mx = (e.clientX-rect.left)*sx, my = (e.clientY-rect.top)*sy;
+        // Always route pointer into UI shell; gameplay actions are Stability-gated deeper in GSM.
         GameStateManager.handlePointer(mx, my, this._pointerSerial);
       };
       this._hackPointerDown = (e) => {
-        if (!NeuralHeistStabilityLayer.canActivate("input")) return;
+        if (isGameplayContext() && !NeuralHeistStabilityLayer.canActivate("input")) return;
         const now = performance.now();
         if (now - this._lastPointerTs < 20) return;
         this._lastPointerTs = now;
@@ -5915,13 +5915,12 @@
         GameStateManager.handleHackPointer(mx, my, this._pointerSerial);
       };
       this._pointerUp = (e) => {
-        if (!NeuralHeistStabilityLayer.canActivate("input")) return;
         e.preventDefault();
         if (GameStateManager && GameStateManager.phase === "multiplayer_menu" && GameStateManager._multiplayerMenuAwaitPointerRelease) {
           GameStateManager._multiplayerMenuAwaitPointerRelease = false;
           if (GameStateManager._dbgLog) GameStateManager._dbgLog("multiplayer menu pointer release armed");
         }
-        if (GameStateManager && GameStateManager.phase === "playing" && GameStateManager.mode === "hack") {
+        if (GameStateManager && GameStateManager.phase === "playing" && GameStateManager.mode === "hack" && NeuralHeistStabilityLayer.canActivate("input")) {
           const hk = GameStateManager.hack;
           if (hk && hk.isTraceStage()) {
             if (NetworkCoordinator.isAuthoritativeHost && !NetworkCoordinator.isAuthoritativeHost()) {
@@ -5934,8 +5933,8 @@
         if (GameStateManager && GameStateManager.hack) GameStateManager.hack.releaseInteraction();
       };
       this._pointerMove = (e) => {
-        if (!NeuralHeistStabilityLayer.canActivate("input")) return;
         if (GameStateManager.phase !== "playing" || GameStateManager.mode !== "hack") return;
+        if (!NeuralHeistStabilityLayer.canActivate("input")) return;
         const rect = canvas.getBoundingClientRect(), sx = VIEW_W/rect.width, sy = VIEW_H/rect.height;
         const mx = (e.clientX-rect.left)*sx, my = (e.clientY-rect.top)*sy;
         GameStateManager.hack.setPointer(mx, my);
@@ -5946,7 +5945,8 @@
         canvas.addEventListener("pointermove", this._pointerMove);
       }
       document.getElementById("breachBtn").addEventListener("click", (e) => {
-        if (!NeuralHeistStabilityLayer.canActivate("ui")) return;
+        // Gameplay HUD button only; never gate UI shell navigation.
+        if (!NeuralHeistStabilityLayer.canActivate("gameplay_ui")) return;
         e.preventDefault(); canvas.focus(); GameStateManager.requestInteract();
       });
     },
